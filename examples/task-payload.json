@@ -1,0 +1,7 @@
+{
+  "goal": "Collect stats",
+  "idempotency_key": "example-1",
+  "paths": [
+    ".local/example-out.json"
+  ]
+}
