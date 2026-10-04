@@ -2,8 +2,10 @@
 
 Producer: `launcher/cli.py` — `build_report()` (projection) and `report()` (JSONL
 emission). Consumer: the existing private metrics dashboard. This document is the
-consumer contract for the `--jsonl` stream. Status: matches implementation at
-commit `b23039a` (2026-10-04).
+consumer contract for the `--jsonl` stream. Status: verified line-by-line
+against `build_report()`/`report()` at commit `b79ae70` (2026-10-04) — the
+report implementation including the coverage line was introduced in that
+commit; the earlier citation of `b23039a` predated the rewrite.
 
 Design invariants, binding for the dashboard (from SPEC.md §report and the
 `build_report` docstring):

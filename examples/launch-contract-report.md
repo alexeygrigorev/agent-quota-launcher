@@ -5,7 +5,79 @@
 - Inputs: `README.md`, `SPEC.md` (workspace root, this checkout)
 - Method: static read-only documentation comparison; implementation was not executed. Line references are to the files as read at this commit. This replaces the earlier AGENTS.md-based draft committed in b23039a.
 
-## 1. Identity and first action
+> **Re-verification 2026-10-04 (quota-launcher-core-3, fd5d5ee9).** The original
+> review below targeted `README.md` as it stood when the child session ran
+> (pre-`b79ae70`). The README was rewritten later the same day in commit
+> `b79ae70` and now documents most of what the original review found missing.
+> All three axes were re-checked line-by-line against the current checkout; the
+> original text is preserved verbatim as the appendix. Current status summary:
+>
+> | Axis | Original | Current (b79ae70) |
+> | --- | --- | --- |
+> | 1. Identity / first action | missing / nonconforming | largely conforming; one residual |
+> | 2. Accept vs exit 0 | missing / nonconforming | conforming |
+> | 3. Resource gates | partially conforming | conforming |
+
+## 1. Identity and first action — current status: largely conforming
+
+`README.md:52` now states the content-check contract directly: the child must
+write a whoami-shaped `{id, tag, workspace, timestamp}` artifact, and
+wrapper/engine start records containing `command`, `phase`, `parent_session`,
+or `schema_version` keys are rejected, as are mismatched identities and stale
+files. This covers SPEC.md:12 (whoami tag/workspace match; native first action
+distinct from the wrapper started marker) and the core-2 rejection cause
+(`.local/first-action-genuine-5.json` was a wrapper `phase: starting` record).
+
+Residual: SPEC.md:6 requires each task to carry a **first-action artifact
+path** and an **expected result artifact path**. The CLI has no dedicated
+arguments for either (`submit` takes generic `--paths`, `launcher/cli.py:216`);
+the contract is met by convention — the first-action artifact must live inside
+the owned `--paths` and is content-validated at launch — and the submit example
+(`README.md:19-25`) passes `--paths .local/artifact.json` without saying that
+this is the first-action artifact. Documented behavior is correct; the
+convention is implicit rather than stated.
+
+## 2. Accept versus exit 0 — current status: conforming
+
+- `README.md:42-44` documents exact runnable `complete` / `accept` examples,
+  both requiring `--reviewer` (SPEC.md:4 "names may vary but document exact
+  runnable examples").
+- `README.md:49` enumerates the full lifecycle including `launch-uncertain`.
+- `README.md:51` states "**Exit 0 is not acceptance.**" and that `accept` only
+  moves `completed-awaiting-review -> accepted` with the reviewer identity;
+  queued, running, and `launch-uncertain` tasks cannot be accepted or
+  completed (SPEC.md:14).
+- `plan` is documented as always dry-run, no state change, no launch
+  (`README.md:27-28`), matching SPEC.md:4.
+
+## 3. Resource gates — current status: conforming
+
+`README.md:72` now carries every audited number: worker memory <= 1500 MiB;
+host MemAvailable >= 10 GiB after active reservations; cwd/TMPDIR >= 50 GiB +
+active reservations + 512 MiB spike; `/tmp` rejected and TMPDIR resolved under
+the owned `<repo>/.local/tmp` by path containment (SPEC.md:12, SPEC.md:16).
+The `run` example passes `--tmpdir .../.local/tmp` (`README.md:34`), which
+resolves under the owned root. Ranking is also now contract-grade
+(`README.md:68`): reset multiplier bounded to [1, 3], unknown `task_fit` /
+`health` weight 0 and never fabricated to 1.0, seed + weights recorded, and the
+promotion multiplier 1.0 / cutoff 2026-10-06T16:00Z stated (SPEC.md:10).
+
+## Verdict (re-verified)
+
+README at `b79ae70` is a contract document, not just a quickstart: it now
+covers the guarded acceptance transition and the exit-0 caveat (axis 2) and all
+numeric resource gates plus the `/tmp` rejection (axis 3) that the original
+review found absent, and it documents the wrapper-start vs native-first-action
+distinction that motivated this repair round (axis 1). One residual gap: the
+first-action artifact path is carried by convention inside generic `--paths`
+with no dedicated field and no explicit labeling in the submit example — a
+documentation nit, not a correctness defect.
+
+---
+
+## Appendix: original review (2026-10-04T12:28:32Z, pre-`b79ae70` README)
+
+### 1. Identity and first action
 
 SPEC requires:
 
@@ -21,7 +93,7 @@ README status: **missing / nonconforming.**
 - No README section documents the whoami tag/workspace verification, expected-tag checking, or the wrapper-start vs native-first-action distinction (README.md:10-48; contrast SPEC.md:12).
 - The nearest text is "It securely wraps `aplexer` for system gating" (README.md:47), which states no identity contract at all.
 
-## 2. Accept versus exit 0
+### 2. Accept versus exit 0
 
 SPEC requires:
 
@@ -35,7 +107,7 @@ README status: **missing / nonconforming.**
 - Nothing in README states that a zero exit code or a live process does not imply acceptance (contrast SPEC.md:14 "exit zero != accepted"); README.md:24-32 presents `run`/admission as the last documented lifecycle step before passive `status`/`report`.
 - No reviewer identity / acceptance-owner concept appears in README (contrast SPEC.md:14 "acceptance owner").
 
-## 3. Resource gates
+### 3. Resource gates
 
 SPEC requires:
 
@@ -51,6 +123,6 @@ README status: **partially conforming; all numbers missing.**
 - Conforming point: the `run` example passes `--tmpdir /home/alexey/git/agent-quota-launcher/.local/tmp` (README.md:30), which resolves under the owned root `.local/tmp` as SPEC.md:12 requires.
 - README.md:46-47 (Design) reiterates the flock lock and `aplexer` wrapping but no numeric gate; "memory limits" appears only in the `run` comment (README.md:25), unquantified.
 
-## Verdict
+### Verdict (original)
 
 README is a working quickstart, not a contract document. It is consistent with SPEC on the ranking formula shape (README.md:43 vs SPEC.md:10) and on the `.local/tmp` example (README.md:30), but it omits or understates every audited contract element: identity/first-action verification (axis 1), the guarded acceptance transition and the exit-0 caveat (axis 2), and all numeric resource gates plus the `/tmp` rejection (axis 3). A reader relying on README alone would not learn that exit 0 is not acceptance, that submit needs a first-action artifact, or that any numeric resource floor exists.
