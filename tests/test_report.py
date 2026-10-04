@@ -62,14 +62,55 @@ class TestReportContract(unittest.TestCase):
         self.assertEqual(cov["window_start"], "2026-10-03T12:14:00Z")
         self.assertEqual(cov["window_end"], "2026-10-04T12:14:00Z")
         self.assertEqual(cov["window_half_open"], "[window_start, window_end)")
-        # Every bucket label is UTC Z and its hour start lies in the window.
+        # Every bucket label is UTC Z; tile hours run floor(window_start)
+        # (the partial first hour) through the last clock hour before as_of.
+        floor_ws = self.now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)
         for label in cov["gaps_within_window"]:
             self.assertTrue(label.endswith("Z"), label)
             h = datetime.strptime(label, "%Y-%m-%dT%H:00:00Z").replace(tzinfo=timezone.utc)
-            self.assertGreaterEqual(h, self.now - timedelta(hours=24))
+            self.assertGreaterEqual(h, floor_ws)
             self.assertLess(h, self.now)
-        # The window holds exactly 24 hourly buckets: gaps + buckets with tasks.
-        self.assertEqual(len(cov["gaps_within_window"]) + len(projection["buckets"]), 24)
+        # Non-hour as_of (12:14): the tiling includes the PARTIAL FIRST hour
+        # (12:00Z previous day, do not floor-then-skip) and the last partial
+        # clock hour (12:00Z as_of day): 25 tiles, gaps + buckets together.
+        self.assertIn("2026-10-03T12:00:00Z", cov["gaps_within_window"])
+        self.assertEqual(len(cov["gaps_within_window"]) + len(projection["buckets"]), 25)
+
+    def test_offset_timestamps_converted_not_relabelled(self):
+        # +02:00 wall time 14:00 is 12:00Z: it must land in the 12:00Z bucket
+        # (same hour as t1), never at its naive wall-clock label.
+        self.store.submit_task("t2", "key2", PAYLOAD, [])
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE tasks SET created_at = '2026-10-04 14:00:00+02:00' "
+                         "WHERE id = 't2'")
+        projection = self.projection()
+        bucket_ids = [t["id"] for t in projection["buckets"]["2026-10-04T12:00:00Z"]]
+        self.assertIn("t2", bucket_ids)
+        self.assertEqual(projection["coverage"]["tasks_outside_window"], 0)
+
+    def test_dst_offset_timestamp_lands_on_utc_instant(self):
+        # Berlin summer offset +02:00: 15:30+02:00 is 13:30Z on the previous
+        # day — inside the window, in the 13:00Z bucket. A naive
+        # replace(tzinfo=UTC) would have produced the 15:00Z label instead.
+        self.store.submit_task("t3", "key3", PAYLOAD, [])
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE tasks SET created_at = '2026-10-03 15:30:00+02:00' "
+                         "WHERE id = 't3'")
+        projection = self.projection()
+        self.assertIn("2026-10-03T13:00:00Z", projection["buckets"])
+        bucket_ids = [t["id"] for t in projection["buckets"]["2026-10-03T13:00:00Z"]]
+        self.assertIn("t3", bucket_ids)
+
+    def test_malformed_created_at_is_invalid_not_outside(self):
+        self.store.submit_task("t4", "key4", PAYLOAD, [])
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE tasks SET created_at = 'not-a-timestamp' "
+                         "WHERE id = 't4'")
+        projection = self.projection()
+        cov = projection["coverage"]
+        self.assertEqual(cov["created_at_invalid"], 1)
+        self.assertEqual(cov["tasks_outside_window"], 0)
+        self.assertNotIn("t4", json.dumps(projection["buckets"]))
 
     def test_task_outside_window_counted_not_emitted(self):
         with self.store.transaction() as conn:

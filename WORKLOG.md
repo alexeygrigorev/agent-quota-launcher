@@ -108,3 +108,23 @@ Head verified the delivery but rejected product with four findings; all fixed, 8
 * Contract report updated again post-R1 so its verdicts describe the identity-match contract; original child review still preserved verbatim as appendix.
 
 No self-acceptance; both genuine tasks remain completed-awaiting-review under the superseded contract (head verified them manually).
+
+## 2026-10-04 QL-CORE-003 R2 fix round (head review C1524/C1526/C1528)
+
+Report-only corrections plus process notes; 89 tests green.
+
+* Window tiling now includes the partial first clock hour (previous code floored `window_start` then skipped it with +1h): first tile = the hour containing `window_start`, last tile = last hour starting before `as_of` — 25 tiles for off-hour `as_of`, 24 on the hour; `gaps + non-empty buckets == tile count`.
+* Offset-aware `created_at` is converted (`astimezone(utc)`), no longer relabelled via `replace(tzinfo=utc)`; store-native UTC-naive values still assumed UTC. Negatives added: +02:00 wall time must land on its true UTC hour; Berlin-summer +02:00 timestamp lands on the UTC instant, not the naive label.
+* Malformed `created_at` counts as `coverage.created_at_invalid` — unknown/invalid, no longer attributed to the generation hour and never counted outside-window.
+* Negatives for non-hour `as_of` (partial edge tiles pinned), offset, DST, malformed all in tests/test_report.py. Child first-action identity/generation bounds and result-evidence assertions preserved untouched.
+* Process: /tmp scratch from the earlier capture removed; scratch now lives under repo-owned `.local/tmp` only. Example lines re-captured read-only from the live store (TMPDIR pointed at `.local/tmp`); embedded coverage line verified byte-identical to the capture.
+
+## 2026-10-04 QL-CORE-003 R2 fix round (head review C1524/C1526/C1528)
+
+Report-only corrections plus process notes; 89 tests green.
+
+* Window tiling now includes the partial first clock hour (previous code floored `window_start` then skipped it with +1h): first tile = the hour containing `window_start`, last tile = last hour starting before `as_of` — 25 tiles for off-hour `as_of`, 24 on the hour; `gaps + non-empty buckets == tile count`.
+* Offset-aware `created_at` is converted (`astimezone(utc)`), no longer relabelled via `replace(tzinfo=utc)`; store-native UTC-naive values still assumed UTC. Negatives added: +02:00 wall time must land on its true UTC hour; Berlin-summer +02:00 timestamp lands on the UTC instant, not the naive label.
+* Malformed `created_at` counts as `coverage.created_at_invalid` — unknown/invalid, no longer attributed to the generation hour and never counted outside-window.
+* Negatives for non-hour `as_of` (partial edge tiles pinned), offset, DST, malformed all in tests/test_report.py. Child first-action identity/generation bounds and result-evidence assertions preserved untouched.
+* Process: /tmp scratch from the earlier capture removed; scratch now lives under repo-owned `.local/tmp` only. Example lines re-captured read-only from the live store (TMPDIR pointed at `.local/tmp`); embedded coverage line verified byte-identical to the capture.

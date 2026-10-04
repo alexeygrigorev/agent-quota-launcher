@@ -178,10 +178,13 @@ def accept(args):
 
 
 def build_report(store, now=None, project_id=None):
-    """Dashboard projection: hourly UTC buckets over the half-open window
-    [as_of-24h, as_of) with explicit gap labels and a project_id on every
-    artifact. Token usage stays null unless natively proven; quota deltas are
-    a separate object; unknown stays unknown (never zero-fabricated)."""
+    """Dashboard projection: hourly UTC buckets tiling the half-open window
+    [as_of-24h, as_of) — including the partial first clock hour — with
+    explicit gap labels and a project_id on every artifact. Offset-aware
+    created_at values are converted to UTC; malformed ones count as invalid
+    and are never attributed. Token usage stays null unless natively proven;
+    quota deltas are a separate object; unknown stays unknown (never
+    zero-fabricated)."""
     now = now or datetime.now(timezone.utc)
     window_start = now - timedelta(hours=24)
 
@@ -193,24 +196,32 @@ def build_report(store, now=None, project_id=None):
 
     window_labels = []
     h = window_start.replace(minute=0, second=0, microsecond=0)
-    if h < window_start:
-        h += timedelta(hours=1)
     while h < now:
         window_labels.append(hour_label(h))
         h += timedelta(hours=1)
+    label_set = set(window_labels)
 
     buckets = {}
     outside_window = 0
+    created_at_invalid = 0
     for task in store.list_tasks():
         try:
-            dt = datetime.fromisoformat(task["created_at"]).replace(tzinfo=timezone.utc)
+            parsed = datetime.fromisoformat(task["created_at"])
         except (ValueError, TypeError):
-            dt = now  # unattributable tasks land in the generation hour
-        if not (window_start <= dt < now):
+            parsed = None
+        if parsed is None:
+            # Malformed timestamps are unknown/invalid, never attributed to a
+            # fabricated hour and never counted as outside-window.
+            created_at_invalid += 1
+            continue
+        if parsed.tzinfo is None:
+            dt = parsed.replace(tzinfo=timezone.utc)  # store writes UTC-naive
+        else:
+            dt = parsed.astimezone(timezone.utc)  # convert real offsets
+        if not (window_start <= dt < now) or hour_label(dt) not in label_set:
             outside_window += 1
             continue
-        label = hour_label(dt)
-        buckets.setdefault(label, []).append({
+        buckets.setdefault(hour_label(dt), []).append({
             "id": task["id"],
             "state": task["state"],
             "reviewer": task["reviewer"],
@@ -244,8 +255,11 @@ def build_report(store, now=None, project_id=None):
             "last_bucket": max(buckets) if buckets else None,
             "gaps_within_window": gaps,
             "tasks_outside_window": outside_window,
+            "created_at_invalid": created_at_invalid,
             "note": "historical hours without tasks are gaps, not simulated "
-                    "activity; tasks outside the window are counted, not emitted",
+                    "activity; tasks outside the window and tasks with "
+                    "malformed timestamps are counted, not emitted or "
+                    "attributed",
         },
         "buckets": buckets,
     }
