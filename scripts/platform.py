@@ -108,9 +108,15 @@ def checkpoint():
     # Later non-fast-forward platform changes require explicit owner reconciliation.
     p=subprocess.run(['git','merge-base','HEAD','FETCH_HEAD'],cwd=ROOT,capture_output=True,text=True)
     if p.returncode:
-        tree=run(['git','ls-tree','-r','FETCH_HEAD'],cwd=ROOT)
-        if tree:raise RuntimeError('refuse unrelated nonempty canonical history')
-        run(['git','merge','--allow-unrelated-histories','--no-edit','FETCH_HEAD'],cwd=ROOT)
+        seed=setup.get('seedCommit')
+        remote_head=run(['git','rev-parse','FETCH_HEAD'],cwd=ROOT)
+        paths=run(['git','ls-tree','-r','--name-only','FETCH_HEAD'],cwd=ROOT)
+        body=run(['git','show','FETCH_HEAD:README.md'],cwd=ROOT) if paths=='README.md' else ''
+        if remote_head!=seed or paths!='README.md' or body!='agent-branches baseline':
+            raise RuntimeError('refuse unrelated canonical history beyond the verified prototype seed')
+        # Preserve both histories, while retaining the existing project tree.
+        # The upstream seed is the exact single README placeholder, not user work.
+        run(['git','merge','-s','ours','--allow-unrelated-histories','--no-edit','FETCH_HEAD'],cwd=ROOT)
     run(['git','push','platform','HEAD:main'],cwd=ROOT,env=env)
     sha=run(['git','rev-parse','HEAD'],cwd=ROOT)
     actual=api(cfg['sidecar'],cfg['sidecar_token'],f'/api/repos/{name}/head?ref=main')['sha']
@@ -134,6 +140,22 @@ def task(args):
         save(marker,obj);pending.unlink()
     print(json.dumps({k:v for k,v in obj.items() if k!='token'}))
 
+def push_task(args):
+    if not args.id.replace('-','').isalnum():raise ValueError('simple task id required')
+    cfg=json.loads(CONFIG.read_text())
+    obj=json.loads((LOCAL/('platform-task-'+args.id+'.json')).read_text())
+    url=obj['fork']['remote']; token=obj['token']['plaintext']
+    lock=open(LOCAL/'git.lock','a');fcntl.flock(lock,fcntl.LOCK_EX)
+    sha=run(['git','rev-parse','HEAD'],cwd=ROOT)
+    run(['git','push',url,'HEAD:refs/heads/main'],cwd=ROOT,env=auth_env(url,token))
+    # Explicit receipt covers callback delivery lag; upstream deduplicates SHA.
+    receipt=api(cfg['coordinator'],token,'/events/push',{'agent':obj['agentId'],'ref':'refs/heads/main','sha':sha})
+    if receipt['heads'].get(obj['agentId'])!=sha:raise RuntimeError('task head was not observed by coordinator')
+    proof={'task_id':obj['taskId'],'agent_id':obj['agentId'],'sha':sha,'remote':url,
+           'coordinator_accepted':receipt['accepted'],'deduped':receipt['deduped'],
+           'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    save(LOCAL/('platform-push-'+args.id+'.json'),proof);print(json.dumps(proof))
+
 def status():
     cfg=json.loads(CONFIG.read_text());data=api(cfg['coordinator'],cfg['admin_token'],'/status')
     # State excludes task credential plaintext per the upstream API contract.
@@ -147,11 +169,13 @@ def main():
     s=sub.add_parser('serve');s.add_argument('mode',choices=['sidecar','coordinator'])
     sub.add_parser('checkpoint');sub.add_parser('status')
     s=sub.add_parser('task');s.add_argument('id');s.add_argument('intent')
+    s=sub.add_parser('push-task');s.add_argument('id')
     args=p.parse_args()
     if args.cmd=='provision':provision(args)
     elif args.cmd=='serve':serve(args.mode)
     elif args.cmd=='checkpoint':checkpoint()
     elif args.cmd=='task':task(args)
+    elif args.cmd=='push-task':push_task(args)
     else:status()
 
 if __name__=='__main__':main()
