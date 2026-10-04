@@ -128,3 +128,19 @@ Report-only corrections plus process notes; 89 tests green.
 * Malformed `created_at` counts as `coverage.created_at_invalid` — unknown/invalid, no longer attributed to the generation hour and never counted outside-window.
 * Negatives for non-hour `as_of` (partial edge tiles pinned), offset, DST, malformed all in tests/test_report.py. Child first-action identity/generation bounds and result-evidence assertions preserved untouched.
 * Process: /tmp scratch from the earlier capture removed; scratch now lives under repo-owned `.local/tmp` only. Example lines re-captured read-only from the live store (TMPDIR pointed at `.local/tmp`); embedded coverage line verified byte-identical to the capture.
+
+## 2026-10-04 QL-CORE-003 R3 fix round (head review C1538)
+
+First-action validator tightened; R2 report behavior kept as-is. 95 tests green.
+
+* ISO `timestamp` in a first action is now bounded like the epoch-ms fields: timezone-aware required (naive fails), not older than the launched session's `created_at_ms` minus 5s skew, not more than 5 minutes in the future.
+* Laundered start records rejected, not only byte-identical copies: an artifact that agrees with the launch start record on every non-time/non-phase key while adding at most `timestamp` (and/or fiddling `created_at_ms`/`updated_at_ms`/`phase`) is the wrapper's own record, not an agent action. A genuine rich whoami always carries real extra session fields (`last_activity_ms`, `reported_state`, ...) and still passes. Identity match is documented as identity, not tool provenance.
+* Negatives added: naive timestamp, stale-vs-launch timestamp, far-future timestamp, start+timestamp, start+altered created_at_ms; positive pin that start+timestamp+real extra keys stays acceptable. Child identity/generation bounds and result-evidence assertions preserved.
+
+## 2026-10-04 QL-CORE-003 R3 fix round (head review C1538)
+
+First-action validator tightened; R2 report behavior kept as-is. 95 tests green.
+
+* ISO `timestamp` in a first action is now bounded like the epoch-ms fields: timezone-aware required (naive fails), not older than the launched session's `created_at_ms` minus 5s skew, not more than 5 minutes in the future.
+* Laundered start records rejected, not only byte-identical copies: an artifact that agrees with the launch start record on every non-time/non-phase key while adding at most `timestamp` (and/or fiddling `created_at_ms`/`updated_at_ms`/`phase`) is the wrapper's own record, not an agent action. A genuine rich whoami always carries real extra session fields (`last_activity_ms`, `reported_state`, ...) and still passes. Identity match is documented as identity, not tool provenance.
+* Negatives added: naive timestamp, stale-vs-launch timestamp, far-future timestamp, start+timestamp, start+altered created_at_ms; positive pin that start+timestamp+real extra keys stays acceptable. Child identity/generation bounds and result-evidence assertions preserved.

@@ -69,11 +69,21 @@ def build_adapter_argv(provider, goal):
 
 
 def _has_time_evidence(data, start_json, now_ms):
-    """At least one parseable time field, sane against the start record."""
+    """At least one time field, sane against the launch window: not before
+    the launched session's creation, not in the fabricated future. ISO
+    timestamps must be timezone-aware (naive fails) and are bounded like the
+    epoch-ms fields."""
     ts = data.get("timestamp")
     if isinstance(ts, str):
         text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
-        datetime.fromisoformat(text)  # raises if unparsable
+        parsed = datetime.fromisoformat(text)  # raises if unparsable
+        if parsed.tzinfo is None:
+            return False  # naive ISO timestamp: no provable instant
+        if start_json.get("created_at_ms") and \
+                parsed.timestamp() * 1000 < start_json["created_at_ms"] - 5000:
+            return False  # stale: older than the launched session itself
+        if now_ms is not None and parsed.timestamp() * 1000 > now_ms + 300_000:
+            return False  # future: fabricated urgency
         return True
     for field in ("created_at_ms", "updated_at_ms"):
         ms = data.get(field)
@@ -90,10 +100,12 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
     """Content check of the child's first-action artifact against the launch
     start record. Identity must match the launched session: id, tag and
     workspace equal the start record's, and parent_session must match when
-    the artifact carries it. A copy of the wrapper start record (byte-identical
-    or merely reformatted) is not a first action. The rich native whoami is
-    preserved: extra keys (command, phase, schema_version, ...) are expected,
-    never blacklisted."""
+    the artifact carries it. Identity match is not tool provenance: any
+    record that is the wrapper start JSON itself — byte-identical,
+    reformatted, or merely augmented with timestamp fields — is rejected as
+    a laundered copy, not an agent action. The rich native whoami is
+    preserved: extra keys beyond the start record (command, phase,
+    schema_version, worker_pid, ...) are expected, never blacklisted."""
     try:
         if not os.path.exists(fa_path):
             return False
@@ -104,8 +116,19 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
         data = json.loads(raw)
         if not isinstance(data, dict):
             return False
-        if data == start_json:
-            return False  # echo of the wrapper start record, not an agent action
+        if all(data.get(k) == v for k, v in start_json.items()) and \
+                set(data) - set(start_json) <= {"timestamp"}:
+            # The wrapper start JSON itself: byte-identical, reformatted, or
+            # laundered with an added timestamp. Not a first tool action.
+            return False
+        differs = {k for k in start_json if data.get(k) != start_json[k]}
+        added = set(data) - set(start_json)
+        if added <= {"timestamp"} and \
+                differs <= {"created_at_ms", "updated_at_ms", "phase"}:
+            # Altered start record: identical on every non-time, non-phase
+            # key, with at most fiddled time/phase values and an added
+            # timestamp. Still the wrapper's own record, not an agent action.
+            return False
         if data.get("id") != start_json.get("id"):
             return False
         if data.get("tag") != start_json.get("tag"):

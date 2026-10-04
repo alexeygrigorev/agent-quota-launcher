@@ -52,7 +52,7 @@ class TestFirstActionValidator(unittest.TestCase):
 
     def test_minimal_identity_plus_timestamp_accepted(self):
         self.write({"id": "sess-1", "tag": "task-t1", "workspace": "/repo",
-                    "timestamp": "2026-10-04T12:00:05Z"})
+                    "timestamp": "2026-10-04T12:29:00Z"})
         self.assertTrue(self.check())
 
     def test_start_record_copy_rejected(self):
@@ -63,6 +63,45 @@ class TestFirstActionValidator(unittest.TestCase):
     def test_reformatted_start_record_copy_rejected(self):
         # ...and neither is the same record re-serialized with other whitespace.
         self.fa.write_text(json.dumps(self.start, indent=2, sort_keys=True))
+        self.assertFalse(self.check())
+
+    def test_start_record_plus_timestamp_rejected(self):
+        # Laundering: the wrapper start JSON with nothing but an added
+        # timestamp is still the wrapper's own record, not an agent action
+        # (head C1538: identity match is not tool provenance).
+        self.fa.write_text(json.dumps(dict(self.start, timestamp="2026-10-04T12:29:00Z")))
+        self.assertFalse(self.check())
+
+    def test_start_record_plus_ms_fields_rejected(self):
+        # Same laundering with epoch-ms time fields instead of an ISO stamp.
+        self.fa.write_text(json.dumps(dict(
+            self.start, created_at_ms=self.start["created_at_ms"] + 5000)))
+        self.assertFalse(self.check())
+
+    def test_start_record_plus_real_extra_keys_accepted(self):
+        # A genuine whoami that agrees with the start record on every start
+        # key but carries real additional session fields is NOT the launder
+        # shape and stays acceptable.
+        self.write(dict(self.start, timestamp="2026-10-04T12:29:00Z",
+                        last_activity_ms=self.start["created_at_ms"] + 8000,
+                        worker_pid=4242))
+        self.assertTrue(self.check())
+
+    def test_naive_iso_timestamp_rejected(self):
+        # No timezone: no provable instant.
+        self.write(dict(self.rich_whoami(), timestamp="2026-10-04T12:00:05"))
+        self.assertFalse(self.check())
+
+    def test_timestamp_stale_vs_launch_rejected(self):
+        # Before the launched session's own creation: impossible for a
+        # genuine whoami taken after start.
+        self.write(dict(self.rich_whoami(),
+                        timestamp="2026-10-04T11:00:00Z"))  # 1h+ before start ms
+        self.assertFalse(self.check())
+
+    def test_timestamp_far_future_rejected(self):
+        self.write(dict(self.rich_whoami(), timestamp="2026-10-04T13:30:00Z"))
+        # now_ms = start + 60s; 13:30Z is far ahead -> fabricated
         self.assertFalse(self.check())
 
     def test_wrong_id_rejected(self):
