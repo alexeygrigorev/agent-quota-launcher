@@ -7,6 +7,8 @@ from pathlib import Path
 from contextlib import contextmanager
 import re
 
+from launcher.tags import run_tag_for
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -103,13 +105,28 @@ class Store:
                 )
         return True
 
-    def complete_task(self, task_id, reviewer):
+    def complete_task(self, task_id, reviewer, reason=None):
         """running -> completed-awaiting-review. Cannot complete queued or
-        launch-uncertain work; caller confirms native process death first."""
+        launch-uncertain work; the caller must confirm native process death
+        AND hold result evidence before calling."""
         return self.transition_task(
             task_id, "completed-awaiting-review", ("running",),
-            reason="head marked complete; native death confirmed", reviewer=reviewer,
+            reason=reason or "head marked complete; native death confirmed",
+            reviewer=reviewer,
         )
+
+    def fail_task(self, task_id, reviewer, reason):
+        """running -> failed. Honest close for launches whose native died
+        without producing result evidence; caller confirms death first."""
+        return self.transition_task(
+            task_id, "failed", ("running",), reason=reason, reviewer=reviewer,
+        )
+
+    def get_task_paths(self, task_id):
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT path FROM task_paths WHERE task_id = ?", (task_id,))
+            return [r[0] for r in cursor.fetchall()]
 
     def accept_task(self, task_id, reviewer):
         """completed-awaiting-review -> accepted only. Queued, launch-uncertain
@@ -224,7 +241,7 @@ class Store:
             cursor = conn.execute(query, params)
             for row in cursor.fetchall():
                 task_id, mem, disk = row
-                res = subprocess.run(["aplexer", "status", f"task-{task_id}", "--json"],
+                res = subprocess.run(["aplexer", "status", run_tag_for(task_id), "--json"],
                                      capture_output=True, text=True, timeout=15)
                 if res.returncode == 0:
                     try:

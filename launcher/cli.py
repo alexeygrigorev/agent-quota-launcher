@@ -4,12 +4,11 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from launcher.store import Store, launch_lock, StateTransitionError
 from launcher.launch import do_run, native_status
+from launcher.tags import run_tag_for
 
-BERLIN = ZoneInfo("Europe/Berlin")
 REPORT = "report"  # exported so tests can build the projection
 
 
@@ -101,17 +100,65 @@ def complete(args):
     if task["state"] != "running":
         print(f"error: task {args.id} is {task['state']}, complete requires running")
         return 1
-    alive, detail = native_status(f"task-{args.id}")
-    if alive == "alive":
-        print(f"error: native process still alive ({detail}); RAM lease must not be "
-              f"released before confirmed death")
+    alive, detail = native_status(run_tag_for(args.id))
+    if alive != "dead":
+        print(f"error: native death not confirmed (status: {alive}; {detail}). "
+              f"An unknown status is not evidence; retry after `watch` reconciles, "
+              f"or use `fail` only once death is confirmed.")
+        return 1
+    evidence = _result_evidence(store, args.id)
+    if not evidence:
+        print(f"error: no result evidence: no owned path holds a non-empty artifact. "
+              f"Native death alone is not success; close with `fail --reason ...` "
+              f"instead of completing.")
         return 1
     try:
-        store.complete_task(args.id, args.reviewer)
+        store.complete_task(args.id, args.reviewer,
+                            reason=f"head marked complete; native death confirmed "
+                                   f"({detail}); result evidence: {', '.join(evidence)}")
     except StateTransitionError as e:
         print(f"error: {e}")
         return 1
-    print(f"completed-awaiting-review: {args.id} (reviewer {args.reviewer}; native: {detail})")
+    print(f"completed-awaiting-review: {args.id} (reviewer {args.reviewer}; "
+          f"native: {detail}; evidence: {len(evidence)} artifact(s))")
+    return 0
+
+
+def _result_evidence(store, task_id):
+    """Owned paths holding a non-empty file count as result evidence."""
+    found = []
+    for p in store.get_task_paths(task_id):
+        try:
+            pp = Path(p)
+            if pp.is_file() and pp.stat().st_size > 0:
+                found.append(str(pp))
+        except OSError:
+            continue
+    return found
+
+
+def fail(args):
+    store = get_store(args)
+    task = store.get_task(args.id)
+    if not task:
+        print(f"error: unknown task {args.id}")
+        return 1
+    if task["state"] != "running":
+        print(f"error: task {args.id} is {task['state']}, fail requires running")
+        return 1
+    alive, detail = native_status(run_tag_for(args.id))
+    if alive != "dead":
+        print(f"error: native death not confirmed (status: {alive}; {detail}); "
+              f"refusing to fail a possibly-live worker")
+        return 1
+    try:
+        store.fail_task(args.id, args.reviewer,
+                        reason=f"failed by {args.reviewer}: {args.reason}; "
+                               f"native death confirmed ({detail})")
+    except StateTransitionError as e:
+        print(f"error: {e}")
+        return 1
+    print(f"failed: {args.id} (reviewer {args.reviewer}; native: {detail})")
     return 0
 
 
@@ -130,18 +177,39 @@ def accept(args):
     return 0
 
 
-def build_report(store, now=None):
-    """Dashboard projection: hourly Berlin buckets, 24h coverage with explicit
-    gaps. Token usage stays null unless natively proven; quota deltas are a
-    separate object; unknown stays unknown (never zero-fabricated)."""
+def build_report(store, now=None, project_id=None):
+    """Dashboard projection: hourly UTC buckets over the half-open window
+    [as_of-24h, as_of) with explicit gap labels and a project_id on every
+    artifact. Token usage stays null unless natively proven; quota deltas are
+    a separate object; unknown stays unknown (never zero-fabricated)."""
     now = now or datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=24)
+
+    def z(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def hour_label(dt):
+        return dt.strftime("%Y-%m-%dT%H:00:00Z")
+
+    window_labels = []
+    h = window_start.replace(minute=0, second=0, microsecond=0)
+    if h < window_start:
+        h += timedelta(hours=1)
+    while h < now:
+        window_labels.append(hour_label(h))
+        h += timedelta(hours=1)
+
     buckets = {}
+    outside_window = 0
     for task in store.list_tasks():
         try:
             dt = datetime.fromisoformat(task["created_at"]).replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
-            dt = now
-        label = dt.astimezone(BERLIN).strftime("%Y-%m-%dT%H:00:00%z")
+            dt = now  # unattributable tasks land in the generation hour
+        if not (window_start <= dt < now):
+            outside_window += 1
+            continue
+        label = hour_label(dt)
         buckets.setdefault(label, []).append({
             "id": task["id"],
             "state": task["state"],
@@ -161,22 +229,23 @@ def build_report(store, now=None):
             },
         })
 
-    hour_start = now.astimezone(BERLIN).replace(minute=0, second=0, microsecond=0)
-    gaps = []
-    for i in range(24):
-        label = (hour_start - timedelta(hours=23 - i)).strftime("%Y-%m-%dT%H:00:00%z")
-        if label not in buckets:
-            gaps.append(label)
+    gaps = [label for label in window_labels if label not in buckets]
 
     return {
-        "timezone": "Europe/Berlin",
-        "generated_at": now.isoformat(),
+        "project_id": project_id,
+        "timezone": "UTC",
+        "generated_at": z(now),
         "coverage": {
             "window_hours": 24,
+            "window_start": z(window_start),
+            "window_end": z(now),
+            "window_half_open": "[window_start, window_end)",
             "first_bucket": min(buckets) if buckets else None,
             "last_bucket": max(buckets) if buckets else None,
-            "gaps_within_last_24h": gaps,
-            "note": "historical hours without tasks are gaps, not simulated activity",
+            "gaps_within_window": gaps,
+            "tasks_outside_window": outside_window,
+            "note": "historical hours without tasks are gaps, not simulated "
+                    "activity; tasks outside the window are counted, not emitted",
         },
         "buckets": buckets,
     }
@@ -184,11 +253,13 @@ def build_report(store, now=None):
 
 def report(args):
     store = get_store(args)
-    projection = build_report(store)
+    project_id = getattr(args, 'project_id', None) or Path.cwd().resolve().name
+    projection = build_report(store, project_id=project_id)
     if getattr(args, 'jsonl', False):
         for bucket in sorted(projection["buckets"]):
-            print(json.dumps({"bucket": bucket, "tasks": projection["buckets"][bucket]}))
-        print(json.dumps({"coverage": projection["coverage"]}))
+            print(json.dumps({"project_id": project_id, "bucket": bucket,
+                              "tasks": projection["buckets"][bucket]}))
+        print(json.dumps({"project_id": project_id, "coverage": projection["coverage"]}))
     else:
         print(json.dumps(projection, indent=2))
     return 0
@@ -242,8 +313,19 @@ def main():
     parser_accept.add_argument("--reviewer", required=True)
     parser_accept.set_defaults(func=accept)
 
+    parser_fail = subparsers.add_parser(
+        "fail",
+        help="close a running task as failed; requires confirmed native death and a reason")
+    parser_fail.add_argument("--id", required=True)
+    parser_fail.add_argument("--reviewer", required=True)
+    parser_fail.add_argument("--reason", required=True)
+    parser_fail.set_defaults(func=fail)
+
     parser_report = subparsers.add_parser("report", help="bounded JSON/JSONL dashboard projection")
     parser_report.add_argument("--jsonl", action="store_true")
+    parser_report.add_argument("--project-id", default=None,
+                               help="project identity stamped on every emitted line "
+                                    "(default: current directory name)")
     parser_report.set_defaults(func=report)
 
     parser_watch = subparsers.add_parser("watch",

@@ -10,68 +10,84 @@
 > (pre-`b79ae70`). The README was rewritten later the same day in commit
 > `b79ae70` and now documents most of what the original review found missing.
 > All three axes were re-checked line-by-line against the current checkout; the
-> original text is preserved verbatim as the appendix. Current status summary:
+> original text is preserved verbatim as the appendix. After head review round
+> R1 (Principal C1450: a key blacklist rejects genuine native whoami, which
+> carries `command`/`phase`/`parent_session`/`schema_version`), the first-action
+> check was replaced by identity matching against the launch start record.
+> Current status summary (as of R1):
 >
-> | Axis | Original | Current (b79ae70) |
+> | Axis | Original | Current (R1) |
 > | --- | --- | --- |
 > | 1. Identity / first action | missing / nonconforming | largely conforming; one residual |
-> | 2. Accept vs exit 0 | missing / nonconforming | conforming |
+> | 2. Accept vs exit 0 | missing / nonconforming | conforming (strengthened in R1) |
 > | 3. Resource gates | partially conforming | conforming |
+>
+> Known limitation of this document: it is a documentation review; it does not
+> certify any launch. The genuine r3 runs it accompanied were validated under
+> the superseded blacklist contract and accepted by head manual verification,
+> not by this report.
 
 ## 1. Identity and first action — current status: largely conforming
 
-`README.md:52` now states the content-check contract directly: the child must
-write a whoami-shaped `{id, tag, workspace, timestamp}` artifact, and
-wrapper/engine start records containing `command`, `phase`, `parent_session`,
-or `schema_version` keys are rejected, as are mismatched identities and stale
-files. This covers SPEC.md:12 (whoami tag/workspace match; native first action
-distinct from the wrapper started marker) and the core-2 rejection cause
-(`.local/first-action-genuine-5.json` was a wrapper `phase: starting` record).
+`README.md` now states the first-action contract as identity matching: the
+child's first tool action must write its full native `aplexer whoami --json`
+output to the first-action artifact path; validation matches `id`, `tag`, and
+`workspace` — plus `parent_session` when present — against the launch start
+record, rejects any copy of that record (byte-identical or reformatted), and
+requires a sane time field. The rich whoami is preserved as-is; no key is
+blacklisted. This covers SPEC.md:12 (whoami tag/workspace match; native first
+action distinct from the wrapper started marker) and both rejection causes
+observed so far: core-2's `phase: starting` wrapper record (a start-record
+copy) and forged identities.
 
-Residual: SPEC.md:6 requires each task to carry a **first-action artifact
-path** and an **expected result artifact path**. The CLI has no dedicated
-arguments for either (`submit` takes generic `--paths`, `launcher/cli.py:216`);
-the contract is met by convention — the first-action artifact must live inside
-the owned `--paths` and is content-validated at launch — and the submit example
-(`README.md:19-25`) passes `--paths .local/artifact.json` without saying that
-this is the first-action artifact. Documented behavior is correct; the
-convention is implicit rather than stated.
+Residual (unchanged by R1, documentation nit): SPEC.md:6 requires each task to
+carry a **first-action artifact path** and an **expected result artifact path**.
+The CLI has no dedicated arguments for either (`submit` takes generic
+`--paths`, `launcher/cli.py` submit parser); the contract is met by convention
+— the first-action artifact must live inside the owned `--paths` and is
+content-validated at launch — and the submit example passes
+`--paths .local/artifact.json` without saying that this is the first-action
+artifact.
 
-## 2. Accept versus exit 0 — current status: conforming
+## 2. Accept versus exit 0 — current status: conforming (strengthened in R1)
 
-- `README.md:42-44` documents exact runnable `complete` / `accept` examples,
-  both requiring `--reviewer` (SPEC.md:4 "names may vary but document exact
+- `README.md` documents exact runnable `complete` / `accept` / `fail` examples,
+  all requiring `--reviewer` (SPEC.md:4 "names may vary but document exact
   runnable examples").
-- `README.md:49` enumerates the full lifecycle including `launch-uncertain`.
-- `README.md:51` states "**Exit 0 is not acceptance.**" and that `accept` only
+- `README.md` enumerates the full lifecycle including `launch-uncertain`.
+- `README.md` states "**Exit 0 is not acceptance.**" and that `accept` only
   moves `completed-awaiting-review -> accepted` with the reviewer identity;
   queued, running, and `launch-uncertain` tasks cannot be accepted or
-  completed (SPEC.md:14).
-- `plan` is documented as always dry-run, no state change, no launch
-  (`README.md:27-28`), matching SPEC.md:4.
+  completed (SPEC.md:14). R1 (head review) added two guards the original SPEC
+  reading under-specified: `complete` refuses until native death is
+  **confirmed** (an unknown aplexer status is not evidence) and refuses without
+  result evidence (at least one owned path holding a non-empty artifact);
+  death without evidence is closed with the guarded `fail` subcommand instead.
+- `plan` is documented as always dry-run, no state change, no launch,
+  matching SPEC.md:4.
 
 ## 3. Resource gates — current status: conforming
 
-`README.md:72` now carries every audited number: worker memory <= 1500 MiB;
-host MemAvailable >= 10 GiB after active reservations; cwd/TMPDIR >= 50 GiB +
-active reservations + 512 MiB spike; `/tmp` rejected and TMPDIR resolved under
-the owned `<repo>/.local/tmp` by path containment (SPEC.md:12, SPEC.md:16).
-The `run` example passes `--tmpdir .../.local/tmp` (`README.md:34`), which
-resolves under the owned root. Ranking is also now contract-grade
-(`README.md:68`): reset multiplier bounded to [1, 3], unknown `task_fit` /
-`health` weight 0 and never fabricated to 1.0, seed + weights recorded, and the
-promotion multiplier 1.0 / cutoff 2026-10-06T16:00Z stated (SPEC.md:10).
+`README.md` carries every audited number: worker memory <= 1500 MiB; host
+MemAvailable >= 10 GiB after active reservations; cwd/TMPDIR >= 50 GiB + active
+reservations + 512 MiB spike; `/tmp` rejected and TMPDIR resolved under the
+owned `<repo>/.local/tmp` by path containment (SPEC.md:12, SPEC.md:16). The
+`run` example passes `--tmpdir .../.local/tmp`, which resolves under the owned
+root. Ranking is also contract-grade: reset multiplier bounded to [1, 3],
+unknown `task_fit` / `health` weight 0 and never fabricated to 1.0, seed +
+weights recorded, and the promotion multiplier 1.0 / cutoff 2026-10-06T16:00Z
+stated (SPEC.md:10).
 
-## Verdict (re-verified)
+## Verdict (re-verified, R1)
 
-README at `b79ae70` is a contract document, not just a quickstart: it now
-covers the guarded acceptance transition and the exit-0 caveat (axis 2) and all
-numeric resource gates plus the `/tmp` rejection (axis 3) that the original
-review found absent, and it documents the wrapper-start vs native-first-action
-distinction that motivated this repair round (axis 1). One residual gap: the
-first-action artifact path is carried by convention inside generic `--paths`
-with no dedicated field and no explicit labeling in the submit example — a
-documentation nit, not a correctness defect.
+README at the R1 head is a contract document, not just a quickstart: it covers
+the guarded acceptance transition and the exit-0 caveat (axis 2, now with
+confirmed-death and result-evidence gates on `complete`), all numeric resource
+gates plus the `/tmp` rejection (axis 3), and the identity-matched
+first-action contract that replaced the superseded key blacklist (axis 1).
+One residual gap: the first-action artifact path is carried by convention
+inside generic `--paths` with no dedicated field and no explicit labeling in
+the submit example — a documentation nit, not a correctness defect.
 
 ---
 

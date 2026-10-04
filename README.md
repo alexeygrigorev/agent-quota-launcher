@@ -35,21 +35,25 @@ python3 -m launcher --config-dir .local/launcher-config run \
 
 # Status, dashboard projection, non-LLM queue watcher
 python3 -m launcher --config-dir .local/launcher-config status
-python3 -m launcher --config-dir .local/launcher-config report [--jsonl]
+python3 -m launcher --config-dir .local/launcher-config report [--jsonl] [--project-id NAME]
 python3 -m launcher --config-dir .local/launcher-config watch \
     --cwd /repo --tmpdir /repo/.local/tmp [--interval 10] [--once]
 
 # Lifecycle completions are guarded and require a reviewer identity
 python3 -m launcher --config-dir .local/launcher-config complete --id task-123 --reviewer head-x
 python3 -m launcher --config-dir .local/launcher-config accept   --id task-123 --reviewer head-x
+
+# Death without result evidence is closed as failed, never completed
+python3 -m launcher --config-dir .local/launcher-config fail --id task-123 \
+    --reviewer head-x --reason "no result artifacts produced"
 ```
 
 ## Lifecycle and semantics
 
 `queued -> starting -> running -> completed-awaiting-review -> accepted`, plus `launch-uncertain`, `stalled`, `failed`, `blocked` notes. Invariants:
 
-- **Exit 0 is not acceptance.** `accept` only moves `completed-awaiting-review -> accepted`, recorded with the reviewer identity. Queued, running, and `launch-uncertain` tasks cannot be accepted or completed.
-- **First action is content-checked.** The child itself must write a whoami-shaped `{id, tag, workspace, timestamp}` artifact. Wrapper/engine start records — anything containing `command`, `phase`, `parent_session`, or `schema_version` keys — are rejected, as are mismatched identities and stale files.
+- **Exit 0 is not acceptance.** `accept` only moves `completed-awaiting-review -> accepted`, recorded with the reviewer identity. Queued, running, and `launch-uncertain` tasks cannot be accepted or completed. `complete` requires **confirmed** native death (an unknown aplexer status is refused) **and** result evidence: at least one owned path holding a non-empty artifact. Death without evidence is closed with `fail --reason`, never completed.
+- **First action is identity-matched, not key-blacklisted.** The child's first tool action must write its full native `aplexer whoami --json` output to the first-action artifact path. Validation matches `id`, `tag`, and `workspace` — and `parent_session` when the artifact carries it — against the launch start record, rejects any copy of that record (byte-identical or reformatted), and requires a sane time field. The rich whoami (`command`, `phase`, `schema_version`, ...) is preserved as-is; those keys are expected on genuine output, never blacklisted.
 - **Timeouts are enforced on the process group.** `payload.timeout` (60–7200s) bounds `aplexer start` plus the first-action wait; the launch lock is only held for reserve+spawn, not the wait. Deadline expiry marks `launch-uncertain` and retains the lease until native session death is confirmed by reconciliation (`watch`).
 - **Resource leases are honest.** RAM/disk reservations cover queued/starting/running/uncertain/stalled tasks and are released after confirmed process death; path leases hold through `completed-awaiting-review`. A launching task excludes its own reservation (`exclude_task_id`).
 
@@ -73,4 +77,4 @@ Worker memory <= 1500 MiB; host MemAvailable must retain >= 10 GiB after active 
 
 ## Report (dashboard contract)
 
-`report --jsonl` emits hourly Europe/Berlin buckets with explicit 24h coverage and gap labels. Token fields (`input_tokens`, `output_tokens`, `cached_tokens`, `cost`) stay `null` with `source: "unproven"` unless natively proven; quota deltas are a separate object; unknown stays unknown — never zero-fabricated. Account percent deltas are not token use or cost.
+`report --jsonl` emits hourly UTC buckets over the half-open window `[as_of-24h, as_of)` with `Z`-suffixed labels, explicit 24h gap labels, and a `project_id` on every line (`--project-id NAME`, default: current directory name). Tasks outside the window are counted in `coverage.tasks_outside_window`, not emitted. Token fields (`input_tokens`, `output_tokens`, `cached_tokens`, `cost`) stay `null` with `source: "unproven"` unless natively proven; quota deltas are a separate object; unknown stays unknown — never zero-fabricated. Account percent deltas are not token use or cost.

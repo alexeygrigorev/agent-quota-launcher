@@ -25,6 +25,7 @@ from launcher.admission import fetch_quse, validate_quse, PROMO_MULTIPLIER, PROM
 from launcher.ranking import select_candidate
 from launcher.resources import check_resources
 from launcher.store import Store, launch_lock, StateTransitionError
+from launcher.tags import run_tag_for
 
 ZCODE_CJS = "/opt/ZCode/resources/glm/zcode.cjs"
 ZCODEX_BIN = "/home/alexey/.local/bin/zcodex"
@@ -50,11 +51,11 @@ ADAPTERS = {
     },
 }
 
-# First-action artifacts must be whoami-shaped and nothing else. Any of these
-# keys marks an engine/wrapper start record (phase/command/schema_version/...),
-# which never proves a genuine agent tool action.
-FIRST_ACTION_KEYS = {"id", "tag", "workspace", "timestamp"}
-FIRST_ACTION_FORBIDDEN_KEYS = {"command", "phase", "parent_session", "schema_version"}
+# The native whoami is RICH (id, tag, workspace, engine, command, phase,
+# parent_session, schema_version, created_at_ms, ...). A first action is
+# validated by identity match against the launch start record, never by a
+# key blacklist: genuine whoami output carries command/phase/... keys.
+FIRST_ACTION_TIME_FIELDS = ("timestamp", "created_at_ms", "updated_at_ms")
 
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 7200
@@ -67,36 +68,54 @@ def build_adapter_argv(provider, goal):
     return list(adapter["argv"]) + [str(goal)]
 
 
-def validate_first_action(fa_path, expected_id, expected_tag, expected_workspace, min_mtime):
-    """Content check: exactly whoami-shaped {id, tag, workspace, timestamp}
-    with matching values; wrapper/engine start records (containing command,
-    phase, parent_session or schema_version) are rejected."""
+def _has_time_evidence(data, start_json, now_ms):
+    """At least one parseable time field, sane against the start record."""
+    ts = data.get("timestamp")
+    if isinstance(ts, str):
+        text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        datetime.fromisoformat(text)  # raises if unparsable
+        return True
+    for field in ("created_at_ms", "updated_at_ms"):
+        ms = data.get(field)
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+            if start_json.get("created_at_ms") and ms < start_json["created_at_ms"] - 5000:
+                return False  # older than the launched session itself
+            if now_ms is not None and ms > now_ms + 300_000:
+                return False  # fabricating the future
+            return True
+    return False
+
+
+def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
+    """Content check of the child's first-action artifact against the launch
+    start record. Identity must match the launched session: id, tag and
+    workspace equal the start record's, and parent_session must match when
+    the artifact carries it. A copy of the wrapper start record (byte-identical
+    or merely reformatted) is not a first action. The rich native whoami is
+    preserved: extra keys (command, phase, schema_version, ...) are expected,
+    never blacklisted."""
     try:
         if not os.path.exists(fa_path):
             return False
         if os.path.getmtime(fa_path) < min_mtime - 5:
             return False
-        with open(fa_path, 'r') as f:
-            data = json.load(f)
+        with open(fa_path, 'rb') as f:
+            raw = f.read()
+        data = json.loads(raw)
         if not isinstance(data, dict):
             return False
-        keys = set(data.keys())
-        if keys & FIRST_ACTION_FORBIDDEN_KEYS:
+        if data == start_json:
+            return False  # echo of the wrapper start record, not an agent action
+        if data.get("id") != start_json.get("id"):
             return False
-        if keys != FIRST_ACTION_KEYS:
+        if data.get("tag") != start_json.get("tag"):
             return False
-        if data.get("id") != expected_id:
+        if data.get("workspace") != start_json.get("workspace"):
             return False
-        if data.get("tag") != expected_tag:
+        if "parent_session" in data and \
+                data.get("parent_session") != start_json.get("parent_session"):
             return False
-        if data.get("workspace") != expected_workspace:
-            return False
-        ts = data.get("timestamp")
-        if not isinstance(ts, str):
-            return False
-        text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
-        datetime.fromisoformat(text)  # must parse as ISO-8601
-        return True
+        return _has_time_evidence(data, start_json, now_ms)
     except Exception:
         return False
 
@@ -237,7 +256,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     check_resources(1500, workspace, tmpdir_resolved, active_mem, active_disk,
                     repo_root=workspace)
 
-    run_tag = f"task-{task_id}"
+    run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
 
     cmd = [
@@ -315,8 +334,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     record["first_action_path"] = str(fa_path)
     while time.monotonic() < deadline:
-        if validate_first_action(str(fa_path), sess_id, sess_tag, sess_ws,
-                                 record["started_at_ts"]):
+        if validate_first_action(str(fa_path), start_json,
+                                 record["started_at_ts"], now_ms=time.time() * 1000):
             store.transition_task(task_id, "running", ("starting",),
                                   reason="genuine first action validated")
             record["outcome"] = "running"

@@ -20,68 +20,104 @@ class TestFirstActionValidator(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.fa = Path(self.dir) / "first-action-t1.json"
         self.min_mtime = time.time() - 60
+        # The wrapper start record captured at launch (aplexer start --json):
+        # rich, with engine/wrapper keys. Identity fields pin the session.
+        self.start = {"schema_version": 1, "id": "sess-1", "tag": "task-t1",
+                      "workspace": "/repo", "parent_session": "parent-1",
+                      "engine": "zcodex", "phase": "starting",
+                      "command": ["zcodex", "exec"],
+                      "created_at_ms": 1791116912591}
+        self.now_ms = self.start["created_at_ms"] + 60_000
 
     def write(self, obj):
         self.fa.write_text(json.dumps(obj))
 
-    def genuine(self):
-        return {"id": "sess-1", "tag": "task-t1",
-                "workspace": "/repo", "timestamp": "2026-10-04T12:00:00Z"}
+    def check(self):
+        return validate_first_action(str(self.fa), self.start, self.min_mtime,
+                                     now_ms=self.now_ms)
 
-    def test_genuine_whoami_shape_accepted(self):
-        self.write(self.genuine())
-        self.assertTrue(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                              "/repo", self.min_mtime))
+    def rich_whoami(self):
+        # What a native `aplexer whoami --json` actually emits: identity plus
+        # command/phase/parent_session/schema_version etc.
+        return dict(self.start, phase="running",
+                    created_at_ms=self.start["created_at_ms"] + 5000,
+                    updated_at_ms=self.start["created_at_ms"] + 9000,
+                    worker_pid=1234)
 
-    def test_wrapper_start_json_rejected(self):
-        # The rejected core-2 case: aplexer wrapper start record with phase.
-        wrapper = {"schema_version": 1, "id": "sess-1", "tag": "task-t1",
-                   "workspace": "/repo", "phase": "starting",
-                   "command": ["zcodex", "exec"], "parent_session": "p",
-                   "created_at_ms": 1}
-        self.write(wrapper)
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+    def test_rich_native_whoami_accepted(self):
+        # command/phase/parent_session/schema_version keys are expected on a
+        # genuine whoami and must NOT be blacklisted (Principal C1450).
+        self.write(self.rich_whoami())
+        self.assertTrue(self.check())
 
-    def test_engine_start_record_rejected(self):
-        record = dict(self.genuine(), phase="running", command=["aplexer"])
-        self.write(record)
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+    def test_minimal_identity_plus_timestamp_accepted(self):
+        self.write({"id": "sess-1", "tag": "task-t1", "workspace": "/repo",
+                    "timestamp": "2026-10-04T12:00:05Z"})
+        self.assertTrue(self.check())
 
-    def test_missing_timestamp_rejected(self):
-        data = self.genuine()
-        del data["timestamp"]
+    def test_start_record_copy_rejected(self):
+        # Byte-identical wrapper start JSON is not a first action...
+        self.fa.write_text(json.dumps(self.start))
+        self.assertFalse(self.check())
+
+    def test_reformatted_start_record_copy_rejected(self):
+        # ...and neither is the same record re-serialized with other whitespace.
+        self.fa.write_text(json.dumps(self.start, indent=2, sort_keys=True))
+        self.assertFalse(self.check())
+
+    def test_wrong_id_rejected(self):
+        self.write(dict(self.rich_whoami(), id="sess-2"))
+        self.assertFalse(self.check())
+
+    def test_wrong_tag_rejected(self):
+        self.write(dict(self.rich_whoami(), tag="task-other"))
+        self.assertFalse(self.check())
+
+    def test_wrong_workspace_rejected(self):
+        self.write(dict(self.rich_whoami(), workspace="/other"))
+        self.assertFalse(self.check())
+
+    def test_parent_session_mismatch_rejected(self):
+        self.write(dict(self.rich_whoami(), parent_session="forged-parent"))
+        self.assertFalse(self.check())
+
+    def test_parent_session_absent_still_accepted(self):
+        data = self.rich_whoami()
+        del data["parent_session"]
         self.write(data)
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+        self.assertTrue(self.check())
 
-    def test_wrong_identity_rejected(self):
-        self.write(self.genuine())
-        self.assertFalse(validate_first_action(str(self.fa), "other", "task-t1",
-                                               "/repo", self.min_mtime))
+    def test_no_time_field_rejected(self):
+        data = self.rich_whoami()
+        for field in ("timestamp", "created_at_ms", "updated_at_ms"):
+            data.pop(field, None)
+        self.write(data)
+        self.assertFalse(self.check())
 
     def test_unparsable_timestamp_rejected(self):
-        self.write(dict(self.genuine(), timestamp="not-a-time"))
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+        self.write(dict(self.rich_whoami(), timestamp="not-a-time"))
+        self.assertFalse(self.check())
 
-    def test_extra_keys_rejected(self):
-        self.write(dict(self.genuine(), extra="smuggled"))
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+    def test_created_before_session_rejected(self):
+        self.write(dict(self.rich_whoami(),
+                        created_at_ms=self.start["created_at_ms"] - 60_000))
+        self.assertFalse(self.check())
+
+    def test_far_future_created_rejected(self):
+        self.write(dict(self.rich_whoami(),
+                        created_at_ms=self.now_ms + 3_600_000))
+        self.assertFalse(self.check())
 
     def test_missing_file_rejected(self):
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", self.min_mtime))
+        self.assertFalse(self.check())
 
     def test_stale_file_rejected(self):
         # A pre-existing artifact from before the launch must not satisfy it.
-        self.write(self.genuine())
+        self.write(self.rich_whoami())
         old = time.time() - 3600
         os.utime(self.fa, (old, old))
-        self.assertFalse(validate_first_action(str(self.fa), "sess-1", "task-t1",
-                                               "/repo", time.time() - 60))
+        self.assertFalse(validate_first_action(str(self.fa), self.start,
+                                               time.time() - 60, now_ms=self.now_ms))
 
 class TestAdapters(unittest.TestCase):
     def test_grok_argv_exact(self):

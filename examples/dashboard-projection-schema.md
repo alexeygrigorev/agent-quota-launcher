@@ -3,9 +3,8 @@
 Producer: `launcher/cli.py` — `build_report()` (projection) and `report()` (JSONL
 emission). Consumer: the existing private metrics dashboard. This document is the
 consumer contract for the `--jsonl` stream. Status: verified line-by-line
-against `build_report()`/`report()` at commit `b79ae70` (2026-10-04) — the
-report implementation including the coverage line was introduced in that
-commit; the earlier citation of `b23039a` predated the rewrite.
+against `build_report()`/`report()` as of 2026-10-04 (head review round R1:
+UTC `[as_of-24h, as_of)` window and `project_id` added).
 
 Design invariants, binding for the dashboard (from SPEC.md §report and the
 `build_report` docstring):
@@ -16,41 +15,43 @@ Design invariants, binding for the dashboard (from SPEC.md §report and the
 - Quota accounting is a separate object and is never mixed into token usage or
   cost.
 - Coverage gaps are explicit; historical hours without tasks are gaps, not
-  simulated activity.
+  simulated activity. Tasks outside the window are counted, not emitted.
 
 ## Stream shape
 
 One JSON object per line (UTF-8, newline-delimited, no array wrapper). Lines are
-of exactly two kinds and must be distinguished by key presence:
+of exactly two kinds and must be distinguished by key presence. Every line
+carries `project_id` (string; `--project-id` at the producer, defaulting to the
+producer's current directory name) so a dashboard can attribute a stream to a
+project:
 
-1. **Bucket lines**: `{"bucket": <label>, "tasks": [<task>, ...]}` — one per
-   hourly bucket that has at least one task, emitted in ascending bucket-label
-   order (the producer sorts labels lexicographically).
-2. **Coverage line**: `{"coverage": {...}}` — exactly one, always the last line
-   of the stream.
+1. **Bucket lines**: `{"project_id": <pid>, "bucket": <label>, "tasks": [<task>, ...]}`
+   — one per hourly bucket that has at least one task, emitted in ascending
+   bucket-label order (the producer sorts labels lexicographically; with fixed
+   `Z` labels that order is chronological).
+2. **Coverage line**: `{"project_id": <pid>, "coverage": {...}}` — exactly one,
+   always the last line of the stream.
 
-A store with tasks but no tasks in the last 24h still emits bucket lines (for
-older hours) plus the coverage line. A completely empty store emits zero bucket
-lines and only the coverage line; consumers must tolerate that. The JSONL stream
-does **not** include the `timezone` and `generated_at` top-level fields that the
+A store with tasks but none in the window still emits bucket lines (for older
+in-window hours — none, since outside-window tasks are not emitted) plus the
+coverage line. A completely empty store emits zero bucket lines and only the
+coverage line; consumers must tolerate that. The JSONL stream does **not**
+include the `timezone`, `generated_at`, and top-level `buckets` map that the
 non-JSONL (`json.dumps(..., indent=2)`) form has — a consumer that needs the
 generation timestamp must use the non-JSONL form or stamp its own receipt time.
 
 ## Bucket line: `bucket`
 
-String. Hourly bucket label in Europe/Berlin wall time, format
-`%Y-%m-%dT%H:00:00%z`, e.g. `2026-10-04T13:00:00+0200`. The UTC offset is part
-of the label (`+0200` in summer, `+0100` in winter), so a task is grouped by its
-Berlin local hour. Edge case: in the repeated hour of a fall-back DST
-transition, the two wall-clock-identical hours are distinct labels
-(`...T02:00:00+0200` and `...T02:00:00+0100`) and their lexicographic order is
-not chronological; sort by the offset-aware instant, not by raw label, if that
-matters to the dashboard.
+String. Hourly bucket label in UTC, format `%Y-%m-%dT%H:00:00Z`, e.g.
+`2026-10-04T13:00:00Z`. A task is grouped by the UTC hour of its recorded
+`created_at` (interpreted as UTC). Because labels carry a fixed `Z` offset,
+lexicographic label order is chronological — no DST caveat.
 
 ## Bucket line: `tasks[]`
 
 Non-empty array. One entry per task whose recorded `created_at` (interpreted as
-UTC) falls into that Berlin hour. Entry fields:
+UTC) falls in that UTC hour **and** inside the projection window
+`[as_of-24h, as_of)`. Entry fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -62,7 +63,7 @@ UTC) falls into that Berlin hour. Entry fields:
 | `quota` | object | See [Quota object](#quota-object). |
 
 Attribution caveat: a task with a missing or unparseable `created_at` is
-attributed to the *generation* hour (`now` at report time), not dropped. The
+attributed to the *generation* hour (`as_of` at report time), not dropped. The
 dashboard cannot distinguish such a task from a task genuinely created in that
 hour; treat a suspiciously dense current-hour bucket accordingly.
 
@@ -115,26 +116,34 @@ Separate object, sibling of `usage`, never merged with it:
 Exactly one, always last:
 
 ```json
-{"coverage": {
+{"project_id": "<pid>", "coverage": {
   "window_hours": 24,
+  "window_start": "<as_of-24h, UTC Z>",
+  "window_end": "<as_of, UTC Z>",
+  "window_half_open": "[window_start, window_end)",
   "first_bucket": "<label> | null",
   "last_bucket": "<label> | null",
-  "gaps_within_last_24h": ["<label>", ...],
-  "note": "historical hours without tasks are gaps, not simulated activity"
+  "gaps_within_window": ["<label>", ...],
+  "tasks_outside_window": <count>,
+  "note": "historical hours without tasks are gaps, not simulated activity; tasks outside the window are counted, not emitted"
 }}
 ```
 
-- `window_hours`: fixed `24`.
+- `window_hours`: fixed `24`. The window is the half-open UTC interval
+  `[window_start, window_end)` with `window_start = as_of - 24h`; hourly bucket
+  labels `h` satisfy `window_start <= h < window_end` on the hour, so exactly
+  24 labels exist.
 - `first_bucket` / `last_bucket`: minimum/maximum bucket label present in the
   stream, or `null` when there are no buckets at all (empty store) — render
   null as “no data”.
-- `gaps_within_last_24h`: explicit list of hourly labels (same
-  `YYYY-MM-DDTHH:00:00±HHMM` Berlin format) for each of the 24 hours ending at
-  the current Berlin hour (`hour_start - 23h … hour_start`) that has no bucket.
-  These are **explicit gaps**: render as missing/no-data cells, never as zero
-  activity. Hours older than the 24h window are simply absent from the stream
-  and are *not* listed as gaps — absence outside the window means “not covered
-  by this projection”, absence inside the window means “covered and empty”.
+- `gaps_within_window`: explicit list of hourly labels (same
+  `YYYY-MM-DDTHH:00:00Z` UTC format) for each of the 24 window hours that has
+  no bucket. These are **explicit gaps**: render as missing/no-data cells,
+  never as zero activity.
+- `tasks_outside_window`: count of known tasks whose `created_at` falls outside
+  the window. They are **not emitted** in the stream — the count is the only
+  trace, so a dashboard can surface “N older tasks not shown”. Render the
+  count, never the tasks themselves.
 
 ## Unknown-vs-zero rendering policy (summary)
 
@@ -145,27 +154,33 @@ Exactly one, always last:
 | `tasks[].quota.percent_delta`, `tasks[].quota.snapshots` | `null` | “unknown”; never blended into usage/cost |
 | `tasks[].reviewer`, `tasks[].reason` | `null` | “—” (not applicable yet / not recorded), not an error state by itself |
 | `coverage.first_bucket`, `coverage.last_bucket` | `null` | “no data” |
-| `coverage.gaps_within_last_24h[]` | label present | explicit gap marker, not zero |
+| `coverage.gaps_within_window[]` | label present | explicit gap marker, not zero |
+| `coverage.tasks_outside_window` | integer | count badge; the tasks themselves are absent from the stream by contract |
 
-## Real example line (read-only capture)
+## Real example lines (read-only capture)
 
 Produced by actually running `python3 -m launcher report --jsonl` on
-2026-10-04 against the live default store (`~/.config/agent-quota-launcher/state.db`),
-no state modified. Bucket line (first stream line):
+2026-10-04 against the live default store
+(`~/.config/agent-quota-launcher/state.db`), no state modified. The stream
+holds one bucket line (five tasks in the 11:00Z hour) and the coverage line
+(23 of 24 window hours explicitly named as gaps; the current wall-clock hour
+is a gap too because it has no tasks yet).
+
+Bucket line (first stream line, tasks abbreviated to the first two for
+fidelity — the full line carries all five):
 
 ```json
-{"bucket": "2026-10-04T13:00:00+0200", "tasks": [{"id": "genuine-1", "state": "failed", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, {"id": "genuine-2", "state": "failed", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, {"id": "genuine-3", "state": "failed", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, {"id": "genuine-4", "state": "stalled", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, {"id": "genuine-5", "state": "stalled", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}]}
+{"project_id": "agent-quota-launcher", "bucket": "2026-10-04T11:00:00Z", "tasks": [{"id": "genuine-1", "state": "failed", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, {"id": "genuine-2", "state": "failed", "reviewer": null, "reason": null, "usage": {"input_tokens": null, "output_tokens": null, "cached_tokens": null, "cost": null, "source": "unproven"}, "quota": {"percent_delta": null, "snapshots": null, "note": "account percent delta is not token use or cost"}}, "... genuine-3 failed, genuine-4 stalled, genuine-5 stalled, same shape ..."]}
 ```
 
-Coverage line (last stream line of the same run; the 23 gap labels are shown in
-full for fidelity):
+Coverage line (last stream line of the same run; the 23 gap labels are shown
+in full for fidelity):
 
 ```json
-{"coverage": {"window_hours": 24, "first_bucket": "2026-10-04T13:00:00+0200", "last_bucket": "2026-10-04T13:00:00+0200", "gaps_within_last_24h": ["2026-10-03T15:00:00+0200", "2026-10-03T16:00:00+0200", "2026-10-03T17:00:00+0200", "2026-10-03T18:00:00+0200", "2026-10-03T19:00:00+0200", "2026-10-03T20:00:00+0200", "2026-10-03T21:00:00+0200", "2026-10-03T22:00:00+0200", "2026-10-03T23:00:00+0200", "2026-10-04T00:00:00+0200", "2026-10-04T01:00:00+0200", "2026-10-04T02:00:00+0200", "2026-10-04T03:00:00+0200", "2026-10-04T04:00:00+0200", "2026-10-04T05:00:00+0200", "2026-10-04T06:00:00+0200", "2026-10-04T07:00:00+0200", "2026-10-04T08:00:00+0200", "2026-10-04T09:00:00+0200", "2026-10-04T10:00:00+0200", "2026-10-04T11:00:00+0200", "2026-10-04T12:00:00+0200", "2026-10-04T14:00:00+0200"], "note": "historical hours without tasks are gaps, not simulated activity"}}
+{"project_id": "agent-quota-launcher", "coverage": {"window_hours": 24, "window_start": "2026-10-03T13:10:11Z", "window_end": "2026-10-04T13:10:11Z", "window_half_open": "[window_start, window_end)", "first_bucket": "2026-10-04T11:00:00Z", "last_bucket": "2026-10-04T11:00:00Z", "gaps_within_window": ["2026-10-03T14:00:00Z", "2026-10-03T15:00:00Z", "2026-10-03T16:00:00Z", "2026-10-03T17:00:00Z", "2026-10-03T18:00:00Z", "2026-10-03T19:00:00Z", "2026-10-03T20:00:00Z", "2026-10-03T21:00:00Z", "2026-10-03T22:00:00Z", "2026-10-03T23:00:00Z", "2026-10-04T00:00:00Z", "2026-10-04T01:00:00Z", "2026-10-04T02:00:00Z", "2026-10-04T03:00:00Z", "2026-10-04T04:00:00Z", "2026-10-04T05:00:00Z", "2026-10-04T06:00:00Z", "2026-10-04T07:00:00Z", "2026-10-04T08:00:00Z", "2026-10-04T09:00:00Z", "2026-10-04T10:00:00Z", "2026-10-04T12:00:00Z", "2026-10-04T13:00:00Z"], "tasks_outside_window": 0, "note": "historical hours without tasks are gaps, not simulated activity; tasks outside the window are counted, not emitted"}}
 ```
 
 Note how the example exercises every contract rule at once: five tasks in one
 bucket with `state` `failed`/`stalled`, all-null usage with `source:
-"unproven"`, all-null quota, and 23 of 24 window hours explicitly named as
-gaps (the current wall-clock hour `14:00` is a gap too because it has no tasks
-yet).
+"unproven"`, all-null quota, a half-open UTC window with explicit bounds, and
+23 of 24 window hours explicitly named as gaps.

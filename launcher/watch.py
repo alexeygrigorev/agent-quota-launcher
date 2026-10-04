@@ -8,6 +8,7 @@ from pathlib import Path
 
 from launcher.launch import do_run, native_status
 from launcher.store import Store, launch_lock
+from launcher.tags import run_tag_for
 
 
 def _reconcile(store):
@@ -20,7 +21,7 @@ def _reconcile(store):
         uncertain = [r[0] for r in cursor.fetchall()]
 
     for task_id in uncertain:
-        alive, detail = native_status(f"task-{task_id}")
+        alive, detail = native_status(run_tag_for(task_id))
         if alive == "dead":
             try:
                 store.transition_task(
