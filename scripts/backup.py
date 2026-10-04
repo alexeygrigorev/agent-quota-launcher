@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Private GitHub main mirror with actual independent checkout verification."""
-import argparse,datetime,fcntl,json,pathlib,subprocess,tempfile
+import argparse,datetime,fcntl,json,pathlib,subprocess,tempfile,shutil,os
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 def call(args,**kw):
     p=subprocess.run(args,capture_output=True,text=True,timeout=120,**kw)
     if p.returncode:raise RuntimeError(f'{args[:2]} failed (exit {p.returncode})')
     return p.stdout.strip()
 def main():
+    os.umask(0o077)
     p=argparse.ArgumentParser();p.add_argument('--repo',default='alexeygrigorev/agent-quota-launcher');a=p.parse_args()
     local=ROOT/'.local';local.mkdir(exist_ok=True,mode=0o700)
+    if shutil.disk_usage(local).free < 50*1024**3 + 512*1024**2:
+        raise RuntimeError('backup restore requires 50GiB free plus 512MiB spike')
     lock=open(local/'git.lock','a');fcntl.flock(lock,fcntl.LOCK_EX)
     if call(['git','branch','--show-current'],cwd=ROOT)!='main':raise RuntimeError('backup only main')
     sha=call(['git','rev-parse','HEAD'],cwd=ROOT)
