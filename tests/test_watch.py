@@ -233,6 +233,36 @@ class WatchRefillTests(unittest.TestCase):
             self.assertTrue(called_refill_args.once)
             self.assertEqual(called_refill_args.wait_for_review, "dependencies")
 
+    def test_bare_proposal_without_substantive_prompt_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+
+            # Bare proposal 1: empty goal
+            store.submit_task("t-empty", "k-empty", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": ""}, [str(cfg / "p-empty")])
+            # Bare proposal 2: whitespace goal
+            store.submit_task("t-ws", "k-ws", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "   "}, [str(cfg / "p-ws")])
+            # Bare proposal 3: goal == task_id
+            store.submit_task("t-same", "k-same", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "t-same"}, [str(cfg / "p-same")])
+
+            # With only bare proposals, none should be dispatchable
+            tid, note = _next_dispatchable(store)
+            self.assertIsNone(tid)
+            self.assertIn("3 queued, all blocked", note)
+
+            with store.get_conn() as conn:
+                r_empty = conn.execute("SELECT reason FROM tasks WHERE id = 't-empty'").fetchone()[0]
+                r_same = conn.execute("SELECT reason FROM tasks WHERE id = 't-same'").fetchone()[0]
+            self.assertEqual(r_empty, "watch: blocked: bare proposal without substantive prompt")
+            self.assertEqual(r_same, "watch: blocked: bare proposal without substantive prompt")
+
+            # Submit task with genuine substantive goal
+            store.submit_task("t-good", "k-good", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "genuine prompt to implement feature"}, [str(cfg / "p-good")])
+            tid, note = _next_dispatchable(store)
+            self.assertEqual(tid, "t-good")
+            self.assertIsNone(note)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -96,6 +96,12 @@ def _next_dispatchable(store, wait_for_review="dependencies"):
         blocked = None
         payload = payloads.get(task_id, {})
 
+        raw_goal = payload.get("goal")
+        goal = (raw_goal if isinstance(raw_goal, str) else str(raw_goal or "")).strip()
+        if not goal or goal == task_id:
+            store.record_reason(task_id, "watch: blocked: bare proposal without substantive prompt")
+            continue
+
         if check_dependencies:
             raw_deps = payload.get("depends_on") or payload.get("dependencies") or []
             if isinstance(raw_deps, str):
