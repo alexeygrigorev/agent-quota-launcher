@@ -187,5 +187,50 @@ class TestAdmission(unittest.TestCase):
             data = fetch_quse()
         self.assertIn("grok", data)
 
+    def test_grok_at_exactly_5_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 5.0, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
+
+    def test_grok_below_5_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 4.9, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
+
+    def test_grok_above_5_percent_admitted(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 5.1, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "grok")
+
+    def test_grok_exhausted_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 0.0, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Quota exhausted", rej.get("grok", ""))
+
+    def test_grok_limit_reached_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 50, "reset_at": self.future1}},
+                                   details={"limit_reached": True})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Limit reached", rej.get("grok", ""))
+
+    def test_grok_failed_reading_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 50, "reset_at": self.future1}},
+                                   status="error", error="provider timeout")}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Error: provider timeout", rej.get("grok", ""))
+
+    def test_grok_absent_window_not_interpreted_as_zero(self):
+        # 5h window absent: 7d window at 50% is valid evidence, not treated as 0%
+        data = {"grok": grok_route({"7d": {"percent_remaining": 50, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["remaining_fraction"], 0.5)
+
 if __name__ == '__main__':
     unittest.main()

@@ -18,6 +18,7 @@ ADAPTER_MODELS = {
     "zai": "glm-5.3-flash",
 }
 CODEX_MIN_REMAINING = 15.0
+GROK_MIN_REMAINING = 5.0
 
 # Promotion stays disabled until a verified ZCode >=3.10 GLM-5.3-Flash
 # subscription route exists; even inside the campaign window the multiplier is
@@ -167,6 +168,8 @@ def _validate_route(name, route, now, task_requirements):
                       "reset timezone, or stale reset_at)")
     if exhausted:
         return None, "Quota exhausted"
+    if provider == "grok" and min_rem <= GROK_MIN_REMAINING:
+        return None, f"Grok window <= {GROK_MIN_REMAINING:g}% remaining (cutoff policy)"
 
     health = 1.0 if route.get("status") == "ok" else None
     task_fit = _task_fit(provider, task_requirements)
