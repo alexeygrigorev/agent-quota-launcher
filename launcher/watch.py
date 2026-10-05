@@ -36,9 +36,40 @@ def _reconcile(store):
     return reconciled
 
 
-def _next_dispatchable(store):
+def derive_task_tmpdir(task_cwd: str, payload: dict) -> str:
+    """Derive a task-local contained TMPDIR under <task_cwd>/.local/tmp.
+    Never inherit a foreign tmpdir from CLI args or sibling tasks."""
+    cwd_path = Path(task_cwd).resolve()
+    allowed_root = cwd_path / ".local" / "tmp"
+    specified = payload.get("tmpdir")
+    if specified:
+        cand_path = Path(specified).resolve()
+        if cand_path.is_relative_to(allowed_root):
+            task_tmp = str(cand_path)
+        else:
+            task_tmp = str(allowed_root)
+    else:
+        task_tmp = str(allowed_root)
+    os.makedirs(task_tmp, exist_ok=True)
+    return task_tmp
+
+
+def _unreviewed_task_ids(store):
+    with store.get_conn() as conn:
+        cursor = conn.execute(
+            "SELECT id FROM tasks WHERE state = 'completed-awaiting-review'")
+        return [r[0] for r in cursor.fetchall()]
+
+
+def _next_dispatchable(store, wait_for_review=True):
     """Oldest queued task whose owned paths don't overlap a live lease.
     Returns (task_id | None, blocked_note | None)."""
+    if wait_for_review:
+        unreviewed = _unreviewed_task_ids(store)
+        if unreviewed:
+            return None, (f"automatic refill waiting for distinct independent "
+                          f"review acceptance of: {', '.join(unreviewed)}")
+
     with store.get_conn() as conn:
         cursor = conn.execute(
             "SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
@@ -79,6 +110,7 @@ def watch_loop(args, max_passes=None):
     lock_path = str(config_dir / 'launch.lock')
     interval = float(getattr(args, 'interval', 10.0) or 10.0)
     once = bool(getattr(args, 'once', False))
+    wait_for_review = bool(getattr(args, 'wait_for_review', True))
 
     store = Store(store_path)
     print("watcher: reconciling and dispatching (non-LLM)")
@@ -89,14 +121,15 @@ def watch_loop(args, max_passes=None):
         for task_id, detail in _reconcile(store):
             print(f"reconciled: task {task_id} -> failed ({detail})")
 
-        task_id, blocked_note = _next_dispatchable(store)
+        task_id, blocked_note = _next_dispatchable(store, wait_for_review=wait_for_review)
         if task_id:
             print(f"dispatching queued task {task_id}")
             try:
                 task_data = store.get_task(task_id)
                 payload = (task_data.get("payload") or {}) if task_data else {}
-                task_cwd = payload.get("cwd") or getattr(args, "cwd", ".")
-                task_tmp = payload.get("tmpdir") or getattr(args, "tmpdir", None) or os.path.join(task_cwd, ".local/tmp")
+                task_cwd = payload.get("cwd") or getattr(args, "cwd", None) or os.getcwd()
+                task_cwd = str(Path(task_cwd).resolve())
+                task_tmp = derive_task_tmpdir(task_cwd, payload)
                 backend = getattr(args, "backend", "task-units")
                 if backend == "task-units":
                     from types import SimpleNamespace

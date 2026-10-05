@@ -231,20 +231,10 @@ def run_task_units(args):
             print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
 
     if completed_ok:
-        from types import SimpleNamespace
-        from launcher.watch import watch_loop
-        refill_args = SimpleNamespace(
-            config_dir=config_dir,
-            cwd=args.cwd,
-            tmpdir=args.tmpdir,
-            backend="task-units",
-            once=True,
+        print(
+            f"task {args.id} completed-awaiting-review; "
+            f"automatic refill held waiting for distinct independent review acceptance"
         )
-        print(f"triggering automated completion-to-next-dispatch refill from controller {args.id}")
-        try:
-            watch_loop(refill_args, max_passes=1)
-        except Exception as e:
-            print(f"refill dispatch error: {e}")
         return 0
     return 1
 
@@ -338,6 +328,22 @@ def accept(args):
         print(f"error: {e}")
         return 1
     print(f"accepted: {args.id} (reviewer {args.reviewer})")
+
+    # Automated refill: only triggered AFTER distinct independent review acceptance
+    if getattr(args, "refill", True):
+        from types import SimpleNamespace
+        from launcher.watch import watch_loop
+        config_dir = config_dir_for(args)
+        refill_args = SimpleNamespace(
+            config_dir=config_dir,
+            backend=getattr(args, "backend", "task-units"),
+            once=True,
+        )
+        print(f"triggering automated review-gated refill after acceptance of {args.id}")
+        try:
+            watch_loop(refill_args, max_passes=1)
+        except Exception as e:
+            print(f"refill dispatch error: {e}")
     return 0
 
 
@@ -505,6 +511,9 @@ def main():
                                           help="accept reviewed artifacts; exit 0 != accepted (needs reviewer)")
     parser_accept.add_argument("--id", required=True)
     parser_accept.add_argument("--reviewer", required=True)
+    parser_accept.add_argument("--no-refill", dest="refill", action="store_false", default=True,
+                               help="do not trigger automated refill dispatch after acceptance")
+    parser_accept.add_argument("--backend", default="task-units", choices=["aplexer", "task-units"])
     parser_accept.set_defaults(func=accept)
 
     parser_fail = subparsers.add_parser(
@@ -524,8 +533,11 @@ def main():
 
     parser_watch = subparsers.add_parser("watch",
                                          help="non-LLM loop: reconcile uncertain launches, dispatch next queued task")
-    parser_watch.add_argument("--cwd", required=True)
-    parser_watch.add_argument("--tmpdir", required=True)
+    parser_watch.add_argument("--cwd", default=None, help="fallback cwd if not specified in task payload")
+    parser_watch.add_argument("--tmpdir", default=None, help="legacy tmpdir override; ignored in favor of task-local contained tmpdir")
+    parser_watch.add_argument("--backend", default="task-units", choices=["aplexer", "task-units"])
+    parser_watch.add_argument("--no-wait-review", dest="wait_for_review", action="store_false", default=True,
+                               help="do not wait for unreviewed tasks before dispatch")
     parser_watch.add_argument("--interval", type=float, default=10.0)
     parser_watch.add_argument("--once", action="store_true", help="single reconcile+dispatch pass")
     parser_watch.set_defaults(func=watch)
