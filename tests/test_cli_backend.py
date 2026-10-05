@@ -157,6 +157,38 @@ class TaskUnitsCliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(store.get_task("t-cli-quse-fail")["state"], "queued")
 
+    def test_quse_oserror_retry_then_lease(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name)
+        store = Store(str(cfg / "state.db"))
+        store.submit_task(
+            "t-cli-quse-eagain", "k-cli-quse-eagain",
+            {"owner": "ql", "cwd": tmp.name, "timeout": 60, "goal": "x", "provider": "grok"},
+            [str(cfg / "p-quse-eagain")],
+        )
+        args = argparse.Namespace(
+            id="t-cli-quse-eagain", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
+            backend="task-units", config_dir=str(cfg),
+        )
+        calls = {"n": 0}
+
+        def flaky_quse():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            return {"ok": True}
+
+        with patch("launcher.admission.fetch_quse", side_effect=flaky_quse), \
+             patch("launcher.cli.time.sleep", return_value=None), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit",
+                   return_value={"exit_code": 0, "unit": "x", "invocation_id": "i"}):
+            rc = run_task_units(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(store.get_task("t-cli-quse-eagain")["state"], "completed-awaiting-review")
+
     def test_head_cred_in_goal_fails_closed_queued(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

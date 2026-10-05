@@ -135,7 +135,7 @@ def run_task_units(args):
         try:
             quse = fetch_quse()
             break
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             last_quse_err = e
             time.sleep(0.5 * (attempt + 1))
     if quse is None:
