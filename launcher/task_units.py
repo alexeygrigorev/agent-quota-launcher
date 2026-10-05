@@ -93,6 +93,22 @@ def show_unit_props(
     return props
 
 
+def timeout_output_text(value) -> str:
+    """Popen._check_timeout yields bytes stdout/stderr even when text=True (C2513)."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def parse_invocation_id(text: str) -> Optional[str]:
+    match = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", text or "", re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
 def signal_owned_unit(unit_name: str, expected_inv: Optional[str], verb: str) -> bool:
     """Issue kill/stop only when nonempty expected Invocation matches nonempty live Invocation."""
     if verb not in ("kill", "stop"):
@@ -519,8 +535,6 @@ def execute_transient_task_unit(
     clean_env["TMP"] = str(tmpdir_path)
 
     assigned_inv_id = None
-    start_cgroup = ""
-    start_pid = ""
     proc = None
 
     try:
@@ -533,26 +547,21 @@ def execute_transient_task_unit(
             text=True,
             start_new_session=True,
         )
-        start_props = show_unit_props(unit_name)
-        assigned_inv_id = (start_props.get("InvocationID") or "").strip() or None
-        start_cgroup = (start_props.get("ControlGroup") or "").strip()
-        start_pid = (start_props.get("MainPID") or start_props.get("ExecMainPID") or "").strip()
+        # Expected identity is the systemd-run launch witness, not an immediate
+        # systemctl show (same-name unit can still be live from a prior run).
 
         try:
             out, err = proc.communicate(timeout=timeout_sec)
-            combined_run_output = (out or "") + "\n" + (err or "")
-            m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", combined_run_output, re.IGNORECASE)
-            if m and not assigned_inv_id:
-                assigned_inv_id = m.group(1)
+            combined_run_output = timeout_output_text(out) + "\n" + timeout_output_text(err)
+            assigned_inv_id = parse_invocation_id(combined_run_output)
             exit_code = proc.returncode
         except subprocess.TimeoutExpired as timed_out:
-            partial = (getattr(timed_out, "stdout", None) or "") + "\n" + (
-                getattr(timed_out, "stderr", None) or ""
+            partial = (
+                timeout_output_text(getattr(timed_out, "stdout", None))
+                + "\n"
+                + timeout_output_text(getattr(timed_out, "stderr", None))
             )
-            if not assigned_inv_id:
-                m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", partial, re.IGNORECASE)
-                if m:
-                    assigned_inv_id = m.group(1)
+            assigned_inv_id = parse_invocation_id(partial)
             live = show_unit_props(unit_name)
             killed = signal_owned_unit(unit_name, assigned_inv_id, "kill")
             try:
@@ -562,12 +571,11 @@ def execute_transient_task_unit(
             identity = {
                 "expected_invocation_id": assigned_inv_id or "",
                 "live_invocation_id": (live.get("InvocationID") or "").strip(),
-                "start_cgroup": start_cgroup,
                 "live_cgroup": (live.get("ControlGroup") or "").strip(),
-                "start_pid": start_pid,
                 "live_pid": (live.get("MainPID") or live.get("ExecMainPID") or "").strip(),
                 "load_state": (live.get("LoadState") or "").strip(),
                 "killed": killed,
+                "witness_source": "systemd-run-timeout-output",
             }
             raise TaskUnitTimeoutError(
                 f"task unit {unit_name} exceeded timeout of {timeout_sec}s identity={identity}",
@@ -582,7 +590,6 @@ def execute_transient_task_unit(
             unit_name,
             timeout_sec=2.0,
             expected_invocation_id=assigned_inv_id,
-            expected_cgroup=start_cgroup or None,
         )
         raise TaskUnitExecutionError(f"execution failed: {e}") from e
 
