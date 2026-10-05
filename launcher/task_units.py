@@ -1,0 +1,675 @@
+"""Manager-spawned bounded sibling systemd TASK units (C2438 / C2441).
+
+Spawns detached transient task service units outside the interactive head's
+cgroup (aplexer-workload-6be4c247-4410-4bdb-968e-7fc2d5844941.scope).
+Each task unit receives its own independent MemoryMax (<= 1500M) and TasksMax (100)
+under app.slice, preventing parent-bound 100-PID exhaustion and allowing
+up to 50 concurrent headless workers across host memory.
+"""
+from __future__ import annotations
+
+import datetime
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from launcher.admission import validate_quse
+from launcher.resources import check_resources
+
+MAX_MEMORY_MB = 1500
+TASKS_MAX = 100
+MAX_DISK_LOG_BYTES = 64 * 1024  # 64 KiB bounded disk log
+CLEANUP_POLL_INTERVAL_SEC = 0.05
+CLEANUP_TIMEOUT_SEC = 5.0
+
+HEAD_SCOPE_FORBIDDEN_MARKERS = (
+    "aplexer-workload-6be4c247-4410-4bdb-968e-7fc2d5844941",
+    "aplexer-workload-",
+)
+
+
+class TaskUnitError(Exception):
+    """Base exception for task unit operations."""
+    pass
+
+
+class TaskUnitAdmissionError(TaskUnitError):
+    """Raised when task unit violates quota or resource floors."""
+    pass
+
+
+class TaskUnitExecutionError(TaskUnitError):
+    """Raised when task unit execution fails or encounters cgroup errors."""
+    pass
+
+
+class TaskUnitCleanupError(TaskUnitError):
+    """Raised when task unit fails to cleanly dissolve lingering PIDs."""
+    pass
+
+
+def sanitize_unit_name(task_id: str) -> str:
+    """Derive a safe systemd unit name from a task identifier."""
+    if not task_id or not isinstance(task_id, str):
+        raise TaskUnitAdmissionError("task_id must be a non-empty string")
+    clean = task_id.strip()
+    if not clean:
+        raise TaskUnitAdmissionError("task_id contains no valid unit characters")
+    if "/" in clean or "\\" in clean or ".." in clean:
+        raise TaskUnitAdmissionError(f"path traversal or directory separator forbidden in task_id: {task_id}")
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", clean):
+        raise TaskUnitAdmissionError(
+            f"task_id contains invalid characters (only alphanumeric, _, - allowed): {task_id}"
+        )
+    return f"agent-task-{clean}.service"
+
+
+def assert_cgroup_outside_head(cgroup_path: str) -> bool:
+    """Verify that a cgroup path is not nested under any head scope."""
+    if not cgroup_path or not isinstance(cgroup_path, str):
+        return True
+    for marker in HEAD_SCOPE_FORBIDDEN_MARKERS:
+        if marker in cgroup_path:
+            raise TaskUnitExecutionError(
+                f"cgroup '{cgroup_path}' is nested under forbidden head scope marker '{marker}'"
+            )
+    return True
+
+
+def admit_task_unit(
+    task_id: str,
+    memory_mb: int,
+    workspace: str,
+    tmpdir: str,
+    quse_json: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+    active_mem_mb: int = 0,
+    active_disk_mb: int = 0,
+) -> bool:
+    """Pre-execution admission check enforcing memory, floors, and quota."""
+    if int(memory_mb) > MAX_MEMORY_MB:
+        raise TaskUnitAdmissionError(
+            f"worker memory {memory_mb}M exceeds maximum allowed ceiling of {MAX_MEMORY_MB}M"
+        )
+    if int(memory_mb) <= 0:
+        raise TaskUnitAdmissionError("worker memory must be a positive integer")
+
+    # Fail closed on missing quota evidence (C2447)
+    if quse_json is None:
+        raise TaskUnitAdmissionError(
+            "fresh quse_json evidence is required for task unit admission (fail closed)"
+        )
+    try:
+        valid_routes, rejections = validate_quse(quse_json)
+        if not valid_routes:
+            raise TaskUnitAdmissionError(f"no valid quota route available: {rejections}")
+        if provider:
+            matching = [
+                r for r in valid_routes
+                if r.get("provider") == provider or r.get("name") == provider
+            ]
+            if not matching:
+                reason = rejections.get(provider, "provider route not accepted or exhausted")
+                raise TaskUnitAdmissionError(
+                    f"requested provider '{provider}' quota rejected: {reason}"
+                )
+    except TaskUnitAdmissionError:
+        raise
+    except Exception as e:
+        raise TaskUnitAdmissionError(f"quota admission validation failed: {e}") from e
+
+    # Check host floors (MemAvailable >= 10 GiB, root disk >= 50 GiB, deny /data)
+    try:
+        check_resources(
+            int(memory_mb),
+            workspace,
+            tmpdir,
+            active_mem_mb=active_mem_mb,
+            active_disk_mb=active_disk_mb,
+            repo_root=workspace,
+        )
+    except Exception as e:
+        raise TaskUnitAdmissionError(f"resource floor check failed: {e}") from e
+
+    # Enforce tmpdir strictly under repo .local/tmp
+    repo_path = Path(workspace).resolve()
+    tmp_path = Path(tmpdir).resolve()
+    allowed_tmp_root = repo_path / ".local" / "tmp"
+    if not tmp_path.is_relative_to(allowed_tmp_root):
+        raise TaskUnitAdmissionError(
+            f"TMPDIR '{tmp_path}' must be located under '{allowed_tmp_root}'"
+        )
+
+    # Deny /data destination explicitly (18.9 GiB free, below 50 GiB floor)
+    if str(tmp_path).startswith("/data") or str(repo_path).startswith("/data"):
+        raise TaskUnitAdmissionError("destination under /data is denied due to floor deficit")
+
+    return True
+
+
+def build_systemd_run_argv(
+    unit_name: str,
+    command_argv: List[str],
+    memory_mb: int,
+    tmpdir: str,
+    workspace: Optional[str] = None,
+    stdout_path: Optional[str] = None,
+    stderr_path: Optional[str] = None,
+    wait: bool = False,
+    slice_name: str = "app.slice",
+) -> List[str]:
+    """Construct systemd-run invocation for a detached transient service unit.
+
+    Notice: Does NOT pass `--scope`. Runs as a standalone transient `.service`
+    unit directly under the user manager, ensuring it does not inherit the
+    head's 100-task or 1500M cgroup ceiling.
+    """
+    if not unit_name.endswith(".service"):
+        raise TaskUnitAdmissionError(f"transient unit must end with .service, got: {unit_name}")
+
+    argv = [
+        "systemd-run",
+        "--user",
+        f"--unit={unit_name}",
+        f"--slice={slice_name}",
+        "--collect",
+    ]
+    if wait:
+        argv.append("--wait")
+    argv.extend([
+        "-p", f"MemoryMax={int(memory_mb)}M",
+        "-p", f"TasksMax={TASKS_MAX}",
+        "-E", f"TMPDIR={tmpdir}",
+        "-E", f"TEMP={tmpdir}",
+        "-E", f"TMP={tmpdir}",
+    ])
+    if workspace:
+        ws_path = Path(workspace).resolve()
+        if not ws_path.is_dir():
+            raise TaskUnitAdmissionError(f"workspace path does not exist or is not a directory: {workspace}")
+        argv.extend(["-p", f"WorkingDirectory={ws_path}"])
+    if stdout_path:
+        argv.extend(["-p", f"StandardOutput=file:{stdout_path}"])
+    if stderr_path:
+        argv.extend(["-p", f"StandardError=file:{stderr_path}"])
+    if not stdout_path and not stderr_path and not wait:
+        argv.append("--pipe")
+
+    argv.append("--")
+    argv.extend(list(command_argv))
+    return argv
+
+
+def generate_prelude_code(expected_unit_name: str, expected_workspace: Optional[str] = None) -> str:
+    """Generate inline Python prelude verifying cgroup isolation and working directory before execution."""
+    ws_check_code = ""
+    if expected_workspace:
+        ws_resolved = str(Path(expected_workspace).resolve())
+        ws_check_code = f"""
+# 4. Verify working directory matches expected workspace (fail-closed per C2465/C2468)
+expected_ws = {repr(ws_resolved)}
+current_cwd = os.path.realpath(os.getcwd())
+if current_cwd != os.path.realpath(expected_ws):
+    sys.stderr.write(f"FATAL: Service cwd '{{current_cwd}}' does not match expected workspace '{{expected_ws}}'\\n")
+    sys.exit(99)
+"""
+
+    return f"""# Auto-generated task unit prelude
+import os, sys
+
+# 1. Inspect own cgroup
+try:
+    with open('/proc/self/cgroup', 'r') as f:
+        cg_content = f.read().strip()
+except Exception as e:
+    sys.stderr.write(f"Prelude error reading /proc/self/cgroup: {{e}}\\n")
+    sys.exit(95)
+
+# 2. Verify NOT in head scope
+forbidden = {repr(HEAD_SCOPE_FORBIDDEN_MARKERS)}
+for mark in forbidden:
+    if mark in cg_content:
+        sys.stderr.write(f"FATAL: Process running inside forbidden head scope {{mark}}\\n")
+        sys.exit(96)
+
+# 3. Verify in expected transient unit and app.slice (fail-closed per C2447)
+unit_base = {repr(expected_unit_name.replace('.service', ''))}
+if unit_base not in cg_content:
+    sys.stderr.write(f"FATAL: cgroup '{{cg_content}}' does not match expected unit '{{unit_base}}'\\n")
+    sys.exit(97)
+if 'app.slice' not in cg_content:
+    sys.stderr.write(f"FATAL: cgroup '{{cg_content}}' is not placed under app.slice\\n")
+    sys.exit(98)
+{ws_check_code}
+# Proceed to execute wrapped command
+if len(sys.argv) > 1:
+    os.execvp(sys.argv[1], sys.argv[1:])
+"""
+
+
+def _is_cgroup_dissolved_or_empty(cg_rel_path: str) -> bool:
+    """Check cgroup.events for populated 0 and verify all descendant cgroup.procs empty."""
+    cgroup_root = Path("/sys/fs/cgroup")
+    clean_rel = cg_rel_path.strip("/")
+    target = cgroup_root / clean_rel
+
+    if not target.exists():
+        return True
+
+    events_file = target / "cgroup.events"
+    if events_file.exists():
+        try:
+            content = events_file.read_text(encoding="utf-8")
+            for line in content.splitlines():
+                if line.startswith("populated"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] != "0":
+                        return False
+        except Exception:
+            pass
+
+    for procs_file in target.glob("**/cgroup.procs"):
+        try:
+            pids = procs_file.read_text(encoding="utf-8").strip()
+            if pids:
+                return False
+        except Exception:
+            pass
+
+    return True
+
+
+def verify_task_unit_cleanup(
+    unit_name: str,
+    timeout_sec: float = CLEANUP_TIMEOUT_SEC,
+    systemctl_cmd: Optional[List[str]] = None,
+    expected_invocation_id: Optional[str] = None,
+) -> Tuple[bool, Dict[str, str]]:
+    """Verify that a transient unit has stopped and its cgroup is fully dissolved."""
+    cmd_base = systemctl_cmd or ["systemctl", "--user"]
+    deadline = time.time() + timeout_sec
+    props: Dict[str, str] = {}
+
+    while time.time() < deadline:
+        try:
+            res = subprocess.run(
+                cmd_base + [
+                    "show",
+                    unit_name,
+                    "-p", "ActiveState",
+                    "-p", "SubState",
+                    "-p", "ControlGroup",
+                    "-p", "InvocationID",
+                    "-p", "ExecMainPID",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            props = {}
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k] = v
+
+            active_state = props.get("ActiveState", "unknown")
+            sub_state = props.get("SubState", "unknown")
+            cg = props.get("ControlGroup", "")
+            inv_id = props.get("InvocationID", "")
+
+            # If expected invocation was given and a different or unverified active invocation is present, do not touch it
+            if expected_invocation_id:
+                if inv_id and inv_id != expected_invocation_id:
+                    return False, props
+                if active_state not in ("inactive", "failed") and not inv_id:
+                    return False, props
+
+            # If inactive or dead, verify cgroup dissolution
+            if active_state in ("inactive", "failed") and sub_state in ("dead", "failed", ""):
+                if not cg:
+                    return True, props
+                if _is_cgroup_dissolved_or_empty(cg):
+                    return True, props
+
+        except Exception:
+            pass
+        time.sleep(CLEANUP_POLL_INTERVAL_SEC)
+
+    # Final attempt to stop unit if still running and owned
+    try:
+        inv_id = props.get("InvocationID", "")
+        if expected_invocation_id:
+            if inv_id and inv_id == expected_invocation_id:
+                subprocess.run(
+                    cmd_base + ["stop", unit_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        else:
+            subprocess.run(
+                cmd_base + ["stop", unit_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    except Exception:
+        pass
+
+    return False, props
+
+
+def _bounded_pipe_pump(pipe, target_path: Path, max_bytes: int):
+    """Pump subprocess stream to disk with strict byte bounding."""
+    bytes_written = 0
+    try:
+        with open(target_path, "wb") as f:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                if bytes_written < max_bytes:
+                    allowed = min(len(chunk), max_bytes - bytes_written)
+                    f.write(chunk[:allowed])
+                    bytes_written += allowed
+                    f.flush()
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def execute_transient_task_unit(
+    task_id: str,
+    command_argv: List[str],
+    memory_mb: int,
+    workspace: str,
+    tmpdir: str,
+    timeout_sec: float = 1200.0,
+    quse_json: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+    log_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute a task in a manager-spawned sibling systemd unit.
+
+    Returns an execution receipt detailing unit, cgroup, timing, and exit code.
+    Fails closed if admission fails, unit fails to start, or lingering PIDs remain.
+    """
+    # 0. Calculate loaded module digest BEFORE execution per C2469
+    try:
+        module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception:
+        module_sha256 = "unknown"
+
+    # 1. Admission check
+    admit_task_unit(task_id, memory_mb, workspace, tmpdir, quse_json=quse_json, provider=provider)
+    unit_name = sanitize_unit_name(task_id)
+
+    repo_dir = Path(workspace).resolve()
+    if not repo_dir.is_dir():
+        raise TaskUnitAdmissionError(f"workspace directory does not exist: {workspace}")
+    tmpdir_path = Path(tmpdir).resolve()
+    tmpdir_path.mkdir(parents=True, exist_ok=True)
+
+    out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = out_dir / f"{task_id}-stdout.log"
+    stderr_log = out_dir / f"{task_id}-stderr.log"
+    stdout_log.touch(mode=0o600, exist_ok=True)
+    stderr_log.touch(mode=0o600, exist_ok=True)
+
+    # 2. Write prelude with verified expected workspace (fail-closed cwd check)
+    prelude_script = tmpdir_path / f"prelude_{task_id}.py"
+    prelude_code = generate_prelude_code(unit_name, expected_workspace=str(repo_dir))
+    prelude_script.write_text(prelude_code, encoding="utf-8")
+    prelude_script.chmod(0o700)
+
+    # 3. Construct systemd-run invocation with file redirection (0 pump threads) and explicit WorkingDirectory
+    wrapped_command = [sys.executable, str(prelude_script)] + list(command_argv)
+    systemd_cmd = build_systemd_run_argv(
+        unit_name=unit_name,
+        command_argv=wrapped_command,
+        memory_mb=memory_mb,
+        tmpdir=str(tmpdir_path),
+        workspace=str(repo_dir),
+        stdout_path=str(stdout_log),
+        stderr_path=str(stderr_log),
+        wait=True,
+    )
+
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    clean_env = dict(os.environ)
+    clean_env["TMPDIR"] = str(tmpdir_path)
+    clean_env["TEMP"] = str(tmpdir_path)
+    clean_env["TMP"] = str(tmpdir_path)
+
+    assigned_inv_id = None
+    proc = None
+
+    try:
+        proc = subprocess.Popen(
+            systemd_cmd,
+            cwd=str(repo_dir),
+            env=clean_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+        try:
+            out, err = proc.communicate(timeout=timeout_sec)
+            combined_run_output = (out or "") + "\n" + (err or "")
+            m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", combined_run_output, re.IGNORECASE)
+            if m:
+                assigned_inv_id = m.group(1)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            if assigned_inv_id:
+                try:
+                    chk = subprocess.run(
+                        ["systemctl", "--user", "show", unit_name, "-p", "InvocationID"],
+                        stdout=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    curr_inv = dict(l.split("=", 1) for l in chk.stdout.splitlines() if "=" in l).get("InvocationID", "")
+                    if curr_inv and curr_inv == assigned_inv_id:
+                        subprocess.run(
+                            ["systemctl", "--user", "kill", "--signal=SIGKILL", unit_name],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                except Exception:
+                    pass
+            else:
+                subprocess.run(
+                    ["systemctl", "--user", "kill", "--signal=SIGKILL", unit_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            proc.kill()
+            raise TaskUnitExecutionError(
+                f"task unit {unit_name} exceeded timeout of {timeout_sec}s"
+            )
+
+    except Exception as e:
+        if assigned_inv_id:
+            try:
+                chk = subprocess.run(
+                    ["systemctl", "--user", "show", unit_name, "-p", "InvocationID"],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                curr_inv = dict(l.split("=", 1) for l in chk.stdout.splitlines() if "=" in l).get("InvocationID", "")
+                if curr_inv and curr_inv == assigned_inv_id:
+                    subprocess.run(
+                        ["systemctl", "--user", "stop", unit_name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+            except Exception:
+                pass
+        else:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        verify_task_unit_cleanup(unit_name, timeout_sec=2.0, expected_invocation_id=assigned_inv_id)
+        raise TaskUnitExecutionError(f"execution failed: {e}") from e
+
+    finally:
+        # Remove prelude script
+        try:
+            if prelude_script.exists():
+                prelude_script.unlink()
+        except Exception:
+            pass
+
+    # 4. Verify post-stop cleanup & cgroup dissolution
+    cleaned_up, props = verify_task_unit_cleanup(
+        unit_name,
+        timeout_sec=CLEANUP_TIMEOUT_SEC,
+        expected_invocation_id=assigned_inv_id,
+    )
+    if not cleaned_up:
+        raise TaskUnitCleanupError(
+            f"unit {unit_name} did not cleanly dissolve lingering PIDs or cgroup: {props}"
+        )
+
+    # 5. Verify cgroup was outside head scope
+    cg = props.get("ControlGroup", "")
+    if cg:
+        assert_cgroup_outside_head(cg)
+
+    finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    return {
+        "task_id": task_id,
+        "unit_name": unit_name,
+        "invocation_id": assigned_inv_id,
+        "exit_code": exit_code,
+        "cgroup": cg,
+        "workspace": str(repo_dir),
+        "working_directory": str(repo_dir),
+        "module_sha256": module_sha256,
+        "provider": provider,
+        "timeout_sec": timeout_sec,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "cleanup_verified": True,
+        "memory_max_mb": memory_mb,
+        "tasks_max": TASKS_MAX,
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+    }
+
+
+def spawn_transient_task_unit(
+    task_id: str,
+    command_argv: List[str],
+    memory_mb: int,
+    workspace: str,
+    tmpdir: str,
+    quse_json: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+    log_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Asynchronously spawn a manager-spawned sibling systemd unit.
+
+    Returns immediately with unit details and invocation ID.
+    0 PIDs and 0 threads remain in the calling controller process during execution.
+    """
+    try:
+        module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception:
+        module_sha256 = "unknown"
+
+    admit_task_unit(task_id, memory_mb, workspace, tmpdir, quse_json=quse_json, provider=provider)
+    unit_name = sanitize_unit_name(task_id)
+
+    repo_dir = Path(workspace).resolve()
+    if not repo_dir.is_dir():
+        raise TaskUnitAdmissionError(f"workspace directory does not exist: {workspace}")
+    tmpdir_path = Path(tmpdir).resolve()
+    tmpdir_path.mkdir(parents=True, exist_ok=True)
+
+    out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = out_dir / f"{task_id}-stdout.log"
+    stderr_log = out_dir / f"{task_id}-stderr.log"
+    stdout_log.touch(mode=0o600, exist_ok=True)
+    stderr_log.touch(mode=0o600, exist_ok=True)
+
+    prelude_script = tmpdir_path / f"prelude_{task_id}.py"
+    prelude_code = generate_prelude_code(unit_name, expected_workspace=str(repo_dir))
+    prelude_script.write_text(prelude_code, encoding="utf-8")
+    prelude_script.chmod(0o700)
+
+    wrapped_command = [sys.executable, str(prelude_script)] + list(command_argv)
+    systemd_cmd = build_systemd_run_argv(
+        unit_name=unit_name,
+        command_argv=wrapped_command,
+        memory_mb=memory_mb,
+        tmpdir=str(tmpdir_path),
+        workspace=str(repo_dir),
+        stdout_path=str(stdout_log),
+        stderr_path=str(stderr_log),
+        wait=False,
+    )
+
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    clean_env = dict(os.environ)
+    clean_env["TMPDIR"] = str(tmpdir_path)
+    clean_env["TEMP"] = str(tmpdir_path)
+    clean_env["TMP"] = str(tmpdir_path)
+
+    res = subprocess.run(
+        systemd_cmd,
+        cwd=str(repo_dir),
+        env=clean_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise TaskUnitExecutionError(
+            f"failed to spawn unit {unit_name}: rc={res.returncode}, stderr={res.stderr}"
+        )
+
+    combined = (res.stdout or "") + "\n" + (res.stderr or "")
+    m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", combined, re.IGNORECASE)
+    inv_id = m.group(1) if m else None
+
+    return {
+        "task_id": task_id,
+        "unit_name": unit_name,
+        "invocation_id": inv_id,
+        "workspace": str(repo_dir),
+        "working_directory": str(repo_dir),
+        "module_sha256": module_sha256,
+        "provider": provider,
+        "started_at": started_at,
+        "memory_max_mb": memory_mb,
+        "tasks_max": TASKS_MAX,
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+    }
