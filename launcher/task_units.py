@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -619,6 +620,34 @@ def execute_transient_task_unit(
 
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+    # 6. Extract genuine structured telemetry events (no synthesized events)
+    events = extract_telemetry_events(stdout_log)
+    tool_calls = parse_tool_events(events)
+    first_tool = tool_calls[0] if tool_calls else None
+
+    result_info = None
+    for ev in events:
+        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+            result_info = ev["result"]
+            break
+
+    # Preserve genuine structured events alongside final artifact in workspace
+    events_artifact = repo_dir / f"{task_id}-telemetry.jsonl"
+    log_events_path = out_dir / f"{task_id}-telemetry.jsonl"
+    if events:
+        try:
+            with open(events_artifact, "w", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev) + "\n")
+        except Exception:
+            pass
+        try:
+            with open(log_events_path, "w", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev) + "\n")
+        except Exception:
+            pass
+
     return {
         "task_id": task_id,
         "unit_name": unit_name,
@@ -637,7 +666,74 @@ def execute_transient_task_unit(
         "tasks_max": TASKS_MAX,
         "stdout_log": str(stdout_log),
         "stderr_log": str(stderr_log),
+        "telemetry_events_path": str(events_artifact) if events else None,
+        "log_telemetry_path": str(log_events_path) if events else None,
+        "tool_calls_count": len(tool_calls),
+        "first_tool": first_tool,
+        "model_status": result_info.get("status") if result_info else None,
+        "usage": result_info.get("usage") if result_info else None,
     }
+
+
+def extract_telemetry_events(stdout_path: Path) -> List[Dict[str, Any]]:
+    """Extract genuine structured invocation/tool events from stdout log.
+    Never synthesizes events: returns only lines that are valid JSON objects
+    representing genuine structured events from adapters."""
+    events = []
+    if not stdout_path.is_file():
+        return events
+    try:
+        with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or not (line.startswith("{") and line.endswith("}")):
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        # Matches agy stream-json, grok streaming-json, or zcodex json
+                        if (
+                            "event" in obj
+                            or "type" in obj
+                            or "tool_name" in obj
+                            or "step_update" in obj
+                            or "result" in obj
+                        ):
+                            events.append(obj)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return events
+
+
+def parse_tool_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract genuine tool-call events from structured event stream."""
+    tool_calls = []
+    for ev in events:
+        step = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else ev
+        if (
+            step.get("step_type") == "tool"
+            or "tool_name" in step
+            or ("tool_info" in step and isinstance(step.get("tool_info"), dict))
+        ):
+            tool_name = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
+            tool_entry = {
+                "tool_name": tool_name,
+                "state": step.get("state"),
+                "step_index": step.get("step_index"),
+                "duration_seconds": step.get("duration_seconds"),
+                "tool_info": step.get("tool_info"),
+            }
+            tool_calls.append(tool_entry)
+        elif ev.get("type") in ("tool_use", "tool_call"):
+            tool_entry = {
+                "tool_name": ev.get("name") or ev.get("tool_name"),
+                "state": ev.get("state", "DONE"),
+                "parameters": ev.get("parameters") or ev.get("input"),
+            }
+            tool_calls.append(tool_entry)
+    return tool_calls
 
 
 def spawn_transient_task_unit(

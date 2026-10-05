@@ -42,7 +42,7 @@ ADAPTERS = {
         "argv": ["/usr/bin/env", "-u", "GEMINI_API_KEY", "-u", "GOOGLE_API_KEY",
                  "/home/alexey/.local/bin/agy", "--model", "gemini-3.1-pro-high", "--effort", "high",
                  "--dangerously-skip-permissions",
-                 "--print-timeout", "0", "--output-format", "text", "-p"],
+                 "--print-timeout", "0", "--output-format", "stream-json", "-p"],
         "env": {},
     },
     "zai": {
