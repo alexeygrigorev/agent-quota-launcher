@@ -119,16 +119,6 @@ Report-only corrections plus process notes; 89 tests green.
 * Negatives for non-hour `as_of` (partial edge tiles pinned), offset, DST, malformed all in tests/test_report.py. Child first-action identity/generation bounds and result-evidence assertions preserved untouched.
 * Process: /tmp scratch from the earlier capture removed; scratch now lives under repo-owned `.local/tmp` only. Example lines re-captured read-only from the live store (TMPDIR pointed at `.local/tmp`); embedded coverage line verified byte-identical to the capture.
 
-## 2026-10-04 QL-CORE-003 R2 fix round (head review C1524/C1526/C1528)
-
-Report-only corrections plus process notes; 89 tests green.
-
-* Window tiling now includes the partial first clock hour (previous code floored `window_start` then skipped it with +1h): first tile = the hour containing `window_start`, last tile = last hour starting before `as_of` — 25 tiles for off-hour `as_of`, 24 on the hour; `gaps + non-empty buckets == tile count`.
-* Offset-aware `created_at` is converted (`astimezone(utc)`), no longer relabelled via `replace(tzinfo=utc)`; store-native UTC-naive values still assumed UTC. Negatives added: +02:00 wall time must land on its true UTC hour; Berlin-summer +02:00 timestamp lands on the UTC instant, not the naive label.
-* Malformed `created_at` counts as `coverage.created_at_invalid` — unknown/invalid, no longer attributed to the generation hour and never counted outside-window.
-* Negatives for non-hour `as_of` (partial edge tiles pinned), offset, DST, malformed all in tests/test_report.py. Child first-action identity/generation bounds and result-evidence assertions preserved untouched.
-* Process: /tmp scratch from the earlier capture removed; scratch now lives under repo-owned `.local/tmp` only. Example lines re-captured read-only from the live store (TMPDIR pointed at `.local/tmp`); embedded coverage line verified byte-identical to the capture.
-
 ## 2026-10-04 QL-CORE-003 R3 fix round (head review C1538)
 
 First-action validator tightened; R2 report behavior kept as-is. 95 tests green.
@@ -137,10 +127,57 @@ First-action validator tightened; R2 report behavior kept as-is. 95 tests green.
 * Laundered start records rejected, not only byte-identical copies: an artifact that agrees with the launch start record on every non-time/non-phase key while adding at most `timestamp` (and/or fiddling `created_at_ms`/`updated_at_ms`/`phase`) is the wrapper's own record, not an agent action. A genuine rich whoami always carries real extra session fields (`last_activity_ms`, `reported_state`, ...) and still passes. Identity match is documented as identity, not tool provenance.
 * Negatives added: naive timestamp, stale-vs-launch timestamp, far-future timestamp, start+timestamp, start+altered created_at_ms; positive pin that start+timestamp+real extra keys stays acceptable. Child identity/generation bounds and result-evidence assertions preserved.
 
-## 2026-10-04 QL-CORE-003 R3 fix round (head review C1538)
+## 2026-10-05 QL-CORE-003 R5 fix round (C2417-EXEC)
 
-First-action validator tightened; R2 report behavior kept as-is. 95 tests green.
+First-action validator provenance gate and consumer dashboard contract repair; 100 tests green (100/100 OK).
 
-* ISO `timestamp` in a first action is now bounded like the epoch-ms fields: timezone-aware required (naive fails), not older than the launched session's `created_at_ms` minus 5s skew, not more than 5 minutes in the future.
-* Laundered start records rejected, not only byte-identical copies: an artifact that agrees with the launch start record on every non-time/non-phase key while adding at most `timestamp` (and/or fiddling `created_at_ms`/`updated_at_ms`/`phase`) is the wrapper's own record, not an agent action. A genuine rich whoami always carries real extra session fields (`last_activity_ms`, `reported_state`, ...) and still passes. Identity match is documented as identity, not tool provenance.
-* Negatives added: naive timestamp, stale-vs-launch timestamp, far-future timestamp, start+timestamp, start+altered created_at_ms; positive pin that start+timestamp+real extra keys stays acceptable. Child identity/generation bounds and result-evidence assertions preserved.
+* Scope 1 — Child artifact provenance (`launcher/launch.py`):
+  - Fixed start-record superset loophole: records where all start keys and values are identically present (`all(data.get(k) == v for k, v in start_json.items())`) now unconditionally fail. This rejects start_json copies, start+timestamp, start+dummy=123, and start records with invented worker fields while original start keys (including `phase=starting`) remain untouched.
+  - Phase enforcement: artifacts reporting `phase == 'starting'` are rejected; genuine running workloads report live phases (`running`, `working`, `launching`).
+  - Live whoami mutation required: artifacts bearing wrapper/engine command signatures must demonstrate live session state (`worker_pid`, `workload_pid`, `updated_at_ms`, or `last_activity_ms`). Flipping `phase` alone with arbitrary keys does not satisfy live whoami validation.
+  - Native whoami keys (`command`, `schema_version`, `limits`, `containment`, etc.) preserved without blacklisting (C1450 preserved).
+  - Tests (`tests/test_launch.py`): added negative tests for `start_json + {"dummy": 123}`, `start_json + dummy + timestamp`, and `start_json + invented live fields with phase=starting`. Added positive pin for full live native whoami fixture. Improved naive ISO timestamp test to be in-window orthogonal.
+  - Boundary: documented that live whoami mutation provides structural/state correlation against the launch record, while captured cryptographic tool-trace verification remains outside v0.1.
+
+* Scope 2 — Consumer attribution and 24h tiling (`launcher/cli.py`):
+  - Canonical project identity: `build_report` and `report` default/stamp `quota-launcher` (canonical QL-DASH-CONTRACT-1 id, avoiding unattributed mapping).
+  - Exact 24 hourly buckets: fixed 25-clock-hour bug in `build_report` when `as_of` is off-hour. Tiling enforces exactly 24 hourly buckets on half-open `[as_of-24h, as_of)` UTC (`gaps_within_window + buckets == 24`), eliminating the prior-hour floor leak.
+  - Tests (`tests/test_report.py`): updated `test_utc_z_window_is_half_open_24h` for exact 24 buckets; added `test_default_project_id_is_quota_launcher` and `test_exact_24_buckets_on_hour_boundary`.
+
+* Test hygiene (`tests/test_resources.py`):
+  - Configured test scratch directories under repo-owned `.local/tmp`, preventing Linux `/tmp` default collisions and guaranteeing zero net `/tmp` growth. All 100 tests pass without requiring ambient environment variables.
+
+## 2026-10-05 QL-CORE-003 R6 fix round (C2417-EXEC)
+
+First-action provenance loophole closure and first partial clock-hour reporting fix; 104 tests green (104/104 OK).
+
+* Scope 1 — Child artifact provenance loophole closure (`launcher/launch.py`):
+  - Loophole 1 fixed: Start record with `phase` flipped to `running`, `dummy=123`, and `worker_pid` present previously bypassed validation. Enforced strict structural schema: `REQUIRED_WHOAMI_FIELDS` (`{"schema_version", "id", "tag", "workspace", "engine", "command", "phase", "worker_pid"}`) requires real execution context; `VALID_WHOAMI_KEYS` rejects arbitrary extra keys like `dummy=123`. `worker_pid` must be a positive non-boolean integer.
+  - Live whoami progression required: When all non-phase start keys match, authentic live time progression (`updated_at_ms` or `last_activity_ms` > `created_at_ms`) must be present; otherwise rejected as a start-record clone.
+  - Loophole 2 fixed: Minimal 4-key identity+timestamp cards (`id`, `tag`, `workspace`, `timestamp`) lacking execution structure are rejected via `REQUIRED_WHOAMI_FIELDS.issubset(data)`.
+  - Negative tests added (`tests/test_launch.py`):
+    - `test_minimal_identity_plus_timestamp_rejected` (4-key identity card fails).
+    - `test_start_record_phase_running_with_worker_pid_and_dummy_rejected` (flipped phase + worker_pid + dummy=123 fails).
+    - `test_start_record_phase_running_with_worker_pid_no_live_time_rejected` (flipped phase + worker_pid without live time progression fails).
+  - All positive pins (`test_positive_pin_real_whoami_fixture_accepted`, `test_rich_native_whoami_accepted`) remain 100% green.
+
+* Scope 2 — First partial clock-hour task placement (`launcher/cli.py`):
+  - Defect fixed: Tasks occurring in `[window_start, window_labels[0])` (e.g. at 12:20 when `window_start` is 12:14 and `window_labels[0]` is 13:00) were previously miscounted as `coverage.tasks_outside_window`.
+  - Placement: Tasks with `window_start <= dt < now` whose hourly floor `hour_label(dt)` precedes `label_set` are now correctly placed into `window_labels[0]`. Tasks strictly before `window_start` (or after `now`) increment `outside_window`.
+  - Tests added (`tests/test_report.py`):
+    - `test_first_partial_hour_task_placed_in_first_bucket_not_outside`: verifies task at 12:20:00Z in a 12:14:00Z window lands in `2026-10-03T13:00:00Z` with `tasks_outside_window == 0`.
+    - `test_task_before_window_start_counted_outside_window`: verifies task at 12:10:00Z (before 12:14:00Z) is not emitted and increments `tasks_outside_window == 1`.
+
+* Verification:
+  - 104/104 tests pass (`python3 -m unittest discover -s tests -v`).
+  - Zero rust/cargo invocations; zero net `/tmp` growth; scratch under `.local/tmp`.
+  - Subagent boundaries strictly respected: no git commit, no self-acceptance; handoff via durable message back to parent.
+
+## 2026-10-05 QL-C2508 identity-matched execute kill + C2506 head.cred gate
+
+Head-owned source pin after 04-b HOLD of `6c96bebe` (not merged). 164 tests green.
+
+* `launcher/task_units.py` `execute_transient_task_unit`: timeout and generic exception no longer `systemctl kill/stop` by unit name when Invocation is missing. Kill/stop only if nonempty expected Invocation AND nonempty live Invocation match (`invocation_ids_match` / `signal_owned_unit`). Timeout raises `TaskUnitTimeoutError` with captured start/live cgroup+PID and is not wrapped into the else-stop path. `verify_task_unit_cleanup` final stop uses the same match rule.
+* `launcher/filebus_backend.py` + `launcher/cli.py` `run_task_units`: C2506 enrollment/adapter gate. `--cred …/filebus/head.cred` in payload/goal, cred fields pointing at head.cred, or worker `bus_identity`/`identity_id` equal to quota-launcher-head / ad6251d7 fail closed before lease (task stays queued). Worker-16.cred and prohibition text without `--cred` remain allowed. Same-UID privacy check, not a security boundary (C2512).
+* Negatives: `tests/test_task_units.py` timeout empty/missing Inv does not kill; matched Inv kills; exception without Inv does not stop. `tests/test_filebus_backend.py` and `tests/test_cli_backend.py` cover the head.cred grant.
+* 6c96bebe / 03-alt remain unmerged. 16-b uses worker cred only. Product not accepted. No 50 claim.

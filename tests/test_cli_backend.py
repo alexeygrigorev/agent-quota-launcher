@@ -157,6 +157,33 @@ class TaskUnitsCliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(store.get_task("t-cli-quse-fail")["state"], "queued")
 
+    def test_head_cred_in_goal_fails_closed_queued(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name)
+        store = Store(str(cfg / "state.db"))
+        store.submit_task(
+            "t-cli-headcred", "k-cli-headcred",
+            {
+                "owner": "ql",
+                "cwd": tmp.name,
+                "timeout": 60,
+                "provider": "grok",
+                "goal": (
+                    "inbox --cred /home/alexey/git/agent-quota-launcher/"
+                    ".local/filebus/head.cred"
+                ),
+            },
+            [str(cfg / "p-headcred")],
+        )
+        args = argparse.Namespace(
+            id="t-cli-headcred", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
+            backend="task-units", config_dir=str(cfg),
+        )
+        rc = run_task_units(args)
+        self.assertEqual(rc, 1)
+        self.assertEqual(store.get_task("t-cli-headcred")["state"], "queued")
+
 
 if __name__ == "__main__":
     unittest.main()

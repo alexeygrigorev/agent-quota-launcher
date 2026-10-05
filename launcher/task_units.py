@@ -55,6 +55,59 @@ class TaskUnitCleanupError(TaskUnitError):
     pass
 
 
+class TaskUnitTimeoutError(TaskUnitExecutionError):
+    """Timeout without claiming foreign unit ownership."""
+
+    def __init__(self, message: str, identity: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.identity = identity or {}
+
+
+def invocation_ids_match(expected: Optional[str], live: Optional[str]) -> bool:
+    """Kill/stop requires nonempty expected Invocation AND nonempty live match."""
+    exp = (expected or "").strip()
+    liv = (live or "").strip()
+    return bool(exp) and bool(liv) and exp == liv
+
+
+def show_unit_props(
+    unit_name: str,
+    properties: Tuple[str, ...] = (
+        "InvocationID",
+        "ControlGroup",
+        "MainPID",
+        "ExecMainPID",
+        "LoadState",
+        "ActiveState",
+    ),
+) -> Dict[str, str]:
+    cmd = ["systemctl", "--user", "show", unit_name]
+    for prop in properties:
+        cmd.extend(["-p", prop])
+    chk = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
+    props: Dict[str, str] = {}
+    for line in (chk.stdout or "").splitlines():
+        if "=" in line:
+            key, val = line.split("=", 1)
+            props[key] = val
+    return props
+
+
+def signal_owned_unit(unit_name: str, expected_inv: Optional[str], verb: str) -> bool:
+    """Issue kill/stop only when nonempty expected Invocation matches nonempty live Invocation."""
+    if verb not in ("kill", "stop"):
+        raise ValueError("verb must be kill or stop")
+    live = show_unit_props(unit_name)
+    if not invocation_ids_match(expected_inv, live.get("InvocationID")):
+        return False
+    if verb == "kill":
+        cmd = ["systemctl", "--user", "kill", "--signal=SIGKILL", unit_name]
+    else:
+        cmd = ["systemctl", "--user", "stop", unit_name]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return True
+
+
 def sanitize_unit_name(task_id: str) -> str:
     """Derive a safe systemd unit name from a task identifier."""
     if not task_id or not isinstance(task_id, str):
@@ -362,10 +415,8 @@ def verify_task_unit_cleanup(
     try:
         inv_id = props.get("InvocationID", "")
         active_state = props.get("ActiveState", "unknown")
-        # Never stop a foreign or reused active unit
-        if expected_invocation_id and inv_id and inv_id != expected_invocation_id:
-            return False, props
-        if expected_invocation_id and not inv_id and active_state not in ("inactive", "failed"):
+        # Only stop when nonempty expected Invocation matches nonempty live Invocation.
+        if not invocation_ids_match(expected_invocation_id, inv_id):
             return False, props
 
         subprocess.run(
@@ -468,6 +519,8 @@ def execute_transient_task_unit(
     clean_env["TMP"] = str(tmpdir_path)
 
     assigned_inv_id = None
+    start_cgroup = ""
+    start_pid = ""
     proc = None
 
     try:
@@ -480,72 +533,57 @@ def execute_transient_task_unit(
             text=True,
             start_new_session=True,
         )
+        start_props = show_unit_props(unit_name)
+        assigned_inv_id = (start_props.get("InvocationID") or "").strip() or None
+        start_cgroup = (start_props.get("ControlGroup") or "").strip()
+        start_pid = (start_props.get("MainPID") or start_props.get("ExecMainPID") or "").strip()
 
         try:
             out, err = proc.communicate(timeout=timeout_sec)
             combined_run_output = (out or "") + "\n" + (err or "")
             m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", combined_run_output, re.IGNORECASE)
-            if m:
+            if m and not assigned_inv_id:
                 assigned_inv_id = m.group(1)
             exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            if assigned_inv_id:
-                try:
-                    chk = subprocess.run(
-                        ["systemctl", "--user", "show", unit_name, "-p", "InvocationID"],
-                        stdout=subprocess.PIPE,
-                        text=True,
-                        check=False,
-                    )
-                    curr_inv = dict(l.split("=", 1) for l in chk.stdout.splitlines() if "=" in l).get("InvocationID", "")
-                    if curr_inv and curr_inv == assigned_inv_id:
-                        subprocess.run(
-                            ["systemctl", "--user", "kill", "--signal=SIGKILL", unit_name],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            check=False,
-                        )
-                except Exception:
-                    pass
-            else:
-                subprocess.run(
-                    ["systemctl", "--user", "kill", "--signal=SIGKILL", unit_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            proc.kill()
-            raise TaskUnitExecutionError(
-                f"task unit {unit_name} exceeded timeout of {timeout_sec}s"
+        except subprocess.TimeoutExpired as timed_out:
+            partial = (getattr(timed_out, "stdout", None) or "") + "\n" + (
+                getattr(timed_out, "stderr", None) or ""
             )
-
-    except Exception as e:
-        if assigned_inv_id:
+            if not assigned_inv_id:
+                m = re.search(r"invocation ID:\s*([a-zA-Z0-9_\-]+)", partial, re.IGNORECASE)
+                if m:
+                    assigned_inv_id = m.group(1)
+            live = show_unit_props(unit_name)
+            killed = signal_owned_unit(unit_name, assigned_inv_id, "kill")
             try:
-                chk = subprocess.run(
-                    ["systemctl", "--user", "show", unit_name, "-p", "InvocationID"],
-                    stdout=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                curr_inv = dict(l.split("=", 1) for l in chk.stdout.splitlines() if "=" in l).get("InvocationID", "")
-                if curr_inv and curr_inv == assigned_inv_id:
-                    subprocess.run(
-                        ["systemctl", "--user", "stop", unit_name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
+                proc.kill()
             except Exception:
                 pass
-        else:
-            subprocess.run(
-                ["systemctl", "--user", "stop", unit_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+            identity = {
+                "expected_invocation_id": assigned_inv_id or "",
+                "live_invocation_id": (live.get("InvocationID") or "").strip(),
+                "start_cgroup": start_cgroup,
+                "live_cgroup": (live.get("ControlGroup") or "").strip(),
+                "start_pid": start_pid,
+                "live_pid": (live.get("MainPID") or live.get("ExecMainPID") or "").strip(),
+                "load_state": (live.get("LoadState") or "").strip(),
+                "killed": killed,
+            }
+            raise TaskUnitTimeoutError(
+                f"task unit {unit_name} exceeded timeout of {timeout_sec}s identity={identity}",
+                identity=identity,
             )
-        verify_task_unit_cleanup(unit_name, timeout_sec=2.0, expected_invocation_id=assigned_inv_id)
+
+    except TaskUnitTimeoutError:
+        raise
+    except Exception as e:
+        signal_owned_unit(unit_name, assigned_inv_id, "stop")
+        verify_task_unit_cleanup(
+            unit_name,
+            timeout_sec=2.0,
+            expected_invocation_id=assigned_inv_id,
+            expected_cgroup=start_cgroup or None,
+        )
         raise TaskUnitExecutionError(f"execution failed: {e}") from e
 
     finally:

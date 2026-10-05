@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,13 +17,16 @@ from launcher.task_units import (
     TaskUnitAdmissionError,
     TaskUnitCleanupError,
     TaskUnitExecutionError,
+    TaskUnitTimeoutError,
     _is_cgroup_dissolved_or_empty,
     admit_task_unit,
     assert_cgroup_outside_head,
     build_systemd_run_argv,
     execute_transient_task_unit,
     generate_prelude_code,
+    invocation_ids_match,
     sanitize_unit_name,
+    signal_owned_unit,
     spawn_transient_task_unit,
     verify_task_unit_cleanup,
 )
@@ -309,9 +313,17 @@ class TestCGroupDissolutionAndCleanup(unittest.TestCase):
         fake_stdout = "ActiveState=active\nSubState=running\nControlGroup=app.slice/agent-task-t1.service\n"
         mock_proc = MagicMock()
         mock_proc.stdout = fake_stdout
-        with patch("subprocess.run", return_value=mock_proc):
+        calls = []
+
+        def mock_sub_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock_proc
+
+        with patch("subprocess.run", side_effect=mock_sub_run):
             cleaned, props = verify_task_unit_cleanup("agent-task-t1.service", timeout_sec=0.1)
             self.assertFalse(cleaned)
+            stop_calls = [c for c in calls if "stop" in c]
+            self.assertEqual(len(stop_calls), 0)
 
     def test_verify_task_unit_cleanup_mismatched_invocation_id_fails_closed(self):
         fake_stdout = "ActiveState=active\nSubState=running\nControlGroup=app.slice/agent-task-t1.service\nInvocationID=other-id-999\n"
@@ -386,10 +398,16 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    @patch("launcher.task_units.show_unit_props", return_value={
+        "InvocationID": "inv12345",
+        "ControlGroup": "app.slice/agent-task-t1.service",
+        "MainPID": "123",
+        "LoadState": "loaded",
+    })
     @patch("launcher.task_units.check_resources", return_value=True)
     @patch("launcher.task_units.verify_task_unit_cleanup")
     @patch("subprocess.Popen")
-    def test_execute_transient_task_unit_success(self, mock_popen, mock_cleanup, mock_res):
+    def test_execute_transient_task_unit_success(self, mock_popen, mock_cleanup, mock_res, mock_show):
         mock_cleanup.return_value = (True, {"ControlGroup": "app.slice/agent-task-t1.service", "ActiveState": "inactive", "SubState": "dead", "InvocationID": "inv12345"})
         
         proc_inst = MagicMock()
@@ -419,10 +437,16 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(receipt["tasks_max"], 100)
         self.assertTrue(Path(receipt["stdout_log"]).exists())
 
+    @patch("launcher.task_units.show_unit_props", return_value={
+        "InvocationID": "",
+        "ControlGroup": "",
+        "MainPID": "0",
+        "LoadState": "not-found",
+    })
     @patch("launcher.task_units.check_resources", return_value=True)
     @patch("launcher.task_units.verify_task_unit_cleanup")
     @patch("subprocess.Popen")
-    def test_execute_transient_task_unit_cleanup_failure_raises(self, mock_popen, mock_cleanup, mock_res):
+    def test_execute_transient_task_unit_cleanup_failure_raises(self, mock_popen, mock_cleanup, mock_res, mock_show):
         mock_cleanup.return_value = (False, {"ActiveState": "failed", "SubState": "failed"})
         
         proc_inst = MagicMock()
@@ -465,6 +489,147 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(len(receipt["module_sha256"]), 64)
         self.assertEqual(receipt["memory_max_mb"], 512)
         self.assertTrue(Path(receipt["stdout_log"]).name.endswith("-stdout.log"))
+
+    def test_invocation_ids_match_requires_both_nonempty_and_equal(self):
+        self.assertTrue(invocation_ids_match("abc", "abc"))
+        self.assertFalse(invocation_ids_match("", ""))
+        self.assertFalse(invocation_ids_match("abc", ""))
+        self.assertFalse(invocation_ids_match("", "abc"))
+        self.assertFalse(invocation_ids_match(None, "abc"))
+        self.assertFalse(invocation_ids_match("abc", "xyz"))
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {}))
+    @patch("subprocess.Popen")
+    def test_timeout_without_invocation_does_not_kill_or_stop(self, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.communicate.side_effect = subprocess.TimeoutExpired(
+            cmd=["systemd-run"], timeout=1, output="", stderr=""
+        )
+        mock_popen.return_value = proc_inst
+        runs = []
+
+        def mock_run(cmd, **kwargs):
+            runs.append(list(cmd))
+            mock = MagicMock()
+            mock.stdout = "InvocationID=\nControlGroup=\nMainPID=0\nLoadState=not-found\n"
+            mock.returncode = 0
+            return mock
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with self.assertRaises(TaskUnitTimeoutError) as ctx:
+                execute_transient_task_unit(
+                    task_id="t-timeout-noid",
+                    command_argv=["sleep", "9"],
+                    memory_mb=512,
+                    workspace=str(self.repo),
+                    tmpdir=str(self.tmpdir),
+                    timeout_sec=0.01,
+                    quse_json=self.valid_quse,
+                )
+        self.assertFalse(ctx.exception.identity.get("killed"))
+        self.assertEqual(ctx.exception.identity.get("expected_invocation_id"), "")
+        kill_or_stop = [c for c in runs if "kill" in c or "stop" in c]
+        self.assertEqual(kill_or_stop, [])
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {}))
+    @patch("subprocess.Popen")
+    def test_timeout_empty_live_invocation_does_not_kill(self, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.communicate.side_effect = subprocess.TimeoutExpired(
+            cmd=["systemd-run"], timeout=1,
+            output="Running as unit: agent-task-t-timeout-empty.service; invocation ID: expected-inv\n",
+            stderr="",
+        )
+        mock_popen.return_value = proc_inst
+        runs = []
+
+        def mock_run(cmd, **kwargs):
+            runs.append(list(cmd))
+            mock = MagicMock()
+            mock.stdout = "InvocationID=\nControlGroup=\nMainPID=0\nLoadState=loaded\n"
+            mock.returncode = 0
+            return mock
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with self.assertRaises(TaskUnitTimeoutError) as ctx:
+                execute_transient_task_unit(
+                    task_id="t-timeout-empty",
+                    command_argv=["sleep", "9"],
+                    memory_mb=512,
+                    workspace=str(self.repo),
+                    tmpdir=str(self.tmpdir),
+                    timeout_sec=0.01,
+                    quse_json=self.valid_quse,
+                )
+        self.assertFalse(ctx.exception.identity.get("killed"))
+        kill_or_stop = [c for c in runs if "kill" in c or "stop" in c]
+        self.assertEqual(kill_or_stop, [])
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {}))
+    @patch("subprocess.Popen")
+    def test_timeout_matched_invocation_kills(self, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.communicate.side_effect = subprocess.TimeoutExpired(
+            cmd=["systemd-run"], timeout=1, output="", stderr=""
+        )
+        mock_popen.return_value = proc_inst
+        runs = []
+
+        def mock_run(cmd, **kwargs):
+            runs.append(list(cmd))
+            mock = MagicMock()
+            mock.stdout = (
+                "InvocationID=matched-inv\n"
+                "ControlGroup=app.slice/agent-task-t-timeout-match.service\n"
+                "MainPID=4242\nLoadState=loaded\n"
+            )
+            mock.returncode = 0
+            return mock
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with self.assertRaises(TaskUnitTimeoutError) as ctx:
+                execute_transient_task_unit(
+                    task_id="t-timeout-match",
+                    command_argv=["sleep", "9"],
+                    memory_mb=512,
+                    workspace=str(self.repo),
+                    tmpdir=str(self.tmpdir),
+                    timeout_sec=0.01,
+                    quse_json=self.valid_quse,
+                )
+        self.assertTrue(ctx.exception.identity.get("killed"))
+        kill_calls = [c for c in runs if "kill" in c]
+        self.assertTrue(any("--signal=SIGKILL" in c for c in kill_calls))
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {}))
+    @patch("subprocess.Popen")
+    def test_exception_without_invocation_does_not_stop(self, mock_popen, mock_cleanup, mock_res):
+        mock_popen.side_effect = OSError("systemd-run missing")
+        runs = []
+
+        def mock_run(cmd, **kwargs):
+            runs.append(list(cmd))
+            mock = MagicMock()
+            mock.stdout = "InvocationID=\nControlGroup=\nMainPID=0\nLoadState=not-found\n"
+            mock.returncode = 0
+            return mock
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with self.assertRaises(TaskUnitExecutionError):
+                execute_transient_task_unit(
+                    task_id="t-exc-noid",
+                    command_argv=["true"],
+                    memory_mb=512,
+                    workspace=str(self.repo),
+                    tmpdir=str(self.tmpdir),
+                    quse_json=self.valid_quse,
+                )
+        kill_or_stop = [c for c in runs if "kill" in c or "stop" in c]
+        self.assertEqual(kill_or_stop, [])
 
 
 if __name__ == "__main__":

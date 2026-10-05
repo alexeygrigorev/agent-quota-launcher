@@ -8,6 +8,7 @@ source tests of transient task units outside the head aplexer cgroup exist.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from launcher.admission import validate_quse
@@ -30,9 +31,59 @@ FILEBUS_IDENTITY_REQUIRED = FILEBUS_LIVE_IDENTITY_REQUIRED + FILEBUS_TERMINAL_RE
 
 NATIVE_WHOAMI_MARKERS = ("worker_cgroup", "workload_cgroup", "socket_path")
 
+# C2506/C2512: same-UID privacy check, not a security boundary (rename/symlink
+# still share the host UID). Catch the exact inheritance defect plus head role.
+HEAD_CRED_GRANT_RE = re.compile(
+    r"--cred(?:\s+|=)\S*filebus/head\.cred\b",
+    re.IGNORECASE,
+)
+HEAD_CRED_FIELD_KEYS = ("cred", "cred_path", "credential", "filebus_cred")
+HEAD_BUS_IDENTITY_ID = "ad6251d7-49f8-4f20-b8a1-d5af62412c5c"
+HEAD_BUS_AGENT = "quota-launcher-head"
+
 
 class FileBusBackendError(Exception):
     pass
+
+
+def _walk_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for key, val in obj.items():
+            yield str(key)
+            yield from _walk_strings(val)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _walk_strings(item)
+
+
+def payload_grants_head_cred(payload) -> bool:
+    """True when a worker payload would inherit the head FileBus credential."""
+    if not isinstance(payload, dict):
+        return False
+    worker_agent = payload.get("bus_identity") or payload.get("agent_name")
+    if worker_agent == HEAD_BUS_AGENT:
+        return True
+    worker_id = payload.get("identity_id") or payload.get("bus_identity_id")
+    if worker_id == HEAD_BUS_IDENTITY_ID:
+        return True
+    for key in HEAD_CRED_FIELD_KEYS:
+        val = payload.get(key)
+        if isinstance(val, str) and "filebus/head.cred" in val.replace("\\", "/"):
+            return True
+    for text in _walk_strings(payload):
+        if HEAD_CRED_GRANT_RE.search(text.replace("\\", "/")):
+            return True
+    return False
+
+
+def reject_head_cred_inheritance(payload) -> None:
+    """Fail closed if payload/goal would pass head.cred to a worker (C2506)."""
+    if payload_grants_head_cred(payload):
+        raise FileBusBackendError(
+            "head.cred must stay private from workers; payload/goal grants HEAD mailbox"
+        )
 
 
 def is_native_whoami(record: dict) -> bool:
@@ -100,6 +151,7 @@ def dispatch_headless_task(payload: dict) -> dict:
     """
     if payload.get("backend") != "filebus":
         raise FileBusBackendError("backend must be filebus")
+    reject_head_cred_inheritance(payload)
     raise FileBusBackendError(
         "live filebus dispatch held: missing source-tested transient "
         "task unit outside aplexer-workload-6be4c247; sidecar session-10825 "
@@ -118,6 +170,7 @@ def plan_filebus_task(store: Store, task_id: str, idempotency_key: str, payload:
     """Queue a FileBus task in the canonical Store. Does not spawn a worker."""
     if payload.get("backend") != "filebus":
         raise FileBusBackendError("backend must be filebus")
+    reject_head_cred_inheritance(payload)
     if int(memory_mb) > 1500:
         raise FileBusBackendError("worker memory exceeds 1500M ceiling")
     queued = store.submit_task(task_id, idempotency_key, payload, paths, memory_mb, disk_mb)

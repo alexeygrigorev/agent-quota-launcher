@@ -112,6 +112,16 @@ def run_task_units(args):
     if not goal:
         print(json.dumps({"error": "payload.goal required for task-units backend"}))
         return 1
+    from launcher.filebus_backend import FileBusBackendError, reject_head_cred_inheritance
+    try:
+        reject_head_cred_inheritance(payload)
+    except FileBusBackendError as e:
+        print(json.dumps({
+            "error": str(e),
+            "backend": "task-units",
+            "task_id": args.id,
+        }))
+        return 1
     provider = payload.get("provider") or "grok"
     tmpdir = args.tmpdir
     memory_mb = int(payload.get("memory_mb") or 768)

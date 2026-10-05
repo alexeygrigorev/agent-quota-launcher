@@ -11,7 +11,9 @@ from launcher.filebus_backend import (
     attach_filebus_live_identity,
     dispatch_headless_task,
     is_native_whoami,
+    payload_grants_head_cred,
     plan_filebus_task,
+    reject_head_cred_inheritance,
     validate_filebus_identity,
     validate_filebus_live_identity,
 )
@@ -71,6 +73,72 @@ class FileBusIdentityTests(unittest.TestCase):
         self.assertFalse(validate_filebus_identity(rec))
 
 
+class FileBusHeadCredInheritanceTests(unittest.TestCase):
+    """C2506: worker payload must not inherit head.cred mailbox authority."""
+
+    def test_goal_with_head_cred_flag_rejected(self):
+        payload = {
+            "backend": "filebus",
+            "goal": (
+                "inbox --cred /home/alexey/git/agent-quota-launcher/"
+                ".local/filebus/head.cred"
+            ),
+        }
+        self.assertTrue(payload_grants_head_cred(payload))
+        with self.assertRaises(FileBusBackendError) as ctx:
+            reject_head_cred_inheritance(payload)
+        self.assertIn("head.cred must stay private", str(ctx.exception))
+
+    def test_cred_field_head_path_rejected(self):
+        payload = {
+            "backend": "filebus",
+            "cred": "/home/alexey/git/agent-quota-launcher/.local/filebus/head.cred",
+            "goal": "read inbox",
+        }
+        self.assertTrue(payload_grants_head_cred(payload))
+        with self.assertRaises(FileBusBackendError):
+            reject_head_cred_inheritance(payload)
+
+    def test_prohibition_text_without_cred_flag_allowed(self):
+        payload = {
+            "backend": "filebus",
+            "goal": "ACK using worker cred only. Do not use head.cred.",
+        }
+        self.assertFalse(payload_grants_head_cred(payload))
+        reject_head_cred_inheritance(payload)
+
+    def test_head_bus_identity_as_worker_rejected(self):
+        payload = {
+            "backend": "filebus",
+            "bus_identity": "quota-launcher-head",
+            "identity_id": "ad6251d7-49f8-4f20-b8a1-d5af62412c5c",
+            "goal": "read inbox",
+        }
+        self.assertTrue(payload_grants_head_cred(payload))
+        with self.assertRaises(FileBusBackendError):
+            reject_head_cred_inheritance(payload)
+
+    def test_worker_cred_flag_allowed(self):
+        payload = {
+            "backend": "filebus",
+            "goal": (
+                "inbox --cred /home/alexey/git/agent-quota-launcher/"
+                ".local/filebus/worker-16.cred"
+            ),
+        }
+        self.assertFalse(payload_grants_head_cred(payload))
+        reject_head_cred_inheritance(payload)
+
+    def test_dispatch_rejects_head_cred_before_hold(self):
+        with self.assertRaises(FileBusBackendError) as ctx:
+            dispatch_headless_task({
+                "backend": "filebus",
+                "goal": "inbox --cred .local/filebus/head.cred",
+            })
+        self.assertIn("head.cred must stay private", str(ctx.exception))
+        self.assertNotIn("live filebus dispatch held", str(ctx.exception))
+
+
 class FileBusDispatchTests(unittest.TestCase):
     def test_dispatch_does_not_call_aplexer(self):
         with self.assertRaises(FileBusBackendError) as ctx:
@@ -97,6 +165,19 @@ class FileBusStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_plan_rejects_head_cred_goal(self):
+        bad = dict(self.payload)
+        bad["goal"] = (
+            "python3 bus_cli.py inbox --cred "
+            "/home/alexey/git/agent-quota-launcher/.local/filebus/head.cred"
+        )
+        with self.assertRaises(FileBusBackendError):
+            plan_filebus_task(
+                self.store, "t-fb-head", "idem-fb-head", bad,
+                [str(Path(self.tmp.name) / "evidence-head")],
+            )
+        self.assertIsNone(self.store.get_task("t-fb-head"))
 
     def test_plan_queues_blocked_without_spawn(self):
         tid = plan_filebus_task(
