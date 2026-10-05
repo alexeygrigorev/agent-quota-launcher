@@ -42,7 +42,13 @@ class TestFirstActionValidator(unittest.TestCase):
         return dict(self.start, phase="running",
                     created_at_ms=self.start["created_at_ms"] + 5000,
                     updated_at_ms=self.start["created_at_ms"] + 9000,
-                    worker_pid=1234)
+                    worker_pid=1234,
+                    boot_id="edbec548-453f-4111-b38e-e7c16d12aa93",
+                    agent="grok",
+                    state="running",
+                    pids_current=12,
+                    memory_current=198983680,
+                    systemd_unit="aplexer-workload-sess-1.scope")
 
     def test_rich_native_whoami_accepted(self):
         # command/phase/parent_session/schema_version keys are expected on a
@@ -50,10 +56,23 @@ class TestFirstActionValidator(unittest.TestCase):
         self.write(self.rich_whoami())
         self.assertTrue(self.check())
 
-    def test_minimal_identity_plus_timestamp_accepted(self):
+    def test_minimal_identity_plus_timestamp_rejected(self):
+        # 4-key identity card lacks execution state (command, phase, schema_version, worker_pid)
         self.write({"id": "sess-1", "tag": "task-t1", "workspace": "/repo",
                     "timestamp": "2026-10-04T12:29:00Z"})
-        self.assertTrue(self.check())
+        self.assertFalse(self.check())
+
+    def test_start_record_phase_running_with_worker_pid_and_dummy_rejected(self):
+        # Start record with phase flipped to running, worker_pid, and dummy=123 must FAIL
+        self.write(dict(self.start, phase="running", worker_pid=1234, dummy=123,
+                        timestamp="2026-10-04T12:29:00Z"))
+        self.assertFalse(self.check())
+
+    def test_start_record_phase_running_with_worker_pid_no_live_time_rejected(self):
+        # Start record with phase flipped to running and worker_pid, but no genuine live time progression must FAIL
+        self.write(dict(self.start, phase="running", worker_pid=1234,
+                        timestamp="2026-10-04T12:29:00Z"))
+        self.assertFalse(self.check())
 
     def test_start_record_copy_rejected(self):
         # Byte-identical wrapper start JSON is not a first action...
@@ -78,18 +97,57 @@ class TestFirstActionValidator(unittest.TestCase):
             self.start, created_at_ms=self.start["created_at_ms"] + 5000)))
         self.assertFalse(self.check())
 
-    def test_start_record_plus_real_extra_keys_accepted(self):
-        # A genuine whoami that agrees with the start record on every start
-        # key but carries real additional session fields is NOT the launder
-        # shape and stays acceptable.
+    def test_start_record_plus_dummy_rejected(self):
+        # A start-record superset with arbitrary extra keys must fail.
+        self.write(dict(self.start, dummy=123))
+        self.assertFalse(self.check())
+
+    def test_start_record_plus_dummy_and_timestamp_rejected(self):
+        # Start record + dummy key + valid timestamp must still fail.
+        self.write(dict(self.start, dummy=123, timestamp="2026-10-04T12:29:00Z"))
+        self.assertFalse(self.check())
+
+    def test_start_record_plus_invented_live_fields_with_phase_starting_rejected(self):
+        # Invented worker_pid/last_activity with all original start keys unchanged
+        # including phase=starting is a start-record clone and must FAIL.
         self.write(dict(self.start, timestamp="2026-10-04T12:29:00Z",
                         last_activity_ms=self.start["created_at_ms"] + 8000,
                         worker_pid=4242))
+        self.assertFalse(self.check())
+
+    def test_positive_pin_real_whoami_fixture_accepted(self):
+        # Full rich native whoami fixture (modeled on live aplexer whoami --json):
+        # phase is running, updated_at_ms > created_at_ms, worker_pid and
+        # session containment keys present.
+        fixture = {
+            "schema_version": 1,
+            "id": self.start["id"],
+            "workspace": self.start["workspace"],
+            "tag": self.start["tag"],
+            "engine": self.start["engine"],
+            "command": list(self.start["command"]),
+            "parent_session": self.start["parent_session"],
+            "cwd": self.start["workspace"],
+            "env": {},
+            "limits": {"memory_bytes": 1572864000, "pids": 100},
+            "history_bytes": 4194304,
+            "created_at_ms": self.start["created_at_ms"],
+            "updated_at_ms": self.start["created_at_ms"] + 5000,
+            "last_activity_ms": self.start["created_at_ms"] + 4500,
+            "reported_state": "working",
+            "phase": "running",
+            "worker_pid": 560806,
+            "workload_pid": 560857,
+            "containment_empty": False,
+            "socket_path": f"/run/user/1000/aplexer/sessions/{self.start['id']}/control.sock",
+            "history_path": f"/home/alexey/.local/state/aplexer/sessions/{self.start['id']}/history.bin",
+        }
+        self.write(fixture)
         self.assertTrue(self.check())
 
     def test_naive_iso_timestamp_rejected(self):
-        # No timezone: no provable instant.
-        self.write(dict(self.rich_whoami(), timestamp="2026-10-04T12:00:05"))
+        # No timezone: no provable instant (in-window naive timestamp).
+        self.write(dict(self.rich_whoami(), timestamp="2026-10-04T12:29:00"))
         self.assertFalse(self.check())
 
     def test_timestamp_stale_vs_launch_rejected(self):
@@ -161,8 +219,9 @@ class TestFirstActionValidator(unittest.TestCase):
 class TestAdapters(unittest.TestCase):
     def test_grok_argv_exact(self):
         argv = build_adapter_argv("grok", "goal text")
-        self.assertEqual(argv, ["grok", "-p", "--model", "grok-4.6", "--effort",
-                                "high", "--permission-mode", "auto", "goal text"])
+        self.assertEqual(argv, ["/home/alexey/.local/bin/grok", "--model",
+                                "grok-4.6", "--effort", "high",
+                                "--permission-mode", "auto", "-p", "goal text"])
 
     def test_antigravity_strips_api_keys_and_sets_print_timeout(self):
         argv = build_adapter_argv("antigravity", "goal")

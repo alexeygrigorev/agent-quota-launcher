@@ -2,6 +2,7 @@ import argparse
 import sys
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -80,9 +81,94 @@ def plan(args):
 
 def run(args):
     config_dir = config_dir_for(args)
+    backend = getattr(args, "backend", "aplexer")
+    if backend == "task-units":
+        return run_task_units(args)
+    if backend not in ("aplexer", "task-units"):
+        print(json.dumps({"error": f"unknown backend {backend}"}))
+        return 1
     lock_path = config_dir / 'launch.lock'
     return do_run(str(config_dir / 'state.db'), args.id, args.cwd, args.tmpdir,
                   str(lock_path))
+
+
+def run_task_units(args):
+    """Public CLI path: launch.lock + Store lease + sibling systemd unit."""
+    from launcher.admission import fetch_quse
+    from launcher.launch import build_adapter_argv
+    from launcher.task_units import execute_transient_task_unit
+
+    config_dir = config_dir_for(args)
+    store = get_store(args)
+    task = store.get_task(args.id)
+    if not task:
+        print(json.dumps({"error": f"unsubmitted id {args.id}"}))
+        return 1
+    if task["state"] != "queued":
+        print(json.dumps({"error": f"duplicate lease: task {args.id} state is {task['state']}"}))
+        return 1
+    payload = task["payload"]
+    goal = payload.get("goal") or payload.get("prompt") or ""
+    if not goal:
+        print(json.dumps({"error": "payload.goal required for task-units backend"}))
+        return 1
+    provider = payload.get("provider") or "grok"
+    tmpdir = args.tmpdir
+    memory_mb = int(payload.get("memory_mb") or 768)
+    timeout_sec = float(payload.get("timeout") or 300)
+    lock_path = config_dir / "launch.lock"
+    # Concurrent sibling launches can collide on quse (observed rc=1). Retry
+    # before leasing so a transient fetch failure leaves the task queued.
+    quse = None
+    last_quse_err = None
+    for attempt in range(4):
+        try:
+            quse = fetch_quse()
+            break
+        except ValueError as e:
+            last_quse_err = e
+            time.sleep(0.5 * (attempt + 1))
+    if quse is None:
+        print(json.dumps({
+            "error": f"quse fetch failed: {last_quse_err}",
+            "backend": "task-units",
+            "task_id": args.id,
+        }))
+        return 1
+    argv = build_adapter_argv(provider, goal)
+    # C2456: hold launch.lock only for Store lease, not the model wait.
+    with launch_lock(str(lock_path)):
+        store.transition_task(args.id, "starting", ("queued",),
+                              reason=f"task-units lease {provider}")
+    try:
+        receipt = execute_transient_task_unit(
+            task_id=args.id,
+            command_argv=argv,
+            memory_mb=memory_mb,
+            workspace=args.cwd,
+            tmpdir=tmpdir,
+            timeout_sec=timeout_sec,
+            quse_json=quse,
+            provider=provider,
+            log_dir=str(config_dir),
+        )
+    except Exception as e:
+        with launch_lock(str(lock_path)):
+            store.transition_task(args.id, "failed", ("starting",), reason=str(e)[:400])
+        print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
+        return 1
+    with launch_lock(str(lock_path)):
+        if receipt.get("exit_code") == 0:
+            store.transition_task(
+                args.id, "completed-awaiting-review", ("starting",),
+                reason="task-units sibling unit exit 0",
+            )
+            print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
+            return 0
+        store.transition_task(args.id, "failed", ("starting",),
+                              reason=f"task-units exit {receipt.get('exit_code')}")
+    print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
+    return 1
 
 
 def status(args):
@@ -179,13 +265,13 @@ def accept(args):
 
 def build_report(store, now=None, project_id=None):
     """Dashboard projection: hourly UTC buckets tiling the half-open window
-    [as_of-24h, as_of) — including the partial first clock hour — with
-    explicit gap labels and a project_id on every artifact. Offset-aware
-    created_at values are converted to UTC; malformed ones count as invalid
-    and are never attributed. Token usage stays null unless natively proven;
-    quota deltas are a separate object; unknown stays unknown (never
-    zero-fabricated)."""
+    [as_of-24h, as_of) with explicit gap labels and a project_id on every
+    artifact. Offset-aware created_at values are converted to UTC; malformed
+    ones count as invalid and are never attributed. Token usage stays null
+    unless natively proven; quota deltas are a separate object; unknown stays
+    unknown (never zero-fabricated)."""
     now = now or datetime.now(timezone.utc)
+    project_id = project_id or "quota-launcher"
     window_start = now - timedelta(hours=24)
 
     def z(dt):
@@ -196,6 +282,8 @@ def build_report(store, now=None, project_id=None):
 
     window_labels = []
     h = window_start.replace(minute=0, second=0, microsecond=0)
+    if h < window_start:
+        h += timedelta(hours=1)
     while h < now:
         window_labels.append(hour_label(h))
         h += timedelta(hours=1)
@@ -218,10 +306,13 @@ def build_report(store, now=None, project_id=None):
             dt = parsed.replace(tzinfo=timezone.utc)  # store writes UTC-naive
         else:
             dt = parsed.astimezone(timezone.utc)  # convert real offsets
-        if not (window_start <= dt < now) or hour_label(dt) not in label_set:
+        if not (window_start <= dt < now):
             outside_window += 1
             continue
-        buckets.setdefault(hour_label(dt), []).append({
+        bucket_key = hour_label(dt)
+        if bucket_key not in label_set:
+            bucket_key = window_labels[0]
+        buckets.setdefault(bucket_key, []).append({
             "id": task["id"],
             "state": task["state"],
             "reviewer": task["reviewer"],
@@ -267,7 +358,7 @@ def build_report(store, now=None, project_id=None):
 
 def report(args):
     store = get_store(args)
-    project_id = getattr(args, 'project_id', None) or Path.cwd().resolve().name
+    project_id = getattr(args, 'project_id', None) or "quota-launcher"
     projection = build_report(store, project_id=project_id)
     if getattr(args, 'jsonl', False):
         for bucket in sorted(projection["buckets"]):
@@ -310,6 +401,12 @@ def main():
     parser_run.add_argument("--id", required=True)
     parser_run.add_argument("--cwd", required=True)
     parser_run.add_argument("--tmpdir", required=True)
+    parser_run.add_argument(
+        "--backend",
+        default="aplexer",
+        choices=["aplexer", "task-units"],
+        help="aplexer = nested native start (held); task-units = sibling systemd unit",
+    )
     parser_run.set_defaults(func=run)
 
     parser_status = subparsers.add_parser("status", help="show task/lifecycle")
@@ -339,7 +436,7 @@ def main():
     parser_report.add_argument("--jsonl", action="store_true")
     parser_report.add_argument("--project-id", default=None,
                                help="project identity stamped on every emitted line "
-                                    "(default: current directory name)")
+                                    "(default: quota-launcher)")
     parser_report.set_defaults(func=report)
 
     parser_watch = subparsers.add_parser("watch",

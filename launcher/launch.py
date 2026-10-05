@@ -1,7 +1,9 @@
 """Launch adapters (strict allowlist, no shell parsing) and the bounded
 launch lifecycle. Provider argv sets are exactly:
 
-- grok:        grok -p --model grok-4.6 --effort high --permission-mode auto <goal>
+- grok:        /home/alexey/.local/bin/grok --model grok-4.6 --effort high
+               --permission-mode auto -p <PROMPT>
+               (installed grok  -p/--single requires the prompt as its value)
 - antigravity: env -u GEMINI_API_KEY -u GOOGLE_API_KEY agy --model gemini-3.1-pro-high
                --effort high --dangerously-skip-permissions -p --print-timeout 0
                --output-format text <goal>   (OAuth route; ambient API keys stripped)
@@ -32,8 +34,8 @@ ZCODEX_BIN = "/home/alexey/.local/bin/zcodex"
 
 ADAPTERS = {
     "grok": {
-        "argv": ["grok", "-p", "--model", "grok-4.6", "--effort", "high",
-                 "--permission-mode", "auto"],
+        "argv": ["/home/alexey/.local/bin/grok", "--model", "grok-4.6",
+                 "--effort", "high", "--permission-mode", "auto", "-p"],
         "env": {},
     },
     "antigravity": {
@@ -96,16 +98,29 @@ def _has_time_evidence(data, start_json, now_ms):
     return False
 
 
+REQUIRED_WHOAMI_FIELDS = {
+    "schema_version",
+    "id",
+    "tag",
+    "workspace",
+    "engine",
+    "command",
+    "phase",
+    "worker_pid",
+}
+
 def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
     """Content check of the child's first-action artifact against the launch
     start record. Identity must match the launched session: id, tag and
     workspace equal the start record's, and parent_session must match when
     the artifact carries it. Identity match is not tool provenance: any
     record that is the wrapper start JSON itself — byte-identical,
-    reformatted, or merely augmented with timestamp fields — is rejected as
-    a laundered copy, not an agent action. The rich native whoami is
-    preserved: extra keys beyond the start record (command, phase,
-    schema_version, worker_pid, ...) are expected, never blacklisted."""
+    reformatted, or augmented with timestamp fields or arbitrary extra keys
+    (such as dummy=123) while keeping start keys intact — is rejected as a
+    laundered clone, not an agent action. A genuine rich native whoami taken
+    after start must show live whoami mutation: live fields must differ from
+    the start record (phase running/working vs starting, updated_at_ms /
+    last_activity_ms after created_at_ms) and extra native keys are preserved."""
     try:
         if not os.path.exists(fa_path):
             return False
@@ -116,19 +131,24 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
         data = json.loads(raw)
         if not isinstance(data, dict):
             return False
-        if all(data.get(k) == v for k, v in start_json.items()) and \
-                set(data) - set(start_json) <= {"timestamp"}:
-            # The wrapper start JSON itself: byte-identical, reformatted, or
-            # laundered with an added timestamp. Not a first tool action.
+
+        # 1. Structural authenticity: require all essential whoami fields.
+        # Minimal 4-key cards (id, tag, workspace, timestamp) without execution
+        # state (command, phase, schema_version, worker_pid) are rejected.
+        if not REQUIRED_WHOAMI_FIELDS.issubset(data):
             return False
-        differs = {k for k in start_json if data.get(k) != start_json[k]}
-        added = set(data) - set(start_json)
-        if added <= {"timestamp"} and \
-                differs <= {"created_at_ms", "updated_at_ms", "phase"}:
-            # Altered start record: identical on every non-time, non-phase
-            # key, with at most fiddled time/phase values and an added
-            # timestamp. Still the wrapper's own record, not an agent action.
+        if not isinstance(data.get("worker_pid"), int) or isinstance(data.get("worker_pid"), bool) or data["worker_pid"] <= 0:
             return False
+
+        # Extra native whoami keys (boot_id, agent, state, pids_*, memory_*,
+        # systemd_unit, ...) are preserved (C1450). Dummy keys on an unmodified
+        # start clone still fail via the clone/superset checks below.
+
+        # 3. Workload phase: a running workload whoami must be in an active phase.
+        if data.get("phase") not in ("running", "working", "launching"):
+            return False
+
+        # 4. Identity match: id, tag, workspace must match the launched session.
         if data.get("id") != start_json.get("id"):
             return False
         if data.get("tag") != start_json.get("tag"):
@@ -138,6 +158,39 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
         if "parent_session" in data and \
                 data.get("parent_session") != start_json.get("parent_session"):
             return False
+        if "engine" in data and "engine" in start_json and data.get("engine") != start_json.get("engine"):
+            return False
+        if "command" in data and "command" in start_json and data.get("command") != start_json.get("command"):
+            return False
+        if "schema_version" in data and "schema_version" in start_json and data.get("schema_version") != start_json.get("schema_version"):
+            return False
+
+        # 5. Start-record superset / clone check:
+        # If all keys match identically -> fail (start-record clone).
+        if all(data.get(k) == v for k, v in start_json.items()):
+            return False
+
+        # If all non-phase keys match identically: flipping phase to running/working
+        # and adding worker_pid is still a start-record clone unless authentic
+        # time progression (updated_at_ms or last_activity_ms > created_at_ms) is present.
+        non_phase_start = {k for k in start_json if k != "phase"}
+        if all(data.get(k) == start_json[k] for k in non_phase_start):
+            has_live_time = False
+            for tf in ("updated_at_ms", "last_activity_ms"):
+                val = data.get(tf)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    if start_json.get("created_at_ms") and val > start_json["created_at_ms"]:
+                        has_live_time = True
+            if not has_live_time:
+                return False
+
+        # 6. Altered start record check:
+        differs = {k for k in start_json if data.get(k) != start_json[k]}
+        added = set(data) - set(start_json)
+        if added <= {"timestamp"} and \
+                differs <= {"created_at_ms", "updated_at_ms", "phase"}:
+            return False
+
         return _has_time_evidence(data, start_json, now_ms)
     except Exception:
         return False

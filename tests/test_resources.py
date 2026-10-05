@@ -6,15 +6,21 @@ from launcher.resources import check_resources
 
 GiB = 1024 * 1024 * 1024
 
+LOCAL_TMP_DIR = Path(__file__).resolve().parent.parent / ".local" / "tmp"
+
+
 class DiskUsage:
     def __init__(self, free):
         self.free = free
 
 class TestResources(unittest.TestCase):
     def setUp(self):
-        self.repo = tempfile.mkdtemp()
+        import shutil
+        LOCAL_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        self.repo = tempfile.mkdtemp(dir=LOCAL_TMP_DIR)
         self.owned_tmp = Path(self.repo) / ".local" / "tmp" / "run1"
         self.owned_tmp.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         self.mem_patch = patch('launcher.resources.get_mem_available',
                                return_value=15 * GiB)
         self.mem_patch.start()
@@ -56,13 +62,13 @@ class TestResources(unittest.TestCase):
             check_resources(1000, self.repo, "/tmp/.local/tmp/x", repo_root=self.repo)
 
     def test_reject_tmpdir_outside_owned_root(self):
-        with tempfile.TemporaryDirectory() as other:
+        with tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as other:
             with self.assertRaisesRegex(ValueError, "TMPDIR must resolve under owned"):
                 check_resources(1000, self.repo, other, repo_root=self.repo)
 
     def test_reject_sibling_repo_local_tmp(self):
         # A sibling checkout's .local/tmp must not satisfy containment.
-        with tempfile.TemporaryDirectory() as sibling:
+        with tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as sibling:
             sib_tmp = Path(sibling) / ".local" / "tmp"
             sib_tmp.mkdir(parents=True)
             with self.assertRaisesRegex(ValueError, "TMPDIR must resolve under owned"):
