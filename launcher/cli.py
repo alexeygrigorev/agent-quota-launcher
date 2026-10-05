@@ -2,6 +2,7 @@ import argparse
 import sys
 import json
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -92,8 +93,54 @@ def run(args):
                   str(lock_path))
 
 
+def controller_unit_name(task_id: str) -> str:
+    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in task_id)
+    return f"ql-ctl-{safe}.service"
+
+
+def spawn_ql_controller(args) -> int:
+    """Place the proven blocking public CLI in a sibling app.slice unit.
+
+    Inner process still uses execute_transient_task_unit(--wait) so ExecMainStatus
+    is sampled before --collect. Head CLI returns after controller start.
+    """
+    launcher_root = str(Path(__file__).resolve().parent.parent)
+    config_dir = config_dir_for(args)
+    unit = controller_unit_name(args.id)
+    cmd = [
+        "systemd-run", "--user", f"--unit={unit}", "--slice=app.slice", "--collect",
+        "-p", "MemoryMax=256M", "-p", "TasksMax=100",
+        "-p", f"WorkingDirectory={launcher_root}",
+        "-E", f"PYTHONPATH={launcher_root}",
+        "-E", f"TMPDIR={args.tmpdir}",
+        "--",
+        sys.executable, "-m", "launcher",
+        "--config-dir", str(config_dir),
+        "run", "--backend", "task-units", "--as-controller",
+        "--id", args.id, "--cwd", args.cwd, "--tmpdir", args.tmpdir,
+    ]
+    res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(json.dumps({
+            "error": f"ql-ctl spawn failed rc={res.returncode}",
+            "stderr": (res.stderr or "")[:400],
+            "task_id": args.id,
+        }))
+        return 1
+    print(json.dumps({
+        "backend": "task-units",
+        "detached_controller": True,
+        "controller_unit": unit,
+        "task_id": args.id,
+        "state": "queued-or-starting",
+    }))
+    return 0
+
+
 def run_task_units(args):
     """Public CLI path: launch.lock + Store lease + sibling systemd unit."""
+    if not getattr(args, "as_controller", False):
+        return spawn_ql_controller(args)
     from launcher.admission import fetch_quse
     from launcher.launch import build_adapter_argv
     from launcher.task_units import execute_transient_task_unit
@@ -416,6 +463,11 @@ def main():
         default="aplexer",
         choices=["aplexer", "task-units"],
         help="aplexer = nested native start (held); task-units = sibling systemd unit",
+    )
+    parser_run.add_argument(
+        "--as-controller",
+        action="store_true",
+        help="inner ql-ctl process: keep proven --wait execute path",
     )
     parser_run.set_defaults(func=run)
 

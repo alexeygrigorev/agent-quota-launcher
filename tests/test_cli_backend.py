@@ -21,6 +21,7 @@ class TaskUnitsCliTests(unittest.TestCase):
             tmpdir=str(cfg / "tmp"),
             backend="task-units",
             config_dir=str(cfg),
+            as_controller=True,
         )
         rc = run_task_units(args)
         self.assertEqual(rc, 1)
@@ -48,7 +49,7 @@ class TaskUnitsCliTests(unittest.TestCase):
         def run_one(tid):
             args = argparse.Namespace(
                 id=tid, cwd=tmp.name, tmpdir=str(cfg / "tmp"),
-                backend="task-units", config_dir=str(cfg),
+                backend="task-units", config_dir=str(cfg), as_controller=True,
             )
             with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
                  patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
@@ -80,6 +81,7 @@ class TaskUnitsCliTests(unittest.TestCase):
             tmpdir=str(cfg / "tmp"),
             backend="task-units",
             config_dir=str(cfg),
+            as_controller=True,
         )
         rc = run_task_units(args)
         self.assertEqual(rc, 1)
@@ -100,6 +102,7 @@ class TaskUnitsCliTests(unittest.TestCase):
             tmpdir=str(cfg / "tmp"),
             backend="task-units",
             config_dir=str(cfg),
+            as_controller=True,
         )
         rc = run_task_units(args)
         self.assertEqual(rc, 1)
@@ -116,7 +119,7 @@ class TaskUnitsCliTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             id="t-cli-quse", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
-            backend="task-units", config_dir=str(cfg),
+            backend="task-units", config_dir=str(cfg), as_controller=True,
         )
         calls = {"n": 0}
 
@@ -148,7 +151,7 @@ class TaskUnitsCliTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             id="t-cli-quse-fail", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
-            backend="task-units", config_dir=str(cfg),
+            backend="task-units", config_dir=str(cfg), as_controller=True,
         )
         with patch("launcher.admission.fetch_quse",
                    side_effect=ValueError("Failed to fetch quse (rc=1)")), \
@@ -169,7 +172,7 @@ class TaskUnitsCliTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             id="t-cli-quse-eagain", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
-            backend="task-units", config_dir=str(cfg),
+            backend="task-units", config_dir=str(cfg), as_controller=True,
         )
         calls = {"n": 0}
 
@@ -210,11 +213,35 @@ class TaskUnitsCliTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             id="t-cli-headcred", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
-            backend="task-units", config_dir=str(cfg),
+            backend="task-units", config_dir=str(cfg), as_controller=True,
         )
         rc = run_task_units(args)
         self.assertEqual(rc, 1)
         self.assertEqual(store.get_task("t-cli-headcred")["state"], "queued")
+
+    def test_outer_run_spawns_ql_ctl_without_as_controller(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name)
+        Store(str(cfg / "state.db")).submit_task(
+            "t-ctl", "k-ctl",
+            {"owner": "ql", "cwd": tmp.name, "timeout": 60, "goal": "x", "provider": "grok"},
+            [str(cfg / "p")],
+        )
+        args = argparse.Namespace(
+            id="t-ctl", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
+            backend="task-units", config_dir=str(cfg), as_controller=False,
+        )
+        captured = {}
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+        with patch("launcher.cli.subprocess.run", side_effect=fake_run):
+            rc = run_task_units(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("--as-controller", captured["cmd"])
+        self.assertTrue(any(str(x).startswith("--unit=ql-ctl-") for x in captured["cmd"]))
+        self.assertNotIn("--wait", captured["cmd"])
 
 
 if __name__ == "__main__":
