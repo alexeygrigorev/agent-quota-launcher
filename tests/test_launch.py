@@ -232,6 +232,8 @@ class TestAdapters(unittest.TestCase):
         self.assertIn("--print-timeout", argv)
         self.assertEqual(argv[argv.index("--print-timeout") + 1], "0")
         self.assertIn("-p", argv)
+        self.assertLess(argv.index("--print-timeout"), argv.index("-p"))
+        self.assertEqual(argv[argv.index("-p") + 1], "goal")
         self.assertNotIn("sh", argv)
         self.assertNotIn("-c", argv[:argv.index("agy")] + ["sh"])
 

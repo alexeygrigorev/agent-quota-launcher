@@ -38,11 +38,10 @@ ADAPTERS = {
                  "--effort", "high", "--permission-mode", "auto", "-p"],
         "env": {},
     },
-    "antigravity": {
-        "argv": ["env", "-u", "GEMINI_API_KEY", "-u", "GOOGLE_API_KEY",
-                 "agy", "--model", "gemini-3.1-pro-high", "--effort", "high",
-                 "--dangerously-skip-permissions", "-p", "--print-timeout", "0",
-                 "--output-format", "text"],
+        "argv": ["/usr/bin/env", "-u", "GEMINI_API_KEY", "-u", "GOOGLE_API_KEY",
+                 "/home/alexey/.local/bin/agy", "--model", "gemini-3.1-pro-high", "--effort", "high",
+                 "--dangerously-skip-permissions",
+                 "--print-timeout", "0", "--output-format", "text", "-p"],
         "env": {},
     },
     "zai": {
