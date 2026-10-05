@@ -325,6 +325,44 @@ class TestCGroupDissolutionAndCleanup(unittest.TestCase):
             )
             self.assertFalse(cleaned)
 
+    def test_verify_task_unit_cleanup_collected_unit_with_empty_metadata_passes(self):
+        # When systemd --collect erases metadata from dead unit, cleanup still succeeds
+        fake_stdout = "ActiveState=inactive\nSubState=dead\nControlGroup=\nInvocationID=\nExecMainPID=0\n"
+        mock_proc = MagicMock()
+        mock_proc.stdout = fake_stdout
+        with patch("subprocess.run", return_value=mock_proc):
+            with patch("launcher.task_units._is_cgroup_dissolved_or_empty", return_value=True):
+                cleaned, props = verify_task_unit_cleanup(
+                    "agent-task-t1.service",
+                    timeout_sec=0.1,
+                    expected_invocation_id="my-expected-id-111",
+                    expected_cgroup="app.slice/agent-task-t1.service",
+                )
+                self.assertTrue(cleaned)
+                self.assertEqual(props["ActiveState"], "inactive")
+                self.assertEqual(props["SubState"], "dead")
+
+    def test_verify_task_unit_cleanup_foreign_active_never_stopped(self):
+        # If another invocation has reused the unit name, never issue systemctl stop
+        fake_stdout = "ActiveState=active\nSubState=running\nControlGroup=app.slice/agent-task-t1.service\nInvocationID=foreign-id-999\n"
+        mock_proc = MagicMock()
+        mock_proc.stdout = fake_stdout
+        calls = []
+        def mock_sub_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock_proc
+
+        with patch("subprocess.run", side_effect=mock_sub_run):
+            cleaned, props = verify_task_unit_cleanup(
+                "agent-task-t1.service",
+                timeout_sec=0.1,
+                expected_invocation_id="my-expected-id-111",
+            )
+            self.assertFalse(cleaned)
+            # Ensure "stop" command was NEVER called
+            stop_calls = [c for c in calls if "stop" in c]
+            self.assertEqual(len(stop_calls), 0)
+
 
 class TestTaskUnitExecutionLifecycle(unittest.TestCase):
     def setUp(self):

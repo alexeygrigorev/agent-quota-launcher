@@ -291,8 +291,16 @@ def verify_task_unit_cleanup(
     timeout_sec: float = CLEANUP_TIMEOUT_SEC,
     systemctl_cmd: Optional[List[str]] = None,
     expected_invocation_id: Optional[str] = None,
+    expected_cgroup: Optional[str] = None,
+    expected_pid: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, str]]:
-    """Verify that a transient unit has stopped and its cgroup is fully dissolved."""
+    """Verify that a transient unit has stopped and its cgroup is fully dissolved.
+
+    Handles systemd --collect metadata erasure cleanly: when a unit completes and
+    systemd garbage-collects its properties (ActiveState=inactive, SubState=dead,
+    ControlGroup="", InvocationID=""), verifies that the known prior cgroup
+    and PID are fully dead. Never touches foreign or reused active units.
+    """
     cmd_base = systemctl_cmd or ["systemctl", "--user"]
     deadline = time.time() + timeout_sec
     props: Dict[str, str] = {}
@@ -324,6 +332,8 @@ def verify_task_unit_cleanup(
             sub_state = props.get("SubState", "unknown")
             cg = props.get("ControlGroup", "")
             inv_id = props.get("InvocationID", "")
+            pid_str = props.get("ExecMainPID", "0")
+            current_pid = int(pid_str) if pid_str.isdigit() else 0
 
             # If expected invocation was given and a different or unverified active invocation is present, do not touch it
             if expected_invocation_id:
@@ -332,35 +342,38 @@ def verify_task_unit_cleanup(
                 if active_state not in ("inactive", "failed") and not inv_id:
                     return False, props
 
-            # If inactive or dead, verify cgroup dissolution
+            # If inactive or dead, verify cgroup dissolution and PID termination
             if active_state in ("inactive", "failed") and sub_state in ("dead", "failed", ""):
-                if not cg:
-                    return True, props
-                if _is_cgroup_dissolved_or_empty(cg):
+                # 1. Verify tracked PID is dead
+                target_pid = expected_pid or (current_pid if current_pid > 0 else None)
+                if target_pid and os.path.exists(f"/proc/{target_pid}"):
+                    return False, props
+
+                # 2. Verify cgroup dissolution (either current cg, expected cg, or slice path)
+                target_cg = cg or expected_cgroup or f"app.slice/{unit_name}"
+                if _is_cgroup_dissolved_or_empty(target_cg):
                     return True, props
 
         except Exception:
             pass
         time.sleep(CLEANUP_POLL_INTERVAL_SEC)
 
-    # Final attempt to stop unit if still running and owned
+    # Final attempt to stop unit if still running and verified owned
     try:
         inv_id = props.get("InvocationID", "")
-        if expected_invocation_id:
-            if inv_id and inv_id == expected_invocation_id:
-                subprocess.run(
-                    cmd_base + ["stop", unit_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-        else:
-            subprocess.run(
-                cmd_base + ["stop", unit_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+        active_state = props.get("ActiveState", "unknown")
+        # Never stop a foreign or reused active unit
+        if expected_invocation_id and inv_id and inv_id != expected_invocation_id:
+            return False, props
+        if expected_invocation_id and not inv_id and active_state not in ("inactive", "failed"):
+            return False, props
+
+        subprocess.run(
+            cmd_base + ["stop", unit_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
     except Exception:
         pass
 
