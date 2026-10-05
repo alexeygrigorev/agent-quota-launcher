@@ -262,6 +262,181 @@ class WatchRefillTests(unittest.TestCase):
             self.assertEqual(tid, "t-good")
             self.assertIsNone(note)
 
+    def test_disk_pressure_29_gib_eligible_continues_and_cleanup_enqueued(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+            store.submit_task(
+                "t-work", "k-work",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "implement valuable feature"},
+                [str(cfg / "pwork")],
+            )
+
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                once=True,
+            )
+
+            captured = {}
+            def fake_spawn(dispatch_args):
+                captured["id"] = dispatch_args.id
+                return 0
+
+            GiB = 1024 * 1024 * 1024
+
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 29 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                rc = watch_loop(args, max_passes=1)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured.get("id"), "t-work")
+
+            cleanup_task = store.get_task("disk-pressure-cleanup-1")
+            self.assertIsNotNone(cleanup_task)
+            payload = cleanup_task["payload"]
+            self.assertEqual(
+                payload["goal"],
+                "Prune expired scratch/temporary files in .local/tmp/. "
+                "Exclude active leases, dirty/unmerged worktrees, histories/auth/recovery paths. "
+                "Unknown ownership: no deletion.",
+            )
+            self.assertEqual(payload["cwd"], "/home/alexey/git/cloudflare-agent-git")
+            self.assertEqual(payload["tmpdir"], "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup")
+            self.assertEqual(payload["owner"], "ant-head-continuation-resume-20261005")
+            self.assertEqual(payload["timeout"], 120)
+            self.assertEqual(payload["model_requirements"], {"provider": "antigravity"})
+            self.assertEqual(cleanup_task["state"], "queued")
+
+    def test_disk_pressure_deduplication_multiple_passes_at_29_gib(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                interval=0.01,
+            )
+
+            GiB = 1024 * 1024 * 1024
+
+            def fake_spawn(dispatch_args):
+                store.transition_task(dispatch_args.id, "running", ("queued",), reason="lease")
+                return 0
+
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 29 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                rc = watch_loop(args, max_passes=3)
+
+            self.assertEqual(rc, 0)
+            with store.get_conn() as conn:
+                count = conn.execute(
+                    "SELECT count(*) FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%'"
+                ).fetchone()[0]
+            self.assertEqual(count, 1)
+
+    def test_disk_pressure_rearm_at_30_gib_and_subsequent_drop(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            episode_state = {"in_episode": False, "episode_id": 0}
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                once=True,
+                episode_state=episode_state,
+            )
+
+            GiB = 1024 * 1024 * 1024
+
+            def fake_spawn(dispatch_args):
+                return 0
+
+            # Pass 1: at 29 GiB -> enqueues disk-pressure-cleanup-1
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 29 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                watch_loop(args, max_passes=1)
+
+            self.assertIsNotNone(store.get_task("disk-pressure-cleanup-1"))
+            self.assertTrue(episode_state["in_episode"])
+            self.assertEqual(episode_state["episode_id"], 1)
+
+            # Pass 2: recovers to 30 GiB -> pressure cleared, rearm enabled
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 30 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                watch_loop(args, max_passes=1)
+
+            self.assertFalse(episode_state["in_episode"])
+
+            # Cleanup task 1 completes and is accepted by reviewer, resolving active state
+            store.transition_task("disk-pressure-cleanup-1", "starting", ("queued",), reason="lease")
+            store.transition_task("disk-pressure-cleanup-1", "completed-awaiting-review", ("starting",), reason="pruned")
+            store.accept_task("disk-pressure-cleanup-1", reviewer="test-reviewer")
+
+            # Pass 3: drops back to 28 GiB -> new episode, enqueues disk-pressure-cleanup-2
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                watch_loop(args, max_passes=1)
+
+            self.assertTrue(episode_state["in_episode"])
+            self.assertEqual(episode_state["episode_id"], 2)
+            self.assertIsNotNone(store.get_task("disk-pressure-cleanup-2"))
+
+    def test_disk_pressure_hard_floor_rejection_below_20_gib(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+            store.submit_task(
+                "t-floor", "k-floor",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "must not dispatch under 20GiB"},
+                [str(cfg / "pfloor")],
+            )
+
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                once=True,
+            )
+
+            spawned = []
+            def fake_spawn(dispatch_args):
+                spawned.append(dispatch_args.id)
+                return 0
+
+            GiB = 1024 * 1024 * 1024
+
+            # 19 GiB (< 20 GiB hard floor)
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 19 * GiB})()), \
+                 patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
+                rc = watch_loop(args, max_passes=1)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(spawned, [])
+            self.assertEqual(store.get_task("t-floor")["state"], "queued")
+            with store.get_conn() as conn:
+                count = conn.execute(
+                    "SELECT count(*) FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%'"
+                ).fetchone()[0]
+            self.assertEqual(count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,12 @@ import unittest
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from launcher.resources import check_resources
+from launcher.resources import (
+    MIN_DISK_FREE_BYTES,
+    WARN_DISK_FREE_BYTES,
+    check_disk_pressure,
+    check_resources,
+)
 
 GiB = 1024 * 1024 * 1024
 
@@ -83,6 +88,67 @@ class TestResources(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "free < 20GiB"):
                 check_resources(1000, self.repo, str(self.owned_tmp),
                                 active_disk_mb=1500, repo_root=self.repo)
+
+    def test_disk_pressure_hard_floor_exceeded(self):
+        with patch('shutil.disk_usage', return_value=DiskUsage(19 * GiB)):
+            res = check_disk_pressure(self.repo, str(self.owned_tmp))
+            self.assertEqual(res["status"], "hard_floor_exceeded")
+            self.assertTrue(res["pressure"])
+            self.assertEqual(res["free_bytes"], 19 * GiB)
+            self.assertFalse(res["eligible_continue"])
+
+    def test_disk_pressure_at_29_gib(self):
+        with patch('shutil.disk_usage', return_value=DiskUsage(29 * GiB)):
+            res = check_disk_pressure(self.repo, str(self.owned_tmp))
+            self.assertEqual(res["status"], "pressure")
+            self.assertTrue(res["pressure"])
+            self.assertEqual(res["free_bytes"], 29 * GiB)
+            self.assertTrue(res["eligible_continue"])
+            self.assertTrue(res["enqueue_cleanup"])
+
+    def test_disk_pressure_at_30_gib_ok_and_rearm(self):
+        with patch('shutil.disk_usage', return_value=DiskUsage(30 * GiB)):
+            res = check_disk_pressure(self.repo, str(self.owned_tmp))
+            self.assertEqual(res["status"], "ok")
+            self.assertFalse(res["pressure"])
+            self.assertEqual(res["free_bytes"], 30 * GiB)
+            self.assertTrue(res["eligible_continue"])
+            self.assertFalse(res["enqueue_cleanup"])
+            self.assertTrue(res["rearm"])
+
+    def test_disk_pressure_episode_deduplication_and_rearm(self):
+        episode_state = {}
+        # 1. First probe at 29 GiB: pressure detected, enqueues cleanup
+        with patch('shutil.disk_usage', return_value=DiskUsage(29 * GiB)):
+            res1 = check_disk_pressure(self.repo, str(self.owned_tmp), episode_state=episode_state)
+            self.assertEqual(res1["status"], "pressure")
+            self.assertTrue(res1["enqueue_cleanup"])
+            self.assertTrue(episode_state["in_episode"])
+            self.assertEqual(episode_state["episode_id"], 1)
+
+        # 2. Second probe at 29 GiB (same episode): deduplication suppresses cleanup
+        with patch('shutil.disk_usage', return_value=DiskUsage(29 * GiB)):
+            res2 = check_disk_pressure(self.repo, str(self.owned_tmp), episode_state=episode_state)
+            self.assertEqual(res2["status"], "pressure")
+            self.assertFalse(res2["enqueue_cleanup"])
+            self.assertTrue(res2["eligible_continue"])
+            self.assertTrue(episode_state["in_episode"])
+
+        # 3. Third probe recovers to 35 GiB: pressure cleared, rearm enabled
+        with patch('shutil.disk_usage', return_value=DiskUsage(35 * GiB)):
+            res3 = check_disk_pressure(self.repo, str(self.owned_tmp), episode_state=episode_state)
+            self.assertEqual(res3["status"], "ok")
+            self.assertFalse(res3["pressure"])
+            self.assertTrue(res3["rearm"])
+            self.assertFalse(episode_state["in_episode"])
+
+        # 4. Fourth probe drops to 28 GiB: new episode triggered, enqueues cleanup for episode 2
+        with patch('shutil.disk_usage', return_value=DiskUsage(28 * GiB)):
+            res4 = check_disk_pressure(self.repo, str(self.owned_tmp), episode_state=episode_state)
+            self.assertEqual(res4["status"], "pressure")
+            self.assertTrue(res4["enqueue_cleanup"])
+            self.assertTrue(episode_state["in_episode"])
+            self.assertEqual(episode_state["episode_id"], 2)
 
 if __name__ == '__main__':
     unittest.main()

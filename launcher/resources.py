@@ -60,3 +60,65 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         raise ValueError(f"TMPDIR must resolve under owned {owned_root}")
 
     return True
+
+
+def check_disk_pressure(cwd, tmpdir, episode_state=None) -> dict:
+    """Samples cwd and tmpdir disk usage against 20GiB hard floor and 30GiB warning threshold."""
+    def _sample(path):
+        try:
+            return shutil.disk_usage(path)
+        except FileNotFoundError:
+            p = Path(path).resolve()
+            while not p.exists() and p.parent != p:
+                p = p.parent
+            return shutil.disk_usage(str(p))
+
+    cwd_stat = _sample(cwd)
+    tmp_stat = _sample(tmpdir)
+    free = min(cwd_stat.free, tmp_stat.free)
+
+    if free < MIN_DISK_FREE_BYTES:
+        return {
+            "status": "hard_floor_exceeded",
+            "pressure": True,
+            "free_bytes": free,
+            "eligible_continue": False,
+        }
+
+    if free < WARN_DISK_FREE_BYTES:
+        enqueue = True
+        if episode_state is not None:
+            if isinstance(episode_state, dict):
+                if episode_state.get("in_episode", False):
+                    enqueue = False
+                else:
+                    episode_state["in_episode"] = True
+                    cur_ep = episode_state.get("episode_id") or episode_state.get("episode") or 0
+                    episode_state["episode_id"] = cur_ep + 1
+                    episode_state["episode"] = cur_ep + 1
+            elif getattr(episode_state, "in_episode", False):
+                enqueue = False
+            elif hasattr(episode_state, "in_episode"):
+                episode_state.in_episode = True
+        return {
+            "status": "pressure",
+            "pressure": True,
+            "free_bytes": free,
+            "eligible_continue": True,
+            "enqueue_cleanup": enqueue,
+        }
+
+    # free >= WARN_DISK_FREE_BYTES
+    if episode_state is not None:
+        if isinstance(episode_state, dict):
+            episode_state["in_episode"] = False
+        elif hasattr(episode_state, "in_episode"):
+            episode_state.in_episode = False
+    return {
+        "status": "ok",
+        "pressure": False,
+        "free_bytes": free,
+        "eligible_continue": True,
+        "enqueue_cleanup": False,
+        "rearm": True,
+    }

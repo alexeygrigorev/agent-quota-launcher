@@ -8,8 +8,22 @@ import time
 from pathlib import Path
 
 from launcher.launch import do_run, native_status
+from launcher.resources import check_disk_pressure
 from launcher.store import Store, launch_lock
 from launcher.tags import run_tag_for
+
+CLEANUP_PAYLOAD = {
+    "goal": (
+        "Prune expired scratch/temporary files in .local/tmp/. "
+        "Exclude active leases, dirty/unmerged worktrees, histories/auth/recovery paths. "
+        "Unknown ownership: no deletion."
+    ),
+    "cwd": "/home/alexey/git/cloudflare-agent-git",
+    "tmpdir": "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup",
+    "owner": "ant-head-continuation-resume-20261005",
+    "timeout": 120,
+    "model_requirements": {"provider": "antigravity"},
+}
 
 
 def _reconcile(store):
@@ -163,11 +177,66 @@ def watch_loop(args, max_passes=None):
     store = Store(store_path)
     print("watcher: reconciling and dispatching (non-LLM)")
 
+    episode_state = getattr(args, "episode_state", None)
+    if episode_state is None:
+        episode_state = {"in_episode": False, "episode_id": 0}
+        with store.get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT idempotency_key FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%'"
+            )
+            max_ep = 0
+            for (k,) in cursor.fetchall():
+                parts = k.rsplit("-", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    max_ep = max(max_ep, int(parts[1]))
+            episode_state["episode_id"] = max_ep
+
+            cursor = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%' "
+                "AND state IN ('queued', 'starting', 'running', 'launch-uncertain', 'stalled')"
+            )
+            if cursor.fetchone():
+                episode_state["in_episode"] = True
+
     passes = 0
     while max_passes is None or passes < max_passes:
         passes += 1
         for task_id, detail in _reconcile(store):
             print(f"reconciled: task {task_id} -> failed ({detail})")
+
+        check_cwd = getattr(args, "pressure_cwd", None) or CLEANUP_PAYLOAD["cwd"]
+        check_tmp = getattr(args, "pressure_tmpdir", None) or CLEANUP_PAYLOAD["tmpdir"]
+        pressure_info = check_disk_pressure(check_cwd, check_tmp, episode_state=episode_state)
+
+        if not pressure_info.get("eligible_continue", True):
+            print(f"watcher: hard disk floor exceeded ({pressure_info.get('free_bytes')} B < 20GiB); dispatch blocked")
+            if once:
+                return 0
+            time.sleep(interval)
+            continue
+
+        if pressure_info.get("enqueue_cleanup"):
+            with store.get_conn() as conn:
+                cursor = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%' "
+                    "AND state IN ('queued', 'starting', 'running', 'launch-uncertain', 'stalled')"
+                )
+                has_active = cursor.fetchone() is not None
+
+            if not has_active:
+                ep = episode_state.get("episode_id", 1)
+                cleanup_key = f"disk-pressure-cleanup-{ep}"
+                cleanup_id = cleanup_key
+                try:
+                    store.submit_task(
+                        task_id=cleanup_id,
+                        idempotency_key=cleanup_key,
+                        payload=CLEANUP_PAYLOAD,
+                        paths=[],
+                    )
+                    print(f"watcher: disk pressure detected ({pressure_info.get('free_bytes')} B); enqueued cleanup task {cleanup_id}")
+                except Exception as e:
+                    print(f"watcher: cleanup task enqueue notice: {e}")
 
         task_id, blocked_note = _next_dispatchable(store, wait_for_review=wait_for_review)
         if task_id:
