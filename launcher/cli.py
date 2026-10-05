@@ -216,6 +216,7 @@ def run_task_units(args):
             store.transition_task(args.id, "failed", ("starting",), reason=str(e)[:400])
         print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
         return 1
+    completed_ok = False
     with launch_lock(str(lock_path)):
         if receipt.get("exit_code") == 0:
             store.transition_task(
@@ -223,10 +224,28 @@ def run_task_units(args):
                 reason="task-units sibling unit exit 0",
             )
             print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
-            return 0
-        store.transition_task(args.id, "failed", ("starting",),
-                              reason=f"task-units exit {receipt.get('exit_code')}")
-    print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
+            completed_ok = True
+        else:
+            store.transition_task(args.id, "failed", ("starting",),
+                                  reason=f"task-units exit {receipt.get('exit_code')}")
+            print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
+
+    if completed_ok:
+        from types import SimpleNamespace
+        from launcher.watch import watch_loop
+        refill_args = SimpleNamespace(
+            config_dir=config_dir,
+            cwd=args.cwd,
+            tmpdir=args.tmpdir,
+            backend="task-units",
+            once=True,
+        )
+        print(f"triggering automated completion-to-next-dispatch refill from controller {args.id}")
+        try:
+            watch_loop(refill_args, max_passes=1)
+        except Exception as e:
+            print(f"refill dispatch error: {e}")
+        return 0
     return 1
 
 

@@ -3,6 +3,7 @@ death, then dispatch the next queued independently owned task with fresh
 quota/resource checks (do_run re-checks everything at launch boundary).
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -92,7 +93,23 @@ def watch_loop(args, max_passes=None):
         if task_id:
             print(f"dispatching queued task {task_id}")
             try:
-                rc = do_run(store_path, task_id, args.cwd, args.tmpdir, lock_path)
+                task_data = store.get_task(task_id)
+                payload = (task_data.get("payload") or {}) if task_data else {}
+                task_cwd = payload.get("cwd") or getattr(args, "cwd", ".")
+                task_tmp = payload.get("tmpdir") or getattr(args, "tmpdir", None) or os.path.join(task_cwd, ".local/tmp")
+                backend = getattr(args, "backend", "task-units")
+                if backend == "task-units":
+                    from types import SimpleNamespace
+                    from launcher.cli import spawn_ql_controller
+                    dispatch_args = SimpleNamespace(
+                        id=task_id,
+                        cwd=task_cwd,
+                        tmpdir=task_tmp,
+                        config_dir=config_dir,
+                    )
+                    rc = spawn_ql_controller(dispatch_args)
+                else:
+                    rc = do_run(store_path, task_id, task_cwd, task_tmp, lock_path)
                 print(f"task {task_id} dispatch finished rc={rc}")
             except Exception as e:
                 store.record_reason(task_id, f"watch: dispatch attempt failed: {e}")
