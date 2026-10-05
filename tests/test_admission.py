@@ -187,20 +187,20 @@ class TestAdmission(unittest.TestCase):
             data = fetch_quse()
         self.assertIn("grok", data)
 
-    def test_grok_at_exactly_5_percent_rejected(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 5.0, "reset_at": self.future1}})}
+    def test_grok_at_exactly_15_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 15.0, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
-        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
+        self.assertIn("Grok window <= 15% remaining (cutoff policy)", rej.get("grok", ""))
 
-    def test_grok_below_5_percent_rejected(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 4.9, "reset_at": self.future1}})}
+    def test_grok_below_15_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 14.9, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
-        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
+        self.assertIn("Grok window <= 15% remaining (cutoff policy)", rej.get("grok", ""))
 
-    def test_grok_above_5_percent_admitted(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 5.1, "reset_at": self.future1}})}
+    def test_grok_above_15_percent_admitted(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 15.1, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 1)
         self.assertEqual(valid[0]["provider"], "grok")
