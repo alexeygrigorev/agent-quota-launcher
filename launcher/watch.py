@@ -61,19 +61,29 @@ def _unreviewed_task_ids(store):
         return [r[0] for r in cursor.fetchall()]
 
 
-def _next_dispatchable(store, wait_for_review=True):
+def _next_dispatchable(store, wait_for_review="dependencies"):
     """Oldest queued task whose owned paths don't overlap a live lease.
     Returns (task_id | None, blocked_note | None)."""
-    if wait_for_review:
+    if wait_for_review == "global":
         unreviewed = _unreviewed_task_ids(store)
         if unreviewed:
             return None, (f"automatic refill waiting for distinct independent "
                           f"review acceptance of: {', '.join(unreviewed)}")
 
+    check_dependencies = wait_for_review in (True, "dependencies", "per-task")
+
     with store.get_conn() as conn:
         cursor = conn.execute(
-            "SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
-        queued = [r[0] for r in cursor.fetchall()]
+            "SELECT id, payload FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
+        queued_rows = cursor.fetchall()
+        queued = [r[0] for r in queued_rows]
+        payloads = {}
+        for tid, p_raw in queued_rows:
+            try:
+                payloads[tid] = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+            except Exception:
+                payloads[tid] = {}
+
         owned = {}
         if queued:
             marks = ",".join("?" for _ in queued)
@@ -84,6 +94,33 @@ def _next_dispatchable(store, wait_for_review=True):
 
     for task_id in queued:
         blocked = None
+        payload = payloads.get(task_id, {})
+
+        if check_dependencies:
+            raw_deps = payload.get("depends_on") or payload.get("dependencies") or []
+            if isinstance(raw_deps, str):
+                deps = [raw_deps]
+            elif isinstance(raw_deps, (list, tuple, set)):
+                deps = list(raw_deps)
+            else:
+                deps = []
+
+            for dep_id in deps:
+                dep_id_str = str(dep_id)
+                dep_task = store.get_task(dep_id_str)
+                if not dep_task:
+                    blocked = f"dependency {dep_id_str} not accepted (not found)"
+                    break
+                dep_state = dep_task.get("state")
+                if dep_state != "accepted":
+                    blocked = f"dependency {dep_id_str} not accepted (state: {dep_state})"
+                    break
+
+        if blocked:
+            store.record_reason(task_id, f"watch: blocked: {blocked}")
+            print(f"task {task_id} blocked: {blocked}")
+            continue
+
         with store.get_conn() as conn:
             active_paths = store.get_active_paths(conn, exclude_task_id=task_id)
         for req in owned.get(task_id, []):
@@ -110,7 +147,7 @@ def watch_loop(args, max_passes=None):
     lock_path = str(config_dir / 'launch.lock')
     interval = float(getattr(args, 'interval', 10.0) or 10.0)
     once = bool(getattr(args, 'once', False))
-    wait_for_review = bool(getattr(args, 'wait_for_review', True))
+    wait_for_review = getattr(args, 'wait_for_review', "dependencies")
 
     store = Store(store_path)
     print("watcher: reconciling and dispatching (non-LLM)")

@@ -51,8 +51,8 @@ class WatchRefillTests(unittest.TestCase):
             # Submit task-2 in queued state
             store.submit_task("t-2", "k-2", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "g2"}, [str(cfg / "p2")])
 
-            # With wait_for_review=True, t-2 should NOT be dispatchable
-            tid, note = _next_dispatchable(store, wait_for_review=True)
+            # With wait_for_review="global", t-2 should NOT be dispatchable
+            tid, note = _next_dispatchable(store, wait_for_review="global")
             self.assertIsNone(tid)
             self.assertIn("automatic refill waiting for distinct independent review acceptance", note)
             self.assertIn("t-1", note)
@@ -61,10 +61,71 @@ class WatchRefillTests(unittest.TestCase):
             tid, note = _next_dispatchable(store, wait_for_review=False)
             self.assertEqual(tid, "t-2")
 
-            # Accept t-1, now t-2 should become dispatchable even with wait_for_review=True
+            # Accept t-1, now t-2 should become dispatchable even with wait_for_review="global"
             store.accept_task("t-1", reviewer="test-reviewer")
-            tid, note = _next_dispatchable(store, wait_for_review=True)
+            tid, note = _next_dispatchable(store, wait_for_review="global")
             self.assertEqual(tid, "t-2")
+
+    def test_independent_tasks_dispatch_when_another_awaiting_review(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            # Submit task-1 and move to completed-awaiting-review
+            store.submit_task("t-1", "k-1", {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "g1"}, [str(cfg / "p1")])
+            store.transition_task("t-1", "starting", ("queued",), reason="lease")
+            store.transition_task("t-1", "completed-awaiting-review", ("starting",), reason="exit 0")
+
+            # Submit task-dep in queued state, depending on t-1
+            store.submit_task(
+                "t-dep", "k-dep",
+                {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "g-dep", "depends_on": ["t-1"]},
+                [str(cfg / "p-dep")],
+            )
+
+            # Submit task-indep in queued state, without dependencies
+            store.submit_task(
+                "t-indep", "k-indep",
+                {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "g-indep"},
+                [str(cfg / "p-indep")],
+            )
+
+            # With default wait_for_review="dependencies", t-dep is blocked on unaccepted t-1,
+            # but independent task t-indep dispatches immediately!
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertEqual(tid, "t-indep")
+
+            # Same with wait_for_review=True (evaluates per-task dependencies)
+            tid, note = _next_dispatchable(store, wait_for_review=True)
+            self.assertEqual(tid, "t-indep")
+
+            # Mark t-indep starting so only t-dep remains queued
+            store.transition_task("t-indep", "starting", ("queued",), reason="lease")
+
+            # t-dep is still blocked because t-1 is completed-awaiting-review, not accepted
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertIsNone(tid)
+            self.assertIn("1 queued, all blocked", note)
+
+            # Accept t-1
+            store.accept_task("t-1", reviewer="test-reviewer")
+
+            # Now t-dep is dispatchable!
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertEqual(tid, "t-dep")
+
+            # Also verify "dependencies" key synonym
+            store.submit_task(
+                "t-dep2", "k-dep2",
+                {"owner": "ql", "cwd": tmp_dir, "timeout": 60, "goal": "g-dep2", "dependencies": ["t-dep"]},
+                [str(cfg / "p-dep2")],
+            )
+            store.transition_task("t-dep", "starting", ("queued",), reason="lease")
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertIsNone(tid)
+            store.transition_task("t-dep", "completed-awaiting-review", ("starting",), reason="exit 0")
+            store.accept_task("t-dep", reviewer="test-reviewer")
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertEqual(tid, "t-dep2")
 
     def test_watch_loop_dispatches_with_task_local_tmpdir_not_args_tmpdir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -170,6 +231,7 @@ class WatchRefillTests(unittest.TestCase):
             called_refill_args = mock_watch.call_args[0][0]
             self.assertEqual(called_refill_args.backend, "task-units")
             self.assertTrue(called_refill_args.once)
+            self.assertEqual(called_refill_args.wait_for_review, "dependencies")
 
 
 if __name__ == "__main__":

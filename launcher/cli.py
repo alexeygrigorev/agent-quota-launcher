@@ -396,6 +396,7 @@ def accept(args):
             config_dir=config_dir,
             backend=getattr(args, "backend", "task-units"),
             once=True,
+            wait_for_review="dependencies",
         )
         print(f"triggering automated review-gated refill after acceptance of {args.id}")
         try:

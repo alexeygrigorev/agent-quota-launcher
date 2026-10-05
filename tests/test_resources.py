@@ -79,8 +79,8 @@ class TestResources(unittest.TestCase):
             check_resources(1000, self.repo, str(self.owned_tmp), repo_root=None)
 
     def test_disk_floor(self):
-        with patch('shutil.disk_usage', return_value=DiskUsage(51 * GiB)):
-            with self.assertRaisesRegex(ValueError, "free < 50GiB"):
+        with patch('shutil.disk_usage', return_value=DiskUsage(21 * GiB)):
+            with self.assertRaisesRegex(ValueError, "free < 20GiB"):
                 check_resources(1000, self.repo, str(self.owned_tmp),
                                 active_disk_mb=1500, repo_root=self.repo)
 

@@ -211,7 +211,10 @@ def native_status(tag, timeout=15):
     except subprocess.TimeoutExpired:
         return "unknown", f"aplexer status timed out after {timeout}s"
     if res.returncode != 0:
-        return "dead", f"aplexer status rc={res.returncode}: {(res.stderr or res.stdout or '').strip()[:200]}"
+        err = (res.stderr or res.stdout or "").strip()
+        if "no session tagged" in err or "has ever existed" in err:
+            return "dead", f"aplexer status rc={res.returncode}: {err[:200]}"
+        return "unknown", f"aplexer status error rc={res.returncode}: {err[:200]}"
     try:
         info = _extract_json(res.stdout)
     except Exception as e:

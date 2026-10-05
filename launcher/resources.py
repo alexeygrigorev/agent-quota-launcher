@@ -6,7 +6,8 @@ from pathlib import Path
 
 MAX_WORKER_MEMORY_MB = 1500
 MIN_MEM_AVAILABLE_BYTES = 10 * 1024 * 1024 * 1024
-MIN_DISK_FREE_BYTES = 50 * 1024 * 1024 * 1024
+MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
+WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
 MAX_DISK_SPIKE_BYTES = 512 * 1024 * 1024
 
 
@@ -39,15 +40,14 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
     cwd_stat = shutil.disk_usage(requested_cwd)
     tmp_stat = shutil.disk_usage(requested_tmpdir)
 
-    # FiftyGiB floor remains; 512MiB is max incremental budget not compulsory per task allocation.
     task_disk = min(int(requested_disk_mb or 0) * 1024 * 1024, MAX_DISK_SPIKE_BYTES)
     required_free = MIN_DISK_FREE_BYTES + (active_disk_mb * 1024 * 1024) + task_disk
 
     if cwd_stat.free < required_free:
-        raise ValueError(f"cwd filesystem free < 50GiB floor + required disk ({required_free} B)")
+        raise ValueError(f"cwd filesystem free < 20GiB floor + required disk ({required_free} B)")
 
     if tmp_stat.free < required_free:
-        raise ValueError(f"tmpdir filesystem free < 50GiB floor + required disk ({required_free} B)")
+        raise ValueError(f"tmpdir filesystem free < 20GiB floor + required disk ({required_free} B)")
 
     tmp_path = Path(requested_tmpdir).resolve()
     if tmp_path == Path('/tmp') or tmp_path.parts[:2] == ('/', 'tmp'):
