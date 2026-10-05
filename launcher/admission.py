@@ -10,6 +10,7 @@ import json
 import math
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 ADAPTER_ROUTES = ("grok", "antigravity", "zai")
 ADAPTER_MODELS = {
@@ -100,7 +101,7 @@ def codex_gate_reason(route, now):
     return None
 
 
-def _validate_route(name, route, now, task_requirements):
+def _validate_route(name, route, now, task_requirements, check_capacity=False, config_dir=None):
     """Validate one route. Returns (candidate|None, rejection_reason|None)."""
     provider = "antigravity" if name == "gemini" else name
 
@@ -108,8 +109,10 @@ def _validate_route(name, route, now, task_requirements):
         gate = codex_gate_reason(route, now)
         if gate:
             return None, gate
-        return None, ("codex explicitly unsupported in launcher v0.1 "
-                      "(protected wrapper scripts/launch-codex.sh not configured)")
+        wrapper_path = Path("scripts/launch-codex.sh")
+        if not wrapper_path.exists():
+            return None, ("codex explicitly unsupported in launcher v0.1 "
+                          "(protected wrapper scripts/launch-codex.sh not configured)")
 
     if provider not in ADAPTER_ROUTES:
         return None, "Unsupported route explicitly blocked"
@@ -171,6 +174,12 @@ def _validate_route(name, route, now, task_requirements):
     if provider == "grok" and min_rem <= GROK_MIN_REMAINING:
         return None, f"Grok window <= {GROK_MIN_REMAINING:g}% remaining (cutoff policy)"
 
+    if check_capacity:
+        from launcher.capacity import check_provider_capacity
+        can_admit, cap_reason, _ = check_provider_capacity(provider, config_dir=config_dir)
+        if not can_admit:
+            return None, cap_reason
+
     health = 1.0 if route.get("status") == "ok" else None
     task_fit = _task_fit(provider, task_requirements)
 
@@ -202,7 +211,7 @@ def _task_fit(provider, task_requirements):
     return 1.0
 
 
-def validate_quse(quse_data, task_requirements=None):
+def validate_quse(quse_data, task_requirements=None, check_capacity=False, config_dir=None):
     """Validate all routes; one broken route must not crash the others.
 
     Returns (valid_routes, rejections). Routes with unknown health or task_fit
@@ -220,7 +229,10 @@ def validate_quse(quse_data, task_requirements=None):
             if not isinstance(route, dict):
                 rejections[name] = "Malformed route record"
                 continue
-            candidate, reason = _validate_route(name, route, now, task_requirements)
+            candidate, reason = _validate_route(
+                name, route, now, task_requirements,
+                check_capacity=check_capacity, config_dir=config_dir
+            )
             if candidate:
                 valid_routes.append(candidate)
             else:

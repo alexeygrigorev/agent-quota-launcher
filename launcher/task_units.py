@@ -162,6 +162,8 @@ def admit_task_unit(
     provider: Optional[str] = None,
     active_mem_mb: int = 0,
     active_disk_mb: int = 0,
+    check_capacity: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> bool:
     """Pre-execution admission check enforcing memory, floors, and quota."""
     if int(memory_mb) > MAX_MEMORY_MB:
@@ -177,7 +179,9 @@ def admit_task_unit(
             "fresh quse_json evidence is required for task unit admission (fail closed)"
         )
     try:
-        valid_routes, rejections = validate_quse(quse_json)
+        valid_routes, rejections = validate_quse(
+            quse_json, check_capacity=check_capacity, config_dir=config_dir
+        )
         if not valid_routes:
             raise TaskUnitAdmissionError(f"no valid quota route available: {rejections}")
         if provider:
@@ -481,6 +485,8 @@ def execute_transient_task_unit(
     quse_json: Optional[Dict[str, Any]] = None,
     provider: Optional[str] = None,
     log_dir: Optional[str] = None,
+    check_capacity: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -494,7 +500,16 @@ def execute_transient_task_unit(
         module_sha256 = "unknown"
 
     # 1. Admission check
-    admit_task_unit(task_id, memory_mb, workspace, tmpdir, quse_json=quse_json, provider=provider)
+    admit_task_unit(
+        task_id,
+        memory_mb,
+        workspace,
+        tmpdir,
+        quse_json=quse_json,
+        provider=provider,
+        check_capacity=check_capacity,
+        config_dir=config_dir,
+    )
     unit_name = sanitize_unit_name(task_id)
 
     repo_dir = Path(workspace).resolve()
@@ -745,6 +760,8 @@ def spawn_transient_task_unit(
     quse_json: Optional[Dict[str, Any]] = None,
     provider: Optional[str] = None,
     log_dir: Optional[str] = None,
+    check_capacity: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -756,7 +773,16 @@ def spawn_transient_task_unit(
     except Exception:
         module_sha256 = "unknown"
 
-    admit_task_unit(task_id, memory_mb, workspace, tmpdir, quse_json=quse_json, provider=provider)
+    admit_task_unit(
+        task_id,
+        memory_mb,
+        workspace,
+        tmpdir,
+        quse_json=quse_json,
+        provider=provider,
+        check_capacity=check_capacity,
+        config_dir=config_dir,
+    )
     unit_name = sanitize_unit_name(task_id)
 
     repo_dir = Path(workspace).resolve()

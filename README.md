@@ -53,7 +53,7 @@ python3 -m launcher --config-dir .local/launcher-config fail --id task-123 \
 `queued -> starting -> running -> completed-awaiting-review -> accepted`, plus `launch-uncertain`, `stalled`, `failed`, `blocked` notes. Invariants:
 
 - **Exit 0 is not acceptance.** `accept` only moves `completed-awaiting-review -> accepted`, recorded with the reviewer identity. Queued, running, and `launch-uncertain` tasks cannot be accepted or completed. `complete` requires **confirmed** native death (an unknown aplexer status is refused) **and** result evidence: at least one owned path holding a non-empty artifact. Death without evidence is closed with `fail --reason`, never completed.
-- **First action is identity-matched, not key-blacklisted.** The child's first tool action must write its full native `aplexer whoami --json` output to the first-action artifact path. Validation matches `id`, `tag`, and `workspace` — and `parent_session` when the artifact carries it — against the launch start record, requires a timezone-aware timestamp bounded to the launch window (naive, stale, or future timestamps fail), and rejects the wrapper start record itself — byte-identical, reformatted, altered in its time/phase fields, or merely augmented with a timestamp (identity match is not tool provenance). The rich whoami (`command`, `phase`, `schema_version`, ...) is preserved as-is; those keys are expected on genuine output, never blacklisted.
+- **First action validates live whoami mutation vs start record, not key blacklists.** The child's first tool action must write its full native `aplexer whoami --json` output to the first-action artifact path. Validation matches `id`, `tag`, and `workspace` — and `parent_session` when present — against the launch start record, requires a timezone-aware timestamp bounded to the launch window (naive, stale, or future timestamps fail), and rejects all start-record supersets: byte-identical copies, reformatted copies, start records augmented with timestamp fields or arbitrary extra keys (`dummy=123`), and start records with invented worker fields while original start keys including `phase=starting` remain unchanged. A genuine child artifact must demonstrate live whoami mutation (`phase` running/working vs starting, updated/activity timestamps after creation, live process/containment state); native keys (`command`, `schema_version`, `worker_pid`, ...) are preserved, never blacklisted. Captured authenticated tool-trace verification remains out of v0.1; identity plus live mutation provides correlation against the launch record.
 - **Timeouts are enforced on the process group.** `payload.timeout` (60–7200s) bounds `aplexer start` plus the first-action wait; the launch lock is only held for reserve+spawn, not the wait. Deadline expiry marks `launch-uncertain` and retains the lease until native session death is confirmed by reconciliation (`watch`).
 - **Resource leases are honest.** RAM/disk reservations cover queued/starting/running/uncertain/stalled tasks and are released after confirmed process death; path leases hold through `completed-awaiting-review`. A launching task excludes its own reservation (`exclude_task_id`).
 
@@ -61,7 +61,7 @@ python3 -m launcher --config-dir .local/launcher-config fail --id task-123 \
 
 | provider | argv |
 | --- | --- |
-| `grok` | `grok -p --model grok-4.6 --effort high --permission-mode auto <goal>` |
+| `grok` | `/home/alexey/.local/bin/grok --model grok-4.6 --effort high --permission-mode auto -p <PROMPT>` |
 | `antigravity` | `env -u GEMINI_API_KEY -u GOOGLE_API_KEY agy --model gemini-3.1-pro-high --effort high --dangerously-skip-permissions -p --print-timeout 0 --output-format text <goal>` |
 | `zai` | `/home/alexey/.local/bin/zcodex exec --model glm-5.3-flash --dangerously-bypass-approvals-and-sandbox -c check_for_update_on_startup=false --json <goal>` with `ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs` |
 
@@ -75,6 +75,13 @@ Codex is explicitly unsupported in v0.1 (the protected `scripts/launch-codex.sh`
 
 Worker memory <= 1500 MiB; host MemAvailable must retain >= 10 GiB after active reservations; cwd and TMPDIR filesystems must retain >= 50 GiB + active reservations + 512 MiB spike; `/tmp` is rejected and TMPDIR must resolve under the owned `<repo>/.local/tmp` (path containment, not substring).
 
+## Hostwide Capacity & Concurrency Governor (C2661 / C2664 / C2670)
+
+- **Fixed shared ZAI ceiling:** Evaluates live `zcode-cli` backend processes across all host trees (including external workspaces like `/data/agents/ai-shipping-labs/`). Rejects new ZAI dispatches when live count + active reservations >= 26.
+- **429 Cooldown Enforcement:** Persists 429 Retry-After cooldown timestamps; rejects dispatch while inside active backoff window.
+- **Atomic Slot Reservation:** Uses `fcntl.flock` on `provider_capacity.lock` to guarantee race-free slot allocation and automatic release upon unit termination or failure.
+- **Multi-engine Fallback:** When a requested provider is at capacity (e.g. ZAI at 26), the maintained CLI automatically falls back to an eligible alternative (e.g. `antigravity` / `gemini-3.1-pro-high`) with verified quota and headroom.
+
 ## Report (dashboard contract)
 
-`report --jsonl` emits hourly UTC buckets over the half-open window `[as_of-24h, as_of)` with `Z`-suffixed labels, explicit 24h gap labels, and a `project_id` on every line (`--project-id NAME`, default: current directory name). Tasks outside the window are counted in `coverage.tasks_outside_window`, not emitted. Token fields (`input_tokens`, `output_tokens`, `cached_tokens`, `cost`) stay `null` with `source: "unproven"` unless natively proven; quota deltas are a separate object; unknown stays unknown — never zero-fabricated. Account percent deltas are not token use or cost.
+`report --jsonl` emits exactly 24 hourly UTC buckets tiling the half-open window `[as_of-24h, as_of)` with `Z`-suffixed labels, explicit gap labels, and canonical `project_id` on every line (`--project-id NAME`, default: `quota-launcher` per QL-DASH-CONTRACT-1). Tasks outside the window are counted in `coverage.tasks_outside_window`, not emitted. Token fields (`input_tokens`, `output_tokens`, `cached_tokens`, `cost`) stay `null` with `source: "unproven"` unless natively proven; quota deltas are a separate object; unknown stays unknown — never zero-fabricated. Account percent deltas are not token use or cost.

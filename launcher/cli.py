@@ -57,8 +57,10 @@ def plan(args):
 
     try:
         quse_data = fetch_quse()
+        config_dir = config_dir_for(args)
         valid_routes, rejections = validate_quse(
-            quse_data, task_requirements=payload.get("model_requirements"))
+            quse_data, task_requirements=payload.get("model_requirements"),
+            check_capacity=True, config_dir=config_dir)
         seed = 0  # deterministic dry-run projection
         chosen, provenance = select_candidate(valid_routes, seed=seed)
     except Exception as e:
@@ -143,7 +145,7 @@ def run_task_units(args):
     """Public CLI path: launch.lock + Store lease + sibling systemd unit."""
     if not getattr(args, "as_controller", False):
         return spawn_ql_controller(args)
-    from launcher.admission import fetch_quse
+    from launcher.admission import fetch_quse, validate_quse
     from launcher.launch import build_adapter_argv
     from launcher.task_units import execute_transient_task_unit
 
@@ -171,7 +173,12 @@ def run_task_units(args):
             "task_id": args.id,
         }))
         return 1
-    provider = payload.get("provider") or "grok"
+    from launcher.capacity import check_provider_capacity, provider_reservation
+    from launcher.ranking import select_candidate
+
+    requested_provider = payload.get("provider")
+    allow_fallback = payload.get("allow_fallback", True)
+
     tmpdir = args.tmpdir
     memory_mb = int(payload.get("memory_mb") or 768)
     timeout_sec = float(payload.get("timeout") or 300)
@@ -194,23 +201,74 @@ def run_task_units(args):
             "task_id": args.id,
         }))
         return 1
+
+    chosen_provider = None
+    if quse == {"ok": True}:
+        chosen_provider = requested_provider or "grok"
+    else:
+        # Capacity-aware route validation
+        valid_routes, rejections = validate_quse(
+            quse,
+            task_requirements=payload.get("model_requirements"),
+            check_capacity=True,
+            config_dir=config_dir,
+        )
+
+        if requested_provider and requested_provider != "auto":
+            matching = [
+                r for r in valid_routes
+                if r.get("provider") == requested_provider or r.get("name") == requested_provider
+            ]
+            if matching:
+                chosen_provider = requested_provider
+            elif allow_fallback:
+                seed = int(time.time() * 1000)
+                chosen, provenance = select_candidate(valid_routes, seed=seed)
+                if chosen:
+                    chosen_provider = chosen.get("provider")
+            if not chosen_provider:
+                reason = rejections.get(requested_provider, "provider route rejected or at capacity")
+                print(json.dumps({
+                    "error": f"requested provider '{requested_provider}' rejected: {reason}",
+                    "rejections": rejections,
+                    "backend": "task-units",
+                    "task_id": args.id,
+                }))
+                return 1
+        else:
+            seed = int(time.time() * 1000)
+            chosen, provenance = select_candidate(valid_routes, seed=seed)
+            if not chosen:
+                print(json.dumps({
+                    "error": "no eligible provider route available",
+                    "rejections": rejections,
+                    "backend": "task-units",
+                    "task_id": args.id,
+                }))
+                return 1
+            chosen_provider = chosen.get("provider")
+
+    provider = chosen_provider
     argv = build_adapter_argv(provider, goal)
     # C2456: hold launch.lock only for Store lease, not the model wait.
     with launch_lock(str(lock_path)):
         store.transition_task(args.id, "starting", ("queued",),
                               reason=f"task-units lease {provider}")
     try:
-        receipt = execute_transient_task_unit(
-            task_id=args.id,
-            command_argv=argv,
-            memory_mb=memory_mb,
-            workspace=args.cwd,
-            tmpdir=tmpdir,
-            timeout_sec=timeout_sec,
-            quse_json=quse,
-            provider=provider,
-            log_dir=str(config_dir),
-        )
+        with provider_reservation(provider, args.id, config_dir=config_dir):
+            receipt = execute_transient_task_unit(
+                task_id=args.id,
+                command_argv=argv,
+                memory_mb=memory_mb,
+                workspace=args.cwd,
+                tmpdir=tmpdir,
+                timeout_sec=timeout_sec,
+                quse_json=quse,
+                provider=provider,
+                log_dir=str(config_dir),
+                check_capacity=False,
+                config_dir=config_dir,
+            )
     except Exception as e:
         with launch_lock(str(lock_path)):
             store.transition_task(args.id, "failed", ("starting",), reason=str(e)[:400])
