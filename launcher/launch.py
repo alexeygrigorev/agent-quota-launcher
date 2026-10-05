@@ -38,6 +38,7 @@ ADAPTERS = {
                  "--effort", "high", "--permission-mode", "auto", "-p"],
         "env": {},
     },
+    "antigravity": {
         "argv": ["/usr/bin/env", "-u", "GEMINI_API_KEY", "-u", "GOOGLE_API_KEY",
                  "/home/alexey/.local/bin/agy", "--model", "gemini-3.1-pro-high", "--effort", "high",
                  "--dangerously-skip-permissions",

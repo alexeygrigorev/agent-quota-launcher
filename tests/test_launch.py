@@ -225,17 +225,21 @@ class TestAdapters(unittest.TestCase):
 
     def test_antigravity_strips_api_keys_and_sets_print_timeout(self):
         argv = build_adapter_argv("antigravity", "goal")
-        self.assertEqual(argv[0], "env")
+        self.assertEqual(argv[0], "/usr/bin/env")
         self.assertIn("-u", argv)
-        self.assertLess(argv.index("GEMINI_API_KEY"), argv.index("agy"))
-        self.assertLess(argv.index("GOOGLE_API_KEY"), argv.index("agy"))
+        self.assertEqual(argv[argv.index("-u") + 1], "GEMINI_API_KEY")
+        self.assertIn("GOOGLE_API_KEY", argv)
+        self.assertIn("/home/alexey/.local/bin/agy", argv)
+        self.assertNotIn("agy", argv)
+        self.assertLess(argv.index("GEMINI_API_KEY"), argv.index("/home/alexey/.local/bin/agy"))
+        self.assertLess(argv.index("GOOGLE_API_KEY"), argv.index("/home/alexey/.local/bin/agy"))
         self.assertIn("--print-timeout", argv)
         self.assertEqual(argv[argv.index("--print-timeout") + 1], "0")
         self.assertIn("-p", argv)
         self.assertLess(argv.index("--print-timeout"), argv.index("-p"))
         self.assertEqual(argv[argv.index("-p") + 1], "goal")
         self.assertNotIn("sh", argv)
-        self.assertNotIn("-c", argv[:argv.index("agy")] + ["sh"])
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.1-pro-high")
 
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
