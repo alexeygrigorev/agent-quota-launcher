@@ -1,3 +1,10 @@
 .local/
 __pycache__/
 *.pyc
+*.db
+*.log
+*.jsonl
+payload*.json
+test_*.py
+reviews/
+.config/
