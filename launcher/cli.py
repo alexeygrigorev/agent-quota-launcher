@@ -113,6 +113,8 @@ def spawn_ql_controller(args) -> int:
         "-p", f"WorkingDirectory={launcher_root}",
         "-E", f"PYTHONPATH={launcher_root}",
         "-E", f"TMPDIR={args.tmpdir}",
+        "-E", f"PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
+        "-E", f"HOME={os.environ.get('HOME', '')}",
         "--",
         sys.executable, "-m", "launcher",
         "--config-dir", str(config_dir),

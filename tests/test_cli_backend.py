@@ -241,6 +241,7 @@ class TaskUnitsCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("--as-controller", captured["cmd"])
         self.assertTrue(any(str(x).startswith("--unit=ql-ctl-") for x in captured["cmd"]))
+        self.assertTrue(any(str(x).startswith("PATH=") for x in captured["cmd"]))
         self.assertNotIn("--wait", captured["cmd"])
 
 
