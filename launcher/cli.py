@@ -176,7 +176,11 @@ def run_task_units(args):
     from launcher.capacity import check_provider_capacity, provider_reservation
     from launcher.ranking import select_candidate
 
-    requested_provider = payload.get("provider")
+    requested_provider = payload.get("provider") or (
+        payload.get("model_requirements", {}).get("provider")
+        if isinstance(payload.get("model_requirements"), dict)
+        else None
+    )
     allow_fallback = payload.get("allow_fallback", True)
 
     tmpdir = args.tmpdir
@@ -228,23 +232,35 @@ def run_task_units(args):
                     chosen_provider = chosen.get("provider")
             if not chosen_provider:
                 reason = rejections.get(requested_provider, "provider route rejected or at capacity")
+                full_reason = f"admission: requested provider '{requested_provider}' rejected: {reason}"
                 print(json.dumps({
-                    "error": f"requested provider '{requested_provider}' rejected: {reason}",
+                    "error": full_reason,
                     "rejections": rejections,
                     "backend": "task-units",
                     "task_id": args.id,
                 }))
+                store.record_reason(args.id, full_reason)
+                try:
+                    store.transition_task(args.id, "failed", ("queued", "starting"), reason=full_reason)
+                except Exception:
+                    pass
                 return 1
         else:
             seed = int(time.time() * 1000)
             chosen, provenance = select_candidate(valid_routes, seed=seed)
             if not chosen:
+                reason = f"admission: no eligible provider route available: {rejections}"
                 print(json.dumps({
                     "error": "no eligible provider route available",
                     "rejections": rejections,
                     "backend": "task-units",
                     "task_id": args.id,
                 }))
+                store.record_reason(args.id, reason)
+                try:
+                    store.transition_task(args.id, "failed", ("queued", "starting"), reason=reason)
+                except Exception:
+                    pass
                 return 1
             chosen_provider = chosen.get("provider")
 

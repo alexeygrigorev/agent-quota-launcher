@@ -200,6 +200,9 @@ def _task_fit(provider, task_requirements):
     otherwise so ranking weights the route at 0 instead of fabricating fit."""
     if not isinstance(task_requirements, dict):
         return None
+    req_provider = task_requirements.get("provider")
+    if req_provider and provider != req_provider:
+        return 0.0
     providers = task_requirements.get("providers")
     if isinstance(providers, (list, tuple)):
         if provider not in providers:

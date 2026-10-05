@@ -74,15 +74,17 @@ def _next_dispatchable(store, wait_for_review="dependencies"):
 
     with store.get_conn() as conn:
         cursor = conn.execute(
-            "SELECT id, payload FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
+            "SELECT id, payload, reason FROM tasks WHERE state = 'queued' ORDER BY created_at ASC")
         queued_rows = cursor.fetchall()
         queued = [r[0] for r in queued_rows]
         payloads = {}
-        for tid, p_raw in queued_rows:
+        reasons = {}
+        for tid, p_raw, r_raw in queued_rows:
             try:
                 payloads[tid] = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
             except Exception:
                 payloads[tid] = {}
+            reasons[tid] = r_raw or ""
 
         owned = {}
         if queued:
@@ -100,6 +102,9 @@ def _next_dispatchable(store, wait_for_review="dependencies"):
         goal = (raw_goal if isinstance(raw_goal, str) else str(raw_goal or "")).strip()
         if not goal or goal == task_id:
             store.record_reason(task_id, "watch: blocked: bare proposal without substantive prompt")
+            continue
+
+        if "admission:" in reasons.get(task_id, ""):
             continue
 
         if check_dependencies:
