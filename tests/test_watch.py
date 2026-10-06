@@ -437,6 +437,41 @@ class WatchRefillTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(count, 0)
 
+    def test_disk_pressure_cleanup_cooldown_prevents_retry_storm(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                once=True,
+                cleanup_cooldown_sec=300.0,
+            )
+
+            GiB = 1024 * 1024 * 1024
+            # First pass at 28 GiB enqueues cleanup-1
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+
+            t1 = store.get_task("disk-pressure-cleanup-1")
+            self.assertIsNotNone(t1)
+
+            # Cleanup-1 fails
+            store.transition_task("disk-pressure-cleanup-1", "starting", ("queued",), reason="lease")
+            store.transition_task("disk-pressure-cleanup-1", "failed", ("starting",), reason="timeout")
+
+            # Second pass immediately after at 28 GiB: cooldown suppresses retry storm
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+
+            t2 = store.get_task("disk-pressure-cleanup-2")
+            self.assertIsNone(t2)
+
 
 if __name__ == "__main__":
     unittest.main()

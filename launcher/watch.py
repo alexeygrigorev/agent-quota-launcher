@@ -225,7 +225,23 @@ def watch_loop(args, max_passes=None):
                 )
                 has_active = cursor.fetchone() is not None
 
-            if not has_active:
+                cooldown_sec = float(getattr(args, "cleanup_cooldown_sec", 300.0))
+                recent_cleanup = False
+                cursor = conn.execute(
+                    "SELECT state, (strftime('%s', 'now') - strftime('%s', updated_at)) "
+                    "FROM tasks WHERE idempotency_key LIKE 'disk-pressure-cleanup-%' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )
+                row = cursor.fetchone()
+                if row and row[0] == "failed" and row[1] is not None:
+                    try:
+                        elapsed = float(row[1])
+                        if elapsed < cooldown_sec:
+                            recent_cleanup = True
+                    except Exception:
+                        pass
+
+            if not has_active and not recent_cleanup:
                 ep = episode_state.get("episode_id", 1)
                 cleanup_key = f"disk-pressure-cleanup-{ep}"
                 cleanup_id = cleanup_key
@@ -243,6 +259,8 @@ def watch_loop(args, max_passes=None):
                     print(f"watcher: disk pressure detected ({pressure_info.get('free_bytes')} B); enqueued cleanup task {cleanup_id}")
                 except Exception as e:
                     print(f"watcher: cleanup task enqueue notice: {e}")
+            elif recent_cleanup:
+                print(f"watcher: disk pressure detected but cleanup episode in cooldown ({cooldown_sec}s); skipping enqueue")
 
         task_id, blocked_note = _next_dispatchable(store, wait_for_review=wait_for_review)
         if task_id:
