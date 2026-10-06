@@ -19,6 +19,16 @@ def get_mem_available():
     return 0
 
 
+def _get_disk_usage(path):
+    try:
+        return shutil.disk_usage(path)
+    except FileNotFoundError:
+        p = Path(path).resolve()
+        while not p.exists() and p.parent != p:
+            p = p.parent
+        return shutil.disk_usage(str(p))
+
+
 def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     active_mem_mb=0, active_disk_mb=0, repo_root=None,
                     ignore_ram=None, requested_disk_mb=0):
@@ -37,18 +47,6 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         if mem_avail - act_mem - req_mem < MIN_MEM_AVAILABLE_BYTES:
             raise ValueError("host MemAvailable < 10GiB")
 
-    cwd_stat = shutil.disk_usage(requested_cwd)
-    tmp_stat = shutil.disk_usage(requested_tmpdir)
-
-    task_disk = min(int(requested_disk_mb or 0) * 1024 * 1024, MAX_DISK_SPIKE_BYTES)
-    required_free = MIN_DISK_FREE_BYTES + (active_disk_mb * 1024 * 1024) + task_disk
-
-    if cwd_stat.free < required_free:
-        raise ValueError(f"cwd filesystem free < 20GiB floor + required disk ({required_free} B)")
-
-    if tmp_stat.free < required_free:
-        raise ValueError(f"tmpdir filesystem free < 20GiB floor + required disk ({required_free} B)")
-
     tmp_path = Path(requested_tmpdir).resolve()
     if tmp_path == Path('/tmp') or tmp_path.parts[:2] == ('/', 'tmp'):
         raise ValueError("reject /tmp")
@@ -59,22 +57,25 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
     if not tmp_path.is_relative_to(owned_root):
         raise ValueError(f"TMPDIR must resolve under owned {owned_root}")
 
+    cwd_stat = _get_disk_usage(requested_cwd)
+    tmp_stat = _get_disk_usage(requested_tmpdir)
+
+    task_disk = min(int(requested_disk_mb or 0) * 1024 * 1024, MAX_DISK_SPIKE_BYTES)
+    required_free = MIN_DISK_FREE_BYTES + (active_disk_mb * 1024 * 1024) + task_disk
+
+    if cwd_stat.free < required_free:
+        raise ValueError(f"cwd filesystem free < 20GiB floor + required disk ({required_free} B)")
+
+    if tmp_stat.free < required_free:
+        raise ValueError(f"tmpdir filesystem free < 20GiB floor + required disk ({required_free} B)")
+
     return True
 
 
 def check_disk_pressure(cwd, tmpdir, episode_state=None) -> dict:
     """Samples cwd and tmpdir disk usage against 20GiB hard floor and 30GiB warning threshold."""
-    def _sample(path):
-        try:
-            return shutil.disk_usage(path)
-        except FileNotFoundError:
-            p = Path(path).resolve()
-            while not p.exists() and p.parent != p:
-                p = p.parent
-            return shutil.disk_usage(str(p))
-
-    cwd_stat = _sample(cwd)
-    tmp_stat = _sample(tmpdir)
+    cwd_stat = _get_disk_usage(cwd)
+    tmp_stat = _get_disk_usage(tmpdir)
     free = min(cwd_stat.free, tmp_stat.free)
 
     if free < MIN_DISK_FREE_BYTES:

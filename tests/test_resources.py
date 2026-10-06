@@ -79,6 +79,20 @@ class TestResources(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "TMPDIR must resolve under owned"):
                 check_resources(1000, self.repo, str(sib_tmp), repo_root=self.repo)
 
+    def test_non_existent_contained_tmpdir_passes(self):
+        # non-existent declared scratch path under repo_root/.local/tmp passes admission
+        non_existent_tmp = self.owned_tmp / "does_not_exist_yet"
+        self.assertFalse(non_existent_tmp.exists())
+        self.assertTrue(check_resources(1000, self.repo, str(non_existent_tmp), repo_root=self.repo))
+
+    def test_non_existent_uncontained_tmpdir_rejected(self):
+        # non-existent scratch path outside repo_root/.local/tmp is rejected without mkdir outside taskscope
+        outside_tmp = Path(self.repo) / "other_dir" / "does_not_exist_yet"
+        self.assertFalse(outside_tmp.exists())
+        with self.assertRaisesRegex(ValueError, "TMPDIR must resolve under owned"):
+            check_resources(1000, self.repo, str(outside_tmp), repo_root=self.repo)
+        self.assertFalse(outside_tmp.exists())
+
     def test_repo_root_required(self):
         with self.assertRaisesRegex(ValueError, "repo root required"):
             check_resources(1000, self.repo, str(self.owned_tmp), repo_root=None)

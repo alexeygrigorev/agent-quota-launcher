@@ -210,15 +210,27 @@ def native_status(tag, timeout=15):
                              capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "unknown", f"aplexer status timed out after {timeout}s"
+
+    out_err = (res.stderr or "") + " " + (res.stdout or "")
+    out_err_lower = out_err.lower()
+    
+    if "stale" in out_err_lower and "socket" in out_err_lower:
+        return "dead", f"aplexer status (stale socket): {out_err.strip()[:200]}"
+    if "transport" in out_err_lower:
+        return "dead", f"aplexer status (transport error): {out_err.strip()[:200]}"
+
     if res.returncode != 0:
         err = (res.stderr or res.stdout or "").strip()
-        if "no session tagged" in err or "has ever existed" in err:
+        err_lower = err.lower()
+        if "no session tagged" in err_lower or "has ever existed" in err_lower:
             return "dead", f"aplexer status rc={res.returncode}: {err[:200]}"
         return "unknown", f"aplexer status error rc={res.returncode}: {err[:200]}"
+        
     try:
         info = _extract_json(res.stdout)
     except Exception as e:
         return "unknown", f"unparsable status JSON: {e}"
+        
     phase = info.get("phase")
     if phase in ("running", "starting", "working", "launching"):
         alive = not info.get("containment_empty", False)
