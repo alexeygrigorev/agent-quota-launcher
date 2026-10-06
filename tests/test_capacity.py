@@ -157,30 +157,34 @@ class TestProviderCapacity(unittest.TestCase):
         self.assertIn("zai", rejections)
         self.assertIn("capacity ceiling (26) reached", rejections["zai"])
 
-    def test_codex_capacity_under_and_at_ceiling(self):
+    def test_default_codex_capacity_unconstrained_by_arbitrary_ceiling(self):
         can_admit, reason, info = check_provider_capacity("codex", config_dir=self.config_dir)
         self.assertTrue(can_admit)
-        self.assertEqual(info["ceiling"], 6)
-        self.assertEqual(info["headroom"], 6)
+        self.assertIsNone(reason)
+        self.assertTrue(info.get("admitted"))
 
-        # Reserve 6 slots to hit the ceiling
+    def test_explicit_max_cap_under_and_at_ceiling(self):
+        # When caller/task explicitly specifies max_cap, it is strictly enforced
+        can_admit, reason, info = check_provider_capacity("codex", max_cap=5, config_dir=self.config_dir)
+        self.assertTrue(can_admit)
+        self.assertEqual(info["ceiling"], 5)
+        self.assertEqual(info["headroom"], 5)
+
         tokens = []
-        for i in range(6):
-            tok = reserve_provider_slot("codex", f"task-codex-{i}", config_dir=self.config_dir)
+        for i in range(5):
+            tok = reserve_provider_slot("codex", f"task-codex-{i}", max_cap=5, config_dir=self.config_dir)
             tokens.append(tok)
 
-        # Check 7th attempt is rejected
-        can_admit, reason, info = check_provider_capacity("codex", config_dir=self.config_dir)
+        # 6th attempt rejected
+        can_admit, reason, info = check_provider_capacity("codex", max_cap=5, config_dir=self.config_dir)
         self.assertFalse(can_admit)
-        self.assertIn("ceiling (6) reached", reason)
+        self.assertIn("ceiling (5) reached", reason)
 
-        # Attempting to reserve raises ConcurrencyLimitExceeded
         with self.assertRaises(ConcurrencyLimitExceeded):
-            reserve_provider_slot("codex", "task-codex-overflow", config_dir=self.config_dir)
+            reserve_provider_slot("codex", "task-codex-overflow", max_cap=5, config_dir=self.config_dir)
 
-        # Release one slot and verify admission opens
         release_provider_slot(tokens[0], config_dir=self.config_dir)
-        can_admit, _, info = check_provider_capacity("codex", config_dir=self.config_dir)
+        can_admit, _, info = check_provider_capacity("codex", max_cap=5, config_dir=self.config_dir)
         self.assertTrue(can_admit)
         self.assertEqual(info["headroom"], 1)
 
