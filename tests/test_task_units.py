@@ -486,6 +486,40 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(receipt["workspace"], str(self.repo))
         self.assertEqual(receipt["working_directory"], str(self.repo))
         self.assertEqual(receipt["timeout_sec"], 1200.0)
+
+    @patch("launcher.task_units.show_unit_props")
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup")
+    @patch("subprocess.Popen")
+    def test_execute_transient_task_unit_telemetry_capture(self, mock_popen, mock_cleanup, mock_res, mock_show):
+        mock_cleanup.return_value = (True, {"ActiveState": "inactive", "SubState": "dead", "InvocationID": "inv12345"})
+        
+        proc_inst = MagicMock()
+        proc_inst.returncode = 0
+        proc_inst.communicate.return_value = ("Running as unit: agent-task-t2.service; invocation ID: inv12345\n", "")
+        # Allow thread to poll once then stop
+        proc_inst.poll.side_effect = [None, 0]
+        mock_popen.return_value = proc_inst
+        
+        mock_show.return_value = {
+            "ControlGroup": "app.slice/agent-task-t2.service",
+            "MemoryPeak": "1048576",
+            "CPUUsageNSec": "5000000"
+        }
+
+        receipt = execute_transient_task_unit(
+            task_id="t2",
+            command_argv=["echo", "telemetry"],
+            memory_mb=512,
+            workspace=str(self.repo),
+            tmpdir=str(self.tmpdir),
+            quse_json=self.valid_quse,
+        )
+
+        self.assertEqual(receipt["task_id"], "t2")
+        self.assertEqual(receipt["cgroup"], "app.slice/agent-task-t2.service")
+        self.assertEqual(receipt["memory_peak_bytes"], 1048576)
+        self.assertEqual(receipt["cpu_usage_nsec"], 5000000)
         self.assertEqual(len(receipt["module_sha256"]), 64)
         self.assertTrue(receipt["cleanup_verified"])
         self.assertEqual(receipt["memory_max_mb"], 512)

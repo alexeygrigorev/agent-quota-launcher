@@ -603,6 +603,33 @@ def execute_transient_task_unit(
         # Expected identity is the systemd-run launch witness, not an immediate
         # systemctl show (same-name unit can still be live from a prior run).
 
+        captured_cg = ""
+        captured_mem_peak = None
+        captured_cpu_usage = None
+        
+        def _poll_telemetry():
+            nonlocal captured_cg, captured_mem_peak, captured_cpu_usage
+            while proc.poll() is None:
+                try:
+                    props = show_unit_props(unit_name, properties=("ControlGroup", "MemoryPeak", "CPUUsageNSec"))
+                    cg_val = props.get("ControlGroup")
+                    if cg_val and cg_val.strip() and cg_val.strip() != "[not set]":
+                        captured_cg = cg_val.strip()
+                    
+                    mp_val = props.get("MemoryPeak")
+                    if mp_val and mp_val.isdigit():
+                        captured_mem_peak = int(mp_val)
+                        
+                    cpu_val = props.get("CPUUsageNSec")
+                    if cpu_val and cpu_val.isdigit():
+                        captured_cpu_usage = int(cpu_val)
+                except Exception:
+                    pass
+                time.sleep(CLEANUP_POLL_INTERVAL_SEC)
+
+        t = threading.Thread(target=_poll_telemetry, daemon=True)
+        t.start()
+
         try:
             out, err = proc.communicate(timeout=timeout_sec)
             combined_run_output = timeout_output_text(out) + "\n" + timeout_output_text(err)
@@ -666,7 +693,7 @@ def execute_transient_task_unit(
         )
 
     # 5. Verify cgroup was outside head scope
-    cg = props.get("ControlGroup", "")
+    cg = captured_cg or props.get("ControlGroup", "")
     if cg:
         assert_cgroup_outside_head(cg)
 
@@ -706,6 +733,8 @@ def execute_transient_task_unit(
         "invocation_id": assigned_inv_id,
         "exit_code": exit_code,
         "cgroup": cg,
+        "memory_peak_bytes": captured_mem_peak,
+        "cpu_usage_nsec": captured_cpu_usage,
         "workspace": str(repo_dir),
         "working_directory": str(repo_dir),
         "module_sha256": module_sha256,
