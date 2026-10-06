@@ -178,12 +178,26 @@ class Store:
                     raise ValueError(f"Path overlap: {req_p} overlaps with {act_p} (task {task_id})")
 
     def submit_task(self, task_id, idempotency_key, payload, paths, memory_mb=1500, disk_mb=512):
-        from launcher.task_profiles import resolve_task_bounds
+        from launcher.task_profiles import resolve_task_bounds, validate_source_commit, SourceValidationError
+        
+        # 1. Bounds resolution (fail-closed on unknown profile name, auto-detect keywords)
         bounds = resolve_task_bounds(payload)
         if not payload.get("timeout") and bounds.get("timeout"):
             payload["timeout"] = bounds["timeout"]
         if not payload.get("profile") and bounds.get("profile"):
             payload["profile"] = bounds["profile"]
+
+        # 2. Preadmission git source commit verification (C2999, C3002)
+        target_commit = payload.get("target_commit") or payload.get("source_commit")
+        target_repo = payload.get("target_worktree") or payload.get("cwd")
+        if target_commit and target_repo:
+            source_receipt = validate_source_commit(
+                target_repo,
+                target_commit,
+                expected_full_sha=target_commit if len(target_commit) == 40 else None,
+            )
+            payload["source_receipt"] = source_receipt
+            payload["resolved_commit"] = source_receipt["resolved_commit"]
 
         if not payload.get("owner") or not payload.get("cwd") or not payload.get("timeout"):
             raise ValueError("Missing owner/cwd/timeout in payload")
@@ -218,7 +232,9 @@ class Store:
             for p in normalized_paths:
                 conn.execute("INSERT INTO task_paths (task_id, path) VALUES (?, ?)", (task_id, str(Path(p).resolve())))
 
-            conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, memory_mb, disk_mb))
+            # Record reservation in task_resources (explicit payload memory_mb wins, else parameter)
+            effective_mem = int(payload["memory_mb"]) if payload.get("memory_mb") else memory_mb
+            conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, effective_mem, disk_mb))
 
         return task_id
 
