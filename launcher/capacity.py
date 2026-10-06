@@ -21,6 +21,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_MAX_CONCURRENT_ZAI = 26
+DEFAULT_MAX_CONCURRENT_CODEX = 6
 DEFAULT_COOLDOWN_SEC = 60.0
 RESERVATION_EXPIRY_SEC = 300.0
 
@@ -215,7 +216,39 @@ def check_provider_capacity(
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
-    # Default for other providers (antigravity, codex, opencode)
+    # 4. Codex ceiling check (Luna <= 6)
+    if provider == "codex":
+        ceiling = max_cap if max_cap is not None else DEFAULT_MAX_CONCURRENT_CODEX
+        with open(lock_file, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                raw_res = _load_reservations(res_file)
+                codex_res = {
+                    tok: info for tok, info in raw_res.items()
+                    if info.get("provider") == "codex" and ts < info.get("expires_at", 0)
+                }
+                reserved_count = len(codex_res)
+                if reserved_count >= ceiling:
+                    reason = (
+                        f"codex hostwide capacity ceiling ({ceiling}) reached: "
+                        f"{reserved_count} reserved (total {reserved_count} >= {ceiling})"
+                    )
+                    return False, reason, {
+                        "provider": "codex",
+                        "reserved_count": reserved_count,
+                        "ceiling": ceiling,
+                        "headroom": 0,
+                    }
+                return True, None, {
+                    "provider": "codex",
+                    "reserved_count": reserved_count,
+                    "ceiling": ceiling,
+                    "headroom": max(0, ceiling - reserved_count),
+                }
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    # Default for other providers (antigravity, opencode)
     return True, None, {"provider": provider, "admitted": True}
 
 
@@ -257,6 +290,15 @@ def reserve_provider_slot(
                         f"Hostwide ZAI concurrency ceiling ({ceiling}) reached! "
                         f"Live processes: {live_count}, Pending reservations: {reserved_count}. "
                         f"Total active: {total_active} >= {ceiling}. Reservation rejected."
+                    )
+
+            if provider == "codex":
+                ceiling = max_cap if max_cap is not None else DEFAULT_MAX_CONCURRENT_CODEX
+                codex_res = {tok: info for tok, info in cleaned.items() if info.get("provider") == "codex"}
+                if len(codex_res) >= ceiling:
+                    raise ConcurrencyLimitExceeded(
+                        f"Hostwide Codex capacity ceiling ({ceiling}) reached! "
+                        f"Pending reservations: {len(codex_res)} >= {ceiling}. Reservation rejected."
                     )
 
             token = f"slot-{provider}-{uuid.uuid4().hex[:12]}"

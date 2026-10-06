@@ -157,6 +157,33 @@ class TestProviderCapacity(unittest.TestCase):
         self.assertIn("zai", rejections)
         self.assertIn("capacity ceiling (26) reached", rejections["zai"])
 
+    def test_codex_capacity_under_and_at_ceiling(self):
+        can_admit, reason, info = check_provider_capacity("codex", config_dir=self.config_dir)
+        self.assertTrue(can_admit)
+        self.assertEqual(info["ceiling"], 6)
+        self.assertEqual(info["headroom"], 6)
+
+        # Reserve 6 slots to hit the ceiling
+        tokens = []
+        for i in range(6):
+            tok = reserve_provider_slot("codex", f"task-codex-{i}", config_dir=self.config_dir)
+            tokens.append(tok)
+
+        # Check 7th attempt is rejected
+        can_admit, reason, info = check_provider_capacity("codex", config_dir=self.config_dir)
+        self.assertFalse(can_admit)
+        self.assertIn("ceiling (6) reached", reason)
+
+        # Attempting to reserve raises ConcurrencyLimitExceeded
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            reserve_provider_slot("codex", "task-codex-overflow", config_dir=self.config_dir)
+
+        # Release one slot and verify admission opens
+        release_provider_slot(tokens[0], config_dir=self.config_dir)
+        can_admit, _, info = check_provider_capacity("codex", config_dir=self.config_dir)
+        self.assertTrue(can_admit)
+        self.assertEqual(info["headroom"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
