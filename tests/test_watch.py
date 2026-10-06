@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ from launcher.cli import accept, run_task_units
 from launcher.store import Store
 from launcher.watch import (
     _next_dispatchable,
+    _reconcile,
     _unreviewed_task_ids,
     derive_task_tmpdir,
     watch_loop,
@@ -573,6 +575,120 @@ class WatchRefillTests(unittest.TestCase):
             payload = t1["payload"]
             self.assertEqual(payload["timeout"], 123.0)
             self.assertEqual(payload["owner"], "test-owner-override")
+
+
+class LifecycleStartingGuardTests(unittest.TestCase):
+    def test_active_starting_actor_retains_lease(self):
+        """Active starting actor (systemd unit active or recent telemetry mtime)
+        is never marked stale or failed; lease is strictly retained."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            store.submit_task(
+                "t-starting-active", "k-starting-active",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 300, "goal": "active task"},
+                [str(cfg / "p-active")],
+            )
+            store.transition_task("t-starting-active", "starting", ("queued",), reason="lease")
+
+            # Case A: systemctl shows unit active
+            with patch("subprocess.run") as mock_subproc:
+                mock_subproc.return_value = type("ProcRes", (), {"stdout": "active\n", "stderr": "", "returncode": 0})()
+                reconciled = _reconcile(store, config_dir=cfg)
+                self.assertEqual(len(reconciled), 0)
+                t = store.get_task("t-starting-active")
+                self.assertEqual(t["state"], "starting")
+
+            # Case B: systemd inactive, but recent telemetry file exists (< 45s)
+            with patch("subprocess.run") as mock_subproc, \
+                 patch("launcher.watch.native_status", return_value=("dead", "session ended")):
+                mock_subproc.return_value = type("ProcRes", (), {"stdout": "inactive\n", "stderr": "", "returncode": 3})()
+
+                # Write recent telemetry file in task_cwd
+                telem_file = Path(task_cwd) / ".local" / "t-starting-active-telemetry.jsonl"
+                telem_file.parent.mkdir(parents=True, exist_ok=True)
+                telem_file.write_text(json.dumps({"event": "step_update", "step": 1}) + "\n")
+
+                reconciled = _reconcile(store, config_dir=cfg)
+                self.assertEqual(len(reconciled), 0)
+                t = store.get_task("t-starting-active")
+                self.assertEqual(t["state"], "starting")
+
+    def test_starting_actor_with_terminal_success_recovered(self):
+        """Starting actor whose process exited but produced a terminal SUCCESS event
+        in its telemetry log is recovered to completed-awaiting-review, not failed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            store.submit_task(
+                "t-starting-success", "k-starting-success",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 300, "goal": "success task"},
+                [str(cfg / "p-success")],
+            )
+            store.transition_task("t-starting-success", "starting", ("queued",), reason="lease")
+
+            # Process is dead and telemetry is older than 45s
+            telem_file = Path(task_cwd) / ".local" / "t-starting-success-telemetry.jsonl"
+            telem_file.parent.mkdir(parents=True, exist_ok=True)
+            telem_file.write_text(
+                json.dumps({"event": "step_update", "step_update": {"state": "DONE"}}) + "\n" +
+                json.dumps({"event": "result", "result": {"status": "SUCCESS", "conversation_id": "test-cid-123"}}) + "\n"
+            )
+            past_time = time.time() - 100.0
+            os.utime(str(telem_file), (past_time, past_time))
+
+            with patch("subprocess.run") as mock_subproc, \
+                 patch("launcher.watch.native_status", return_value=("dead", "session ended")):
+                mock_subproc.return_value = type("ProcRes", (), {"stdout": "inactive\n", "stderr": "", "returncode": 3})()
+
+                reconciled = _reconcile(store, config_dir=cfg)
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0][0], "t-starting-success")
+                self.assertIn("recovered", reconciled[0][1])
+
+                t = store.get_task("t-starting-success")
+                self.assertEqual(t["state"], "completed-awaiting-review")
+                with store.get_conn() as conn:
+                    r = conn.execute("SELECT reason FROM tasks WHERE id = 't-starting-success'").fetchone()
+                    reason = r[0] if r else ""
+                self.assertIn("terminal SUCCESS", reason)
+
+    def test_starting_actor_confirmed_dead_without_success_fails(self):
+        """Starting actor whose process exited without SUCCESS evidence is cleanly marked failed."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            store.submit_task(
+                "t-starting-fail", "k-starting-fail",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 300, "goal": "failing task"},
+                [str(cfg / "p-fail")],
+            )
+            store.transition_task("t-starting-fail", "starting", ("queued",), reason="lease")
+
+            with patch("subprocess.run") as mock_subproc, \
+                 patch("launcher.watch.native_status", return_value=("dead", "session ended")):
+                mock_subproc.return_value = type("ProcRes", (), {"stdout": "inactive\n", "stderr": "", "returncode": 3})()
+
+                reconciled = _reconcile(store, config_dir=cfg)
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0][0], "t-starting-fail")
+
+                t = store.get_task("t-starting-fail")
+                self.assertEqual(t["state"], "failed")
+                with store.get_conn() as conn:
+                    r = conn.execute("SELECT reason FROM tasks WHERE id = 't-starting-fail'").fetchone()
+                    reason = r[0] if r else ""
+                self.assertIn("starting actor death confirmed", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

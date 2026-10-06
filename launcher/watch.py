@@ -4,6 +4,7 @@ quota/resource checks (do_run re-checks everything at launch boundary).
 """
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -28,27 +29,229 @@ CLEANUP_PAYLOAD = {
 }
 
 
-def _reconcile(store):
-    """Confirm native death for uncertain/stalled launches before releasing
-    their leases. A time limit alone never proves the lease safe to steal."""
+def _find_task_artifacts(task_id: str, payload: dict = None, config_dir=None):
+    dirs = []
+    if config_dir:
+        dirs.append(Path(config_dir))
+    if payload and isinstance(payload, dict):
+        cwd = payload.get("cwd")
+        if cwd:
+            p = Path(cwd)
+            dirs.extend([p, p / ".local"])
+        tmpdir = payload.get("tmpdir")
+        if tmpdir:
+            dirs.append(Path(tmpdir))
+    dirs.extend([
+        Path("/home/alexey/git/agent-quota-launcher"),
+        Path("/home/alexey/git/agent-quota-launcher/.local"),
+        Path("/home/alexey/git/cloudflare-agent-git/.local"),
+        Path.cwd(),
+        Path.cwd() / ".local",
+        Path.home() / ".config" / "agent-quota-launcher",
+    ])
+    seen = set()
+    unique_dirs = []
+    for d in dirs:
+        try:
+            res = d.resolve()
+            if res not in seen and res.is_dir():
+                seen.add(res)
+                unique_dirs.append(res)
+        except Exception:
+            pass
+    return unique_dirs
+
+
+def _check_task_active(task_id: str, payload: dict = None, config_dir=None) -> tuple:
+    """Inspect systemd transient units, aplexer native status, and recent telemetry
+    activity to confirm whether a task actor is currently alive."""
+    # 1. Inspect systemd transient task unit and controller unit
+    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in task_id)
+    unit_candidates = [
+        f"agent-task-{safe}.service",
+        f"ql-ctl-{safe}.service",
+    ]
+    if safe != task_id:
+        unit_candidates.append(f"agent-task-{task_id}.service")
+        unit_candidates.append(f"ql-ctl-{task_id}.service")
+
+    for unit in unit_candidates:
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True, text=True, timeout=5,
+            )
+            state = res.stdout.strip()
+            if state in ("active", "activating", "reloading"):
+                return True, f"systemd unit {unit} active ({state})"
+        except Exception:
+            pass
+
+    # 2. Inspect aplexer native status
+    try:
+        alive, detail = native_status(run_tag_for(task_id))
+        if alive == "alive":
+            return True, f"aplexer session alive ({detail})"
+        elif alive == "unknown":
+            return True, f"aplexer session unknown ({detail})"
+    except Exception:
+        pass
+
+    # 3. Inspect telemetry log activity / mtime (< 45s)
+    search_dirs = _find_task_artifacts(task_id, payload, config_dir)
+    now = time.time()
+    for d in search_dirs:
+        for fname in (f"{task_id}-telemetry.jsonl", f"{task_id}-stdout.log"):
+            fpath = d / fname
+            try:
+                if fpath.is_file():
+                    age = now - fpath.stat().st_mtime
+                    if age < 45.0:
+                        return True, f"recent telemetry activity in {fname} ({age:.1f}s ago)"
+            except Exception:
+                pass
+
+    return False, "no active systemd unit, aplexer session, or recent telemetry"
+
+
+def _check_late_success(task_id: str, payload: dict = None, config_dir=None) -> tuple:
+    """Inspect telemetry logs and task receipts to recover late success evidence
+    before declaring failure."""
+    search_dirs = _find_task_artifacts(task_id, payload, config_dir)
+
+    # 1. Inspect task receipts
+    for d in search_dirs:
+        for rname in (f"{task_id}-receipt.json", "receipt.json"):
+            rpath = d / rname
+            try:
+                if rpath.is_file():
+                    with open(rpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        if data.get("task_id") in (None, task_id) and data.get("exit_code") == 0:
+                            unit = data.get("unit_name") or data.get("unit") or "unknown"
+                            return True, f"task receipt exit 0 (unit {unit})"
+            except Exception:
+                pass
+
+    # 2. Inspect telemetry JSONL log
+    for d in search_dirs:
+        tpath = d / f"{task_id}-telemetry.jsonl"
+        try:
+            if tpath.is_file():
+                with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or not (line.startswith("{") and line.endswith("}")):
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if isinstance(obj, dict):
+                                ev = obj.get("event")
+                                res = obj.get("result")
+                                if ev == "result" and isinstance(res, dict):
+                                    st = res.get("status")
+                                    if st in ("SUCCESS", "success", "completed", "ok"):
+                                        cid = res.get("conversation_id", "unknown")
+                                        return True, f"terminal SUCCESS in telemetry log (CID {cid})"
+                                elif obj.get("status") in ("SUCCESS", "success") and "conversation_id" in obj:
+                                    return True, f"terminal SUCCESS in telemetry (CID {obj.get('conversation_id')})"
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+    # 3. Inspect stdout log for embedded telemetry result
+    for d in search_dirs:
+        spath = d / f"{task_id}-stdout.log"
+        try:
+            if spath.is_file():
+                size = spath.stat().st_size
+                with open(spath, "r", encoding="utf-8", errors="replace") as f:
+                    if size > 200_000:
+                        f.seek(size - 200_000)
+                    for line in f:
+                        line = line.strip()
+                        if not line or not (line.startswith("{") and line.endswith("}")):
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if isinstance(obj, dict):
+                                ev = obj.get("event")
+                                res = obj.get("result")
+                                if ev == "result" and isinstance(res, dict):
+                                    st = res.get("status")
+                                    if st in ("SUCCESS", "success", "completed", "ok"):
+                                        cid = res.get("conversation_id", "unknown")
+                                        return True, f"terminal SUCCESS in stdout log (CID {cid})"
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+    return False, "no late success evidence"
+
+
+def _reconcile(store, config_dir=None):
+    """Confirm native death for uncertain/stalled/starting launches before releasing
+    their leases or declaring failure. A time limit alone never proves the lease safe
+    to steal, and an active or late-succeeded actor must never be prematurely failed."""
+    if config_dir is None and hasattr(store, "db_path") and store.db_path != ":memory:":
+        config_dir = Path(store.db_path).parent
+
     reconciled = []
     with store.get_conn() as conn:
         cursor = conn.execute(
-            "SELECT id FROM tasks WHERE state IN ('launch-uncertain', 'stalled')")
-        uncertain = [r[0] for r in cursor.fetchall()]
+            "SELECT id, state, payload FROM tasks WHERE state IN ('launch-uncertain', 'stalled', 'starting')")
+        rows = cursor.fetchall()
 
-    for task_id in uncertain:
-        alive, detail = native_status(run_tag_for(task_id))
-        if alive == "dead":
+    for task_id, state, raw_payload in rows:
+        payload = {}
+        if raw_payload:
+            try:
+                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            except Exception:
+                payload = {}
+
+        # 1. Active check: if actor is running or active, retain lease
+        is_active, active_detail = _check_task_active(task_id, payload, config_dir=config_dir)
+        if is_active:
+            print(f"reconcile: task {task_id} native/unit active ({active_detail}); lease retained")
+            continue
+
+        # 2. Late success recovery: if actor exited but produced SUCCESS evidence
+        has_success, success_detail = _check_late_success(task_id, payload, config_dir=config_dir)
+        if has_success:
+            try:
+                store.transition_task(
+                    task_id, "completed-awaiting-review", ("launch-uncertain", "stalled", "starting"),
+                    reason=f"late success recovered during reconciliation: {success_detail}")
+                reconciled.append((task_id, f"recovered: {success_detail}"))
+                print(f"reconcile: task {task_id} recovered to completed-awaiting-review ({success_detail})")
+            except Exception:
+                pass
+            continue
+
+        # 3. Not active and no late success: confirm death and transition to failed
+        if state in ("launch-uncertain", "stalled"):
             try:
                 store.transition_task(
                     task_id, "failed", ("launch-uncertain", "stalled"),
-                    reason=f"native death confirmed during reconciliation: {detail}")
-                reconciled.append((task_id, detail))
+                    reason=f"native death confirmed during reconciliation: {active_detail}")
+                reconciled.append((task_id, active_detail))
+                print(f"reconcile: task {task_id} ({state}) native death confirmed -> failed ({active_detail})")
             except Exception:
-                pass  # state moved concurrently; next pass re-checks
-        else:
-            print(f"reconcile: task {task_id} native {alive} ({detail}); lease retained")
+                pass
+        elif state == "starting":
+            try:
+                store.transition_task(
+                    task_id, "failed", ("starting",),
+                    reason=f"starting actor death confirmed during reconciliation: {active_detail}")
+                reconciled.append((task_id, active_detail))
+                print(f"reconcile: task {task_id} starting actor dead -> failed ({active_detail})")
+            except Exception:
+                pass
+
     return reconciled
 
 
@@ -203,8 +406,8 @@ def watch_loop(args, max_passes=None):
     passes = 0
     while max_passes is None or passes < max_passes:
         passes += 1
-        for task_id, detail in _reconcile(store):
-            print(f"reconciled: task {task_id} -> failed ({detail})")
+        for task_id, detail in _reconcile(store, config_dir=config_dir):
+            print(f"reconciled: task {task_id} ({detail})")
 
         check_cwd = getattr(args, "pressure_cwd", None) or CLEANUP_PAYLOAD["cwd"]
         check_tmp = getattr(args, "pressure_tmpdir", None) or CLEANUP_PAYLOAD["tmpdir"]
