@@ -8,12 +8,16 @@ from launcher.store import Store
 
 def test_get_profile_known():
     prof = get_profile("model-review")
-    assert prof["timeout"] == 600.0
+    assert prof["timeout"] == 900.0
     assert prof["memory_mb"] == 768
 
     det = get_profile("deterministic-check")
     assert det["timeout"] == 60.0
     assert det["memory_mb"] == 256
+
+    cln = get_profile("model-cleanup")
+    assert cln["timeout"] == 600.0
+    assert cln["memory_mb"] == 768
 
 
 def test_get_profile_unknown_or_none():
@@ -41,7 +45,7 @@ def test_resolve_task_bounds_autodetect_review():
     payload = {"id": "t-ql-review-something", "command": "python3 review.py"}
     bounds = resolve_task_bounds(payload)
     assert bounds["profile"] == "model-review"
-    assert bounds["timeout"] == 600.0
+    assert bounds["timeout"] == 900.0
 
 
 def test_resolve_task_bounds_autodetect_model_exec():
@@ -51,10 +55,18 @@ def test_resolve_task_bounds_autodetect_model_exec():
     assert bounds["timeout"] == 600.0
 
 
-def test_resolve_task_bounds_autodetect_cleanup():
-    payload = {"id": "disk-pressure-cleanup-2"}
+def test_resolve_task_bounds_autodetect_model_cleanup():
+    payload = {"id": "disk-pressure-cleanup-2", "prompt": "zcodex clean old caches"}
     bounds = resolve_task_bounds(payload)
-    assert bounds["profile"] == "cleanup"
+    assert bounds["profile"] == "model-cleanup"
+    assert bounds["timeout"] == 600.0
+    assert bounds["memory_mb"] == 768
+
+
+def test_resolve_task_bounds_autodetect_deterministic_cleanup():
+    payload = {"id": "disk-pressure-cleanup-2", "command": "rm -rf .local/tmp/*"}
+    bounds = resolve_task_bounds(payload)
+    assert bounds["profile"] == "deterministic-cleanup"
     assert bounds["timeout"] == 120.0
     assert bounds["memory_mb"] == 256
 
@@ -78,5 +90,5 @@ def test_submit_task_auto_populates_profile_timeout(tmp_path):
     if isinstance(stored_payload, str):
         import json
         stored_payload = json.loads(stored_payload)
-    assert stored_payload["timeout"] == 600.0
+    assert stored_payload["timeout"] == 900.0
     assert stored_payload["profile"] == "model-review"

@@ -3,6 +3,7 @@
 Formalizes timeout and resource bounds per task category to prevent
 premature timeouts on model code reviews and long-running test suites,
 while maintaining fast fail-fast deadlines on deterministic checks.
+Incorporates measured historical durations (e.g. model cleanups taking 173-346s).
 """
 
 from typing import Dict, Any, Optional
@@ -12,7 +13,7 @@ DEFAULT_MEMORY_MB: int = 768
 
 TASK_PROFILES: Dict[str, Dict[str, Any]] = {
     "model-review": {
-        "timeout": 600.0,
+        "timeout": 900.0,
         "memory_mb": 768,
         "description": "Full-suite test execution and independent LLM code review",
     },
@@ -21,20 +22,30 @@ TASK_PROFILES: Dict[str, Dict[str, Any]] = {
         "memory_mb": 768,
         "description": "Autonomous model agent reasoning, tool use, and artifact drafting",
     },
+    "model-cleanup": {
+        "timeout": 600.0,
+        "memory_mb": 768,
+        "description": "Model-directed disk pressure mitigation and audit pruning (historical 173-346s)",
+    },
     "deterministic-check": {
         "timeout": 60.0,
         "memory_mb": 256,
         "description": "Fast deterministic test runner, linter, or syntax verification",
     },
+    "deterministic-cleanup": {
+        "timeout": 120.0,
+        "memory_mb": 256,
+        "description": "Bounded deterministic shell/file pruning without model invocation",
+    },
     "cleanup": {
         "timeout": 120.0,
         "memory_mb": 256,
-        "description": "Disk pressure mitigation, cache pruning, or artifact cleanup unit",
+        "description": "Generic deterministic cleanup alias",
     },
     "default": {
         "timeout": DEFAULT_TIMEOUT_SEC,
         "memory_mb": DEFAULT_MEMORY_MB,
-        "description": "Standard general task execution profile",
+        "description": "Standard general task execution profile (non-model tasks)",
     },
 }
 
@@ -52,7 +63,7 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     Precedence:
     1. Explicit values in payload (if truthy and > 0)
     2. Named profile in payload["profile"]
-    3. Auto-detected profile from payload contents (e.g. review keywords/command)
+    3. Auto-detected profile from payload contents (e.g. model keywords, review, cleanup)
     4. General default (300s timeout, 768MB memory)
     """
     profile_name = payload.get("profile")
@@ -61,12 +72,14 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not profile_name:
         cmd = str(payload.get("command") or "") + " " + str(payload.get("prompt") or "")
         task_id = str(payload.get("id") or "")
+        is_model = any(k in cmd for k in ("zcodex", "agy", "codex", "zcode", "gemini", "glm-5"))
+        
         if "review" in task_id or "review" in cmd:
             profile_name = "model-review"
-        elif any(k in cmd for k in ("zcodex", "agy", "codex exec", "zcode")):
-            profile_name = "model-task"
         elif "cleanup" in task_id:
-            profile_name = "cleanup"
+            profile_name = "model-cleanup" if is_model else "deterministic-cleanup"
+        elif is_model:
+            profile_name = "model-task"
         else:
             profile_name = "default"
 
