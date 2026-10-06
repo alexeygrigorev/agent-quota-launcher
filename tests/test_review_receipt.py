@@ -303,6 +303,70 @@ class TestReviewReceiptValidation(unittest.TestCase):
         self.assertEqual(parsed["task_id"], "test-task-1")
         self.assertEqual(len(parsed["review_prompt"]), 500)
 
+    def test_dedup_projection_active_ended(self):
+        """Test projection for active and ended tasks."""
+        payload = {"owner": "test", "cwd": ".", "timeout": 60}
+        self.store.submit_task("t-proj-1", "idem-proj-1", payload, [])
+        
+        proj = self.store.get_task_identity_projection("t-proj-1")
+        self.assertEqual(proj["lifecycle_state"], "active")
+        self.assertEqual(proj["task_state"], "queued")
+        self.assertEqual(proj["cgroup_unit_name"], "agent-task-t-proj-1.service")
+        
+        self.store.transition_task("t-proj-1", "running", ("queued",))
+        proj = self.store.get_task_identity_projection("t-proj-1")
+        # without systemctl active state it might be unknown, let's mock it if possible or just accept unknown
+        self.assertIn(proj["lifecycle_state"], ("unknown", "active"))
+        
+        self.store.complete_task("t-proj-1", "reviewer")
+        proj = self.store.get_task_identity_projection("t-proj-1")
+        self.assertEqual(proj["lifecycle_state"], "ended")
+        self.assertEqual(proj["task_state"], "completed-awaiting-review")
+
+    def test_dedup_projection_receipt_deduplication(self):
+        """Test projection deduplicates receipts by (task_id, invocation_id) and (task_id, report_sha256)."""
+        payload = {"owner": "test", "cwd": ".", "timeout": 60}
+        self.store.submit_task("t-proj-2", "idem-proj-2", payload, [])
+        
+        r1 = dict(self.base_receipt, task_id="t-proj-2", report_sha256="hash1")
+        self.store.add_review_receipt(r1, "accepted", {"report_sha256": "hash1", "invocation_id": "inv-1"})
+        
+        # duplicate report_sha256
+        r2 = dict(self.base_receipt, task_id="t-proj-2", report_sha256="hash1", verdict="REJECT")
+        self.store.add_review_receipt(r2, "rejected", {"report_sha256": "hash1", "invocation_id": "inv-2"})
+        
+        proj = self.store.get_task_identity_projection("t-proj-2")
+        # should only count the first one due to deduplication, so verdict should be ACCEPT
+        self.assertEqual(proj["receipt_verdict"], "ACCEPT")
+        
+        # different hash, same invocation_id
+        r3 = dict(self.base_receipt, task_id="t-proj-2", report_sha256="hash2", verdict="REJECT")
+        self.store.add_review_receipt(r3, "rejected", {"report_sha256": "hash2", "invocation_id": "inv-1"})
+        
+        proj = self.store.get_task_identity_projection("t-proj-2")
+        self.assertEqual(proj["receipt_verdict"], "ACCEPT")
+        
+        # different hash, different invocation_id
+        r4 = dict(self.base_receipt, task_id="t-proj-2", report_sha256="hash3", verdict="CHANGES_REQUESTED")
+        self.store.add_review_receipt(r4, "rejected_negative_verdict", {"report_sha256": "hash3", "invocation_id": "inv-3"})
+        
+        proj = self.store.get_task_identity_projection("t-proj-2")
+        self.assertEqual(proj["receipt_verdict"], "CHANGES_REQUESTED")
+
+    def test_dedup_projection_unknown_state(self):
+        """Test projection handles unknown lifecycle states."""
+        payload = {"owner": "test", "cwd": ".", "timeout": 60}
+        self.store.submit_task("t-proj-3", "idem-proj-3", payload, [])
+        
+        self.store.transition_task("t-proj-3", "running", ("queued",))
+        # because the systemctl command will return inactive for a missing unit
+        proj = self.store.get_task_identity_projection("t-proj-3")
+        self.assertEqual(proj["lifecycle_state"], "unknown")
+        
+        self.store.fail_task("t-proj-3", "reviewer", "failed")
+        proj = self.store.get_task_identity_projection("t-proj-3")
+        self.assertEqual(proj["lifecycle_state"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

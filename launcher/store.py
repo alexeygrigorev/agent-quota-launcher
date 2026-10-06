@@ -353,6 +353,92 @@ class Store:
                 for r in cursor.fetchall()
             ]
 
+    def get_task_identity_projection(self, task_id: str) -> dict:
+        """Aggregate task status, cgroup unit name, invocation ID, 
+        latest review receipt ID, receipt verdict/status, and categorized lifecycle state.
+        Deduplicates receipts by (task_id, invocation_id) and (task_id, report_sha256)."""
+        task = self.get_task(task_id)
+        if not task:
+            return {}
+
+        task_state = task["state"]
+        
+        with self.get_conn() as conn:
+            cursor = conn.execute("SELECT updated_at FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            updated_at = row[0] if row else None
+
+        unit_name = f"agent-task-{task_id}.service"
+        invocation_id = None
+        systemd_active = False
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "show", unit_name, "-p", "InvocationID", "-p", "ActiveState"],
+                capture_output=True, text=True, check=False, timeout=3.0
+            )
+            props = dict(line.split("=", 1) for line in res.stdout.strip().split("\n") if "=" in line)
+            invocation_id = props.get("InvocationID") or None
+            systemd_active = props.get("ActiveState") in ("active", "activating")
+        except Exception:
+            pass
+
+        seen_hashes = set()
+        seen_invocations = set()
+        latest_receipt = None
+
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT id, report_sha256, verdict, status, details, created_at "
+                "FROM review_receipts WHERE task_id = ? ORDER BY created_at ASC",
+                (task_id,)
+            )
+            for row in cursor.fetchall():
+                rid, r_hash, r_verdict, r_status, r_details_str, r_created_at = row
+                
+                if r_hash and r_hash in seen_hashes:
+                    continue
+                if r_hash:
+                    seen_hashes.add(r_hash)
+                    
+                r_details = json.loads(r_details_str) if r_details_str else {}
+                r_inv_id = r_details.get("invocation_id")
+                
+                if r_inv_id:
+                    if r_inv_id in seen_invocations:
+                        continue
+                    seen_invocations.add(r_inv_id)
+                
+                latest_receipt = {
+                    "id": rid,
+                    "verdict": r_verdict,
+                    "status": r_status,
+                    "created_at": r_created_at
+                }
+
+        if task_state in ("queued", "starting", "launch-uncertain", "stalled", "running"):
+            if not systemd_active and task_state == "running":
+                lifecycle = "unknown"
+            else:
+                lifecycle = "active"
+        elif task_state == "completed-awaiting-review":
+            lifecycle = "ended"
+        elif task_state in ("failed", "accepted"):
+            lifecycle = task_state
+        else:
+            lifecycle = "unknown"
+
+        return {
+            "task_id": task_id,
+            "task_state": task_state,
+            "cgroup_unit_name": unit_name,
+            "invocation_id": invocation_id,
+            "latest_receipt_id": latest_receipt["id"] if latest_receipt else None,
+            "receipt_verdict": latest_receipt["verdict"] if latest_receipt else None,
+            "receipt_status": latest_receipt["status"] if latest_receipt else None,
+            "lifecycle_state": lifecycle,
+            "timestamp": updated_at
+        }
+
 
 @contextmanager
 def launch_lock(lock_path):
