@@ -19,7 +19,7 @@ ADAPTER_MODELS = {
     "zai": "glm-5.3-flash",
 }
 CODEX_MIN_REMAINING = 15.0
-GROK_MIN_REMAINING = 15.0
+GROK_MIN_REMAINING = 5.0
 
 # Promotion stays disabled until a verified ZCode >=3.10 GLM-5.3-Flash
 # subscription route exists; even inside the campaign window the multiplier is

@@ -1,3 +1,4 @@
+from unittest.mock import patch
 import unittest
 from datetime import datetime, timezone, timedelta
 from launcher.admission import validate_quse, codex_gate_reason, fetch_quse
@@ -187,20 +188,20 @@ class TestAdmission(unittest.TestCase):
             data = fetch_quse()
         self.assertIn("grok", data)
 
-    def test_grok_at_exactly_15_percent_rejected(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 15.0, "reset_at": self.future1}})}
+    def test_grok_at_exactly_5_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 5.0, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
-        self.assertIn("Grok window <= 15% remaining (cutoff policy)", rej.get("grok", ""))
+        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
 
-    def test_grok_below_15_percent_rejected(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 14.9, "reset_at": self.future1}})}
+    def test_grok_below_5_percent_rejected(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 4.9, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
-        self.assertIn("Grok window <= 15% remaining (cutoff policy)", rej.get("grok", ""))
+        self.assertIn("Grok window <= 5% remaining (cutoff policy)", rej.get("grok", ""))
 
-    def test_grok_above_15_percent_admitted(self):
-        data = {"grok": grok_route({"7d": {"percent_remaining": 15.1, "reset_at": self.future1}})}
+    def test_grok_above_5_percent_admitted(self):
+        data = {"grok": grok_route({"7d": {"percent_remaining": 5.1, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 1)
         self.assertEqual(valid[0]["provider"], "grok")
@@ -231,6 +232,24 @@ class TestAdmission(unittest.TestCase):
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 1)
         self.assertEqual(valid[0]["remaining_fraction"], 0.5)
+
+
+    @patch("launcher.capacity.check_provider_capacity")
+    def test_zai_concurrency_bound_enforced(self, mock_check_cap):
+        # When ZAI concurrency bound <= 26 is reached, ensure it is rejected
+        mock_check_cap.return_value = (False, "zai hostwide capacity ceiling (26) reached: 26 live processes", {})
+        data = {"zai": route({"5h": {"percent_remaining": 90, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data, check_capacity=True)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("capacity ceiling (26) reached", rej.get("zai", ""))
+
+    
+    def test_codex_above_15_percent_passes_gate(self):
+        data = {"codex": route({"7d": {"percent_remaining": 15.1, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        # It passes the 15% gate and hits the unsupported wrapper error instead.
+        self.assertIn("unsupported in launcher v0.1", rej.get("codex", ""))
 
 if __name__ == '__main__':
     unittest.main()
