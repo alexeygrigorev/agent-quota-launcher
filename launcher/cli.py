@@ -194,8 +194,10 @@ def run_task_units(args):
     allow_fallback = payload.get("allow_fallback", True)
 
     tmpdir = args.tmpdir
-    memory_mb = int(payload.get("memory_mb") or 768)
-    timeout_sec = float(payload.get("timeout") or 300)
+    from launcher.task_profiles import resolve_task_bounds
+    bounds = resolve_task_bounds(payload)
+    memory_mb = int(payload.get("memory_mb") or bounds["memory_mb"])
+    timeout_sec = float(payload.get("timeout") or bounds["timeout"])
     lock_path = config_dir / "launch.lock"
     # Concurrent sibling launches can collide on quse (observed rc=1). Retry
     # before leasing so a transient fetch failure leaves the task queued.

@@ -178,6 +178,13 @@ class Store:
                     raise ValueError(f"Path overlap: {req_p} overlaps with {act_p} (task {task_id})")
 
     def submit_task(self, task_id, idempotency_key, payload, paths, memory_mb=1500, disk_mb=512):
+        from launcher.task_profiles import resolve_task_bounds
+        bounds = resolve_task_bounds(payload)
+        if not payload.get("timeout") and bounds.get("timeout"):
+            payload["timeout"] = bounds["timeout"]
+        if not payload.get("profile") and bounds.get("profile"):
+            payload["profile"] = bounds["profile"]
+
         if not payload.get("owner") or not payload.get("cwd") or not payload.get("timeout"):
             raise ValueError("Missing owner/cwd/timeout in payload")
 
