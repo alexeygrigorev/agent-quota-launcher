@@ -1,4 +1,5 @@
 import argparse
+import sqlite3
 import sys
 import json
 import os
@@ -363,7 +364,11 @@ def request(args):
     if args.timeout:
         payload["timeout"] = args.timeout
 
-    bounds = resolve_task_bounds(payload)
+    try:
+        bounds = resolve_task_bounds(payload)
+    except ValueError as e:
+        print(json.dumps({"error": f"Profile resolution failed: {e}"}))
+        return 1
     
     source_receipt = None
     if args.target_commit or args.target_worktree:
@@ -387,7 +392,14 @@ def request(args):
                 normalized_paths.append(stripped)
 
     # Submit task
-    store.submit_task(task_id, idem_key, payload, normalized_paths)
+    try:
+        store.submit_task(task_id, idem_key, payload, normalized_paths)
+    except sqlite3.IntegrityError as e:
+        print(json.dumps({"error": f"Task submission failed (duplicate id '{task_id}'): {e}"}))
+        return 1
+    except ValueError as e:
+        print(json.dumps({"error": f"Task submission failed: {e}"}))
+        return 1
     
     # Spawn controller
     class SpawnArgs:
@@ -775,6 +787,7 @@ def main():
     parser_request.add_argument("--timeout", type=float, help="Timeout override")
     parser_request.add_argument("--paths", action="append", default=[])
     parser_request.add_argument("--id", help="Explicit task ID")
+    parser_request.add_argument("--key", help="Idempotency key; resubmitting with the same key and payload safely replays (Store.submit_task)")
     parser_request.set_defaults(func=request)
 
     parser_status = subparsers.add_parser("status", help="show task/lifecycle")

@@ -171,3 +171,33 @@ def test_submit_task_records_profile_memory_in_task_resources(tmp_path):
         assert row[0] == 256
         assert row[1] == 512
 
+
+
+def test_resolve_task_bounds_autodetect_sees_goal_key():
+    # C3048 regression (review probe P3): `launcher request` stores the prompt
+    # under payload["goal"]; auto-detection must see it, or review goals resolve
+    # to the 300s default instead of model-review (900s).
+    payload = {
+        "id": "task-abcd1234",
+        "goal": "perform full code review of the diff and report findings",
+        "cwd": "/tmp/request-repo",
+        "owner": "alexey",
+    }
+    bounds = resolve_task_bounds(payload)
+    assert bounds["profile"] == "model-review"
+    assert bounds["timeout"] == 900.0
+
+
+def test_resolve_task_bounds_goal_model_work_detects_model_task():
+    # Non-review model goal submitted via request() must land on model-task.
+    payload = {"id": "task-abcd1234", "goal": "use zcodex to draft the migration script"}
+    bounds = resolve_task_bounds(payload)
+    assert bounds["profile"] == "model-task"
+    assert bounds["timeout"] == 600.0
+
+
+def test_resolve_task_bounds_goal_without_model_keywords_stays_default():
+    payload = {"id": "task-abcd1234", "goal": "run the linter and report whitespace issues"}
+    bounds = resolve_task_bounds(payload)
+    assert bounds["profile"] == "default"
+    assert bounds["timeout"] == 300.0

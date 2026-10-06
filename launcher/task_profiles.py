@@ -150,7 +150,7 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     Precedence:
     1. Explicit values in payload (if truthy and > 0, clamped to safety bounds)
     2. Named profile in payload["profile"] (fail-closed if unknown)
-    3. Auto-detected profile from payload contents (checking provider, model, command, prompt, id)
+    3. Auto-detected profile from payload contents (checking provider, model, command, prompt, goal, id)
     4. General default (300s timeout, 768MB memory)
     """
     profile_name = payload.get("profile")
@@ -158,11 +158,18 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     if profile_name:
         profile = get_profile(profile_name)
     else:
-        # Comprehensive detection (F1 / C3014): inspect provider, model, model_requirements, command, prompt, id
+        # Comprehensive detection (F1 / C3014): inspect provider, model, model_requirements,
+        # command, prompt, goal, id. "goal" is included because `launcher request` stores the
+        # task prompt under that key (C3048); without it, request-submitted model work would
+        # silently fall back to the 300s default profile.
         model_req = payload.get("model_requirements") or {}
         provider = str(payload.get("provider") or model_req.get("provider") or "").lower().strip()
         model = str(payload.get("model") or model_req.get("model") or "").lower().strip()
-        cmd = (str(payload.get("command") or "") + " " + str(payload.get("prompt") or "")).lower()
+        cmd = (
+            str(payload.get("command") or "")
+            + " " + str(payload.get("prompt") or "")
+            + " " + str(payload.get("goal") or "")
+        ).lower()
         task_id = str(payload.get("id") or "").lower()
 
         is_model = bool(

@@ -790,7 +790,18 @@ def extract_telemetry_events(stdout_path: Path) -> List[Dict[str, Any]]:
 
 
 def parse_tool_events(events: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
-    """Extract distinct tool-call events and the total count of raw tool events from stream."""
+    """Extract distinct tool-call events and the total count of raw tool events from stream.
+
+    Dedup assumptions (C3045/C3048):
+    - Indexed entries are deduplicated by ``step_index`` alone, which assumes the
+      adapter emits globally unique indices across the whole run; an adapter that
+      resets indices per turn would collapse distinct calls. ``tool_events_count``
+      (the raw count) is retained in receipts as the audit fallback whenever
+      ``tool_calls_count`` looks suspiciously low.
+    - Index-less ACTIVE events are paired with a later index-less DONE of the same
+      tool_name across the entire stream, so cross-turn false pairing is possible.
+      Telemetry only: no control-flow decision consumes these counts.
+    """
     raw_tools = []
     for ev in events:
         step = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else ev
