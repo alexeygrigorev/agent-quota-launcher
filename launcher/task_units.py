@@ -266,24 +266,20 @@ def build_systemd_run_argv(
         "-E", f"TMP={tmpdir}",
     ])
 
-    # Propagate standard execution PATH, HOME, USER to transient unit
+    # Propagate strict whitelisted execution PATH, HOME, USER to transient unit
     path_entries = [
-        "/home/alexey/.local/bin",
-        "/home/alexey/.nvm/versions/node/v24.13.1/bin",
+        str(Path.home() / ".local" / "bin"),
+        str(Path.home() / ".nvm" / "versions" / "node" / "v24.13.1" / "bin"),
         "/usr/local/bin",
         "/usr/bin",
         "/bin",
     ]
-    current_path = os.environ.get("PATH", "")
-    if current_path:
-        for p in current_path.split(":"):
-            if p and p not in path_entries and os.path.isdir(p):
-                path_entries.append(p)
-    unit_path = ":".join(path_entries)
+    valid_paths = [p for p in path_entries if os.path.isdir(p)]
+    unit_path = ":".join(valid_paths)
 
     argv.extend([
         "-E", f"PATH={unit_path}",
-        "-E", f"HOME={os.environ.get('HOME', '/home/alexey')}",
+        "-E", f"HOME={os.environ.get('HOME', str(Path.home()))}",
         "-E", f"USER={os.environ.get('USER', 'alexey')}",
     ])
 
@@ -293,9 +289,14 @@ def build_systemd_run_argv(
         argv.extend(["-E", f"ZCODE_CJS={zcode_cjs}"])
 
     if extra_env:
-        for k, v in extra_env.items():
-            if k and v is not None:
-                argv.extend(["-E", f"{k}={v}"])
+        # Securely pass extra_env via temporary EnvironmentFile (0600) to prevent cmdline secret leaks
+        tmp_p = Path(tmpdir)
+        tmp_p.mkdir(parents=True, exist_ok=True)
+        env_file_path = tmp_p / f"{unit_name}.env"
+        lines = [f"{k}={v}\n" for k, v in sorted(extra_env.items()) if k and v is not None]
+        env_file_path.write_text("".join(lines), encoding="utf-8")
+        env_file_path.chmod(0o600)
+        argv.extend(["-p", f"EnvironmentFile={env_file_path}"])
     if workspace:
         ws_path = Path(workspace).resolve()
         if not ws_path.is_dir():

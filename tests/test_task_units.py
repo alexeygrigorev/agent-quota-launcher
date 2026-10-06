@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -237,15 +238,46 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         self.assertNotIn("--scope", cmd)
 
     def test_build_systemd_run_argv_propagates_extra_env(self):
-        cmd = build_systemd_run_argv(
-            unit_name="agent-task-t1.service",
-            command_argv=["python3", "worker.py"],
-            memory_mb=768,
-            tmpdir="/repo/.local/tmp/t1",
-            extra_env={"CUSTOM_KEY": "CUSTOM_VAL", "FOO": "BAR"},
-        )
-        self.assertIn("CUSTOM_KEY=CUSTOM_VAL", cmd)
-        self.assertIn("FOO=BAR", cmd)
+        tmp_ws = tempfile.mkdtemp()
+        try:
+            cmd = build_systemd_run_argv(
+                unit_name="agent-task-t1.service",
+                command_argv=["python3", "worker.py"],
+                memory_mb=768,
+                tmpdir=f"{tmp_ws}/tmp",
+                extra_env={"CUSTOM_KEY": "CUSTOM_VAL", "FOO": "BAR"},
+            )
+            # Secrets MUST NOT leak via command-line arguments (-E)
+            self.assertNotIn("CUSTOM_KEY=CUSTOM_VAL", cmd)
+            self.assertNotIn("FOO=BAR", cmd)
+            # Environment variables must be passed securely via EnvironmentFile
+            env_file_arg = f"EnvironmentFile={tmp_ws}/tmp/agent-task-t1.service.env"
+            self.assertIn(env_file_arg, cmd)
+            # Verify the env file was created with 0600 mode and correct content
+            env_path = Path(f"{tmp_ws}/tmp/agent-task-t1.service.env")
+            self.assertTrue(env_path.exists())
+            self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
+            content = env_path.read_text(encoding="utf-8")
+            self.assertIn("CUSTOM_KEY=CUSTOM_VAL\n", content)
+            self.assertIn("FOO=BAR\n", content)
+        finally:
+            shutil.rmtree(tmp_ws, ignore_errors=True)
+
+    def test_build_systemd_run_argv_strict_path_whitelist(self):
+        # Even if os.environ has an unvetted path, it must not propagate
+        old_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = f"/malicious/unvetted/bin:{old_path}"
+            cmd = build_systemd_run_argv(
+                unit_name="agent-task-t1.service",
+                command_argv=["python3", "worker.py"],
+                memory_mb=768,
+                tmpdir="/repo/.local/tmp/t1",
+            )
+            path_arg = next(arg for arg in cmd if arg.startswith("PATH="))
+            self.assertNotIn("/malicious/unvetted/bin", path_arg)
+        finally:
+            os.environ["PATH"] = old_path
 
     def test_build_systemd_run_argv_requires_service_suffix(self):
         with self.assertRaises(TaskUnitAdmissionError):
