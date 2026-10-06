@@ -199,6 +199,17 @@ def admit_task_unit(
     except Exception as e:
         raise TaskUnitAdmissionError(f"quota admission validation failed: {e}") from e
 
+    # Enforce tmpdir strictly under repo .local/tmp
+    repo_path = Path(workspace).resolve()
+    if tmpdir is None:
+        tmpdir = str(repo_path / ".local" / "tmp" / task_id)
+    tmp_path = Path(tmpdir).resolve()
+    allowed_tmp_root = repo_path / ".local" / "tmp"
+    if not tmp_path.is_relative_to(allowed_tmp_root):
+        raise TaskUnitAdmissionError(
+            f"TMPDIR '{tmp_path}' must be located under '{allowed_tmp_root}'"
+        )
+
     # Check host floors (MemAvailable >= 10 GiB, root disk >= 50 GiB, deny /data)
     try:
         check_resources(
@@ -211,17 +222,6 @@ def admit_task_unit(
         )
     except Exception as e:
         raise TaskUnitAdmissionError(f"resource floor check failed: {e}") from e
-
-    # Enforce tmpdir strictly under repo .local/tmp
-    repo_path = Path(workspace).resolve()
-    if tmpdir is None:
-        tmpdir = str(repo_path / ".local" / "tmp" / task_id)
-    tmp_path = Path(tmpdir).resolve()
-    allowed_tmp_root = repo_path / ".local" / "tmp"
-    if not tmp_path.is_relative_to(allowed_tmp_root):
-        raise TaskUnitAdmissionError(
-            f"TMPDIR '{tmp_path}' must be located under '{allowed_tmp_root}'"
-        )
 
     # Deny /data destination explicitly (18.9 GiB free, below 50 GiB floor)
     if str(tmp_path).startswith("/data") or str(repo_path).startswith("/data"):

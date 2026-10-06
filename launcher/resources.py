@@ -108,6 +108,12 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         if not cap["feasible"]:
             raise ValueError(f"stage {target_stage} capacity exceeded")
 
+    if requested_tmpdir is None:
+        if repo_root is not None:
+            requested_tmpdir = str(Path(repo_root).resolve() / '.local' / 'tmp')
+        else:
+            raise ValueError("requested_tmpdir is required")
+
     tmp_path = Path(requested_tmpdir).resolve()
     if tmp_path == Path('/tmp') or tmp_path.parts[:2] == ('/', 'tmp'):
         raise ValueError("reject /tmp")

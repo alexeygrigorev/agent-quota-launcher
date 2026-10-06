@@ -116,13 +116,14 @@ def spawn_ql_controller(args) -> int:
     launcher_root = str(Path(__file__).resolve().parent.parent)
     config_dir = config_dir_for(args)
     unit = controller_unit_name(args.id)
+    effective_tmpdir = args.tmpdir or str(Path(args.cwd).resolve() / '.local' / 'tmp' / args.id)
     cmd = [
         "systemd-run", "--user", f"--unit={unit}", "--slice=app.slice", "--collect",
         "-p", "MemoryMax=256M", "-p", "TasksMax=100",
         "-p", f"WorkingDirectory={launcher_root}",
         "-E", f"PYTHONPATH={launcher_root}",
-        # dynamically inject TMPDIR if unspecified
-        "-E", f"TMPDIR={args.tmpdir if args.tmpdir else str(Path(args.cwd).resolve() / '.local' / 'tmp' / args.id)}",
+        # dynamically inject TMPDIR
+        "-E", f"TMPDIR={effective_tmpdir}",
         "-E", f"PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         "-E", f"HOME={os.environ.get('HOME', '')}",
         "--",
@@ -130,9 +131,8 @@ def spawn_ql_controller(args) -> int:
         "--config-dir", str(config_dir),
         "run", "--backend", "task-units", "--as-controller",
         "--id", args.id, "--cwd", args.cwd,
+        "--tmpdir", effective_tmpdir,
     ]
-    if args.tmpdir:
-        cmd.extend(["--tmpdir", args.tmpdir])
     res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
     if res.returncode != 0:
         print(json.dumps({

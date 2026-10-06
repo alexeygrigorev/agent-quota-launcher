@@ -106,7 +106,7 @@ class TestTaskUnitAdmission(unittest.TestCase):
 
 
     def test_admit_task_unit_auto_provisions_tmpdir_when_none(self):
-        with patch("launcher.task_units.check_resources", return_value=True):
+        with patch("launcher.task_units.check_resources", return_value=True) as mock_check:
             self.assertTrue(
                 admit_task_unit(
                     task_id="t_auto",
@@ -116,6 +116,11 @@ class TestTaskUnitAdmission(unittest.TestCase):
                     quse_json=self.valid_quse,
                 )
             )
+            self.assertTrue(mock_check.called)
+            called_tmpdir = mock_check.call_args[0][2]
+            expected_tmpdir = str(self.repo / ".local" / "tmp" / "t_auto")
+            self.assertEqual(called_tmpdir, expected_tmpdir)
+
 
     def test_admit_task_unit_missing_quse_rejected(self):
         with self.assertRaises(TaskUnitAdmissionError) as ctx:

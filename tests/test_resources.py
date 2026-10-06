@@ -97,6 +97,13 @@ class TestResources(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repo root required"):
             check_resources(1000, self.repo, str(self.owned_tmp), repo_root=None)
 
+    def test_check_resources_tmpdir_none_defaults_under_repo(self):
+        # When requested_tmpdir is None and repo_root is provided, defaults to repo_root/.local/tmp
+        self.assertTrue(check_resources(1000, self.repo, None, repo_root=self.repo))
+        # When requested_tmpdir is None and repo_root is None, raises ValueError
+        with self.assertRaisesRegex(ValueError, "requested_tmpdir is required"):
+            check_resources(1000, self.repo, None, repo_root=None)
+
 
     def test_estimate_stage_memory_bytes(self):
         from launcher.resources import estimate_stage_memory_bytes
