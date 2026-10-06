@@ -701,6 +701,9 @@ def main():
                                help="do not wait for unreviewed tasks before dispatch")
     parser_watch.add_argument("--interval", type=float, default=10.0)
     parser_watch.add_argument("--once", action="store_true", help="single reconcile+dispatch pass")
+    parser_watch.add_argument("--cleanup-timeout", type=float, default=None)
+    parser_watch.add_argument("--cleanup-cooldown-sec", type=float, default=300.0)
+    parser_watch.add_argument("--cleanup-owner", type=str, default=None)
     parser_watch.set_defaults(func=watch)
 
     parser_verify = subparsers.add_parser(

@@ -22,7 +22,7 @@ CLEANUP_PAYLOAD = {
     ),
     "cwd": "/home/alexey/git/cloudflare-agent-git",
     "tmpdir": "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup",
-    "owner": "ant-head-continuation-resume-20261005",
+    "owner": "ql-head-feedback-custody-20261006",
     "timeout": DEFAULT_CLEANUP_TIMEOUT_SEC,
     "model_requirements": {"provider": "antigravity"},
 }
@@ -233,7 +233,7 @@ def watch_loop(args, max_passes=None):
                     "ORDER BY created_at DESC LIMIT 1"
                 )
                 row = cursor.fetchone()
-                if row and row[0] == "failed" and row[1] is not None:
+                if row and row[0] in ("failed", "completed-awaiting-review", "completed", "accepted") and row[1] is not None:
                     try:
                         elapsed = float(row[1])
                         if elapsed < cooldown_sec:
@@ -250,6 +250,9 @@ def watch_loop(args, max_passes=None):
                     cleanup_to = getattr(args, "cleanup_timeout", None)
                     if cleanup_to is not None:
                         payload["timeout"] = float(cleanup_to)
+                    cleanup_own = getattr(args, "cleanup_owner", None)
+                    if cleanup_own is not None:
+                        payload["owner"] = str(cleanup_own)
                     store.submit_task(
                         task_id=cleanup_id,
                         idempotency_key=cleanup_key,

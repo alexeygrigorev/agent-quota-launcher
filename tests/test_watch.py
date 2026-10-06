@@ -307,7 +307,7 @@ class WatchRefillTests(unittest.TestCase):
             )
             self.assertEqual(payload["cwd"], "/home/alexey/git/cloudflare-agent-git")
             self.assertEqual(payload["tmpdir"], "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup")
-            self.assertEqual(payload["owner"], "ant-head-continuation-resume-20261005")
+            self.assertEqual(payload["owner"], "ql-head-feedback-custody-20261006")
             self.assertEqual(payload["timeout"], 600)
             self.assertEqual(payload["model_requirements"], {"provider": "antigravity"})
             self.assertEqual(cleanup_task["state"], "queued")
@@ -359,6 +359,7 @@ class WatchRefillTests(unittest.TestCase):
                 backend="task-units",
                 once=True,
                 episode_state=episode_state,
+                cleanup_cooldown_sec=0.0,
             )
 
             GiB = 1024 * 1024 * 1024
@@ -444,6 +445,7 @@ class WatchRefillTests(unittest.TestCase):
             task_cwd = os.path.join(tmp_dir, "my-work")
             os.makedirs(task_cwd, exist_ok=True)
 
+            # Do not provide episode_state in args so watch_loop recalculates it from DB each time
             args = argparse.Namespace(
                 config_dir=str(cfg),
                 cwd=task_cwd,
@@ -454,24 +456,93 @@ class WatchRefillTests(unittest.TestCase):
             )
 
             GiB = 1024 * 1024 * 1024
-            # First pass at 28 GiB enqueues cleanup-1
+            
+            # Scenario 1: failed
             with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
                 watch_loop(args, max_passes=1)
 
             t1 = store.get_task("disk-pressure-cleanup-1")
             self.assertIsNotNone(t1)
 
-            # Cleanup-1 fails
             store.transition_task("disk-pressure-cleanup-1", "starting", ("queued",), reason="lease")
             store.transition_task("disk-pressure-cleanup-1", "failed", ("starting",), reason="timeout")
 
-            # Second pass immediately after at 28 GiB: cooldown suppresses retry storm
+            # Second pass: cooldown suppresses retry storm
             with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
                 watch_loop(args, max_passes=1)
 
             t2 = store.get_task("disk-pressure-cleanup-2")
             self.assertIsNone(t2)
+            
+            # Clear cooldown and backdate created_at so newer tasks definitely sort first
+            with store.get_conn() as conn:
+                conn.execute("UPDATE tasks SET created_at = datetime('now', '-400 seconds'), updated_at = datetime('now', '-400 seconds') WHERE id = 'disk-pressure-cleanup-1'")
+                
+            # Need to clear pressure so episode resets
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 30 * GiB})()):
+                watch_loop(args, max_passes=1)
+                
+            # Scenario 2: completed-awaiting-review
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+                
+            self.assertIsNotNone(store.get_task("disk-pressure-cleanup-2"))
+            store.transition_task("disk-pressure-cleanup-2", "starting", ("queued",), reason="lease")
+            store.transition_task("disk-pressure-cleanup-2", "completed-awaiting-review", ("starting",), reason="done")
+            
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+            
+            self.assertIsNone(store.get_task("disk-pressure-cleanup-3"))
+            
+            # Clear cooldown and backdate created_at
+            with store.get_conn() as conn:
+                conn.execute("UPDATE tasks SET created_at = datetime('now', '-400 seconds'), updated_at = datetime('now', '-400 seconds') WHERE id = 'disk-pressure-cleanup-2'")
+                
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 30 * GiB})()):
+                watch_loop(args, max_passes=1)
+                
+            # Scenario 3: accepted
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+                
+            self.assertIsNotNone(store.get_task("disk-pressure-cleanup-3"))
+            store.transition_task("disk-pressure-cleanup-3", "starting", ("queued",), reason="lease")
+            store.transition_task("disk-pressure-cleanup-3", "completed-awaiting-review", ("starting",), reason="done")
+            store.accept_task("disk-pressure-cleanup-3", reviewer="alice")
+            
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+                
+            self.assertIsNone(store.get_task("disk-pressure-cleanup-4"))
 
+    def test_cli_overrides_propagate_to_cleanup_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir)
+            store = Store(str(cfg / "state.db"))
+            task_cwd = os.path.join(tmp_dir, "my-work")
+            os.makedirs(task_cwd, exist_ok=True)
+
+            args = argparse.Namespace(
+                config_dir=str(cfg),
+                cwd=task_cwd,
+                tmpdir=os.path.join(task_cwd, ".local", "tmp"),
+                backend="task-units",
+                once=True,
+                cleanup_timeout=123.0,
+                cleanup_cooldown_sec=50.0,
+                cleanup_owner="test-owner-override",
+            )
+
+            GiB = 1024 * 1024 * 1024
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 28 * GiB})()):
+                watch_loop(args, max_passes=1)
+
+            t1 = store.get_task("disk-pressure-cleanup-1")
+            self.assertIsNotNone(t1)
+            payload = t1["payload"]
+            self.assertEqual(payload["timeout"], 123.0)
+            self.assertEqual(payload["owner"], "test-owner-override")
 
 if __name__ == "__main__":
     unittest.main()
