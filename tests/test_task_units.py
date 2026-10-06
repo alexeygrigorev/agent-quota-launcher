@@ -104,6 +104,19 @@ class TestTaskUnitAdmission(unittest.TestCase):
                 )
             )
 
+
+    def test_admit_task_unit_auto_provisions_tmpdir_when_none(self):
+        with patch("launcher.task_units.check_resources", return_value=True):
+            self.assertTrue(
+                admit_task_unit(
+                    task_id="t_auto",
+                    memory_mb=512,
+                    workspace=str(self.repo),
+                    tmpdir=None,
+                    quse_json=self.valid_quse,
+                )
+            )
+
     def test_admit_task_unit_missing_quse_rejected(self):
         with self.assertRaises(TaskUnitAdmissionError) as ctx:
             admit_task_unit(
@@ -478,6 +491,39 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(receipt["memory_max_mb"], 512)
         self.assertEqual(receipt["tasks_max"], 100)
         self.assertTrue(Path(receipt["stdout_log"]).exists())
+
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {}))
+    @patch("subprocess.Popen")
+    def test_execute_transient_task_unit_auto_provisions_tmpdir(self, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.returncode = 0
+        proc_inst.communicate.return_value = ("Running as unit: agent-task-t-auto.service; invocation ID: inv12345\n", "")
+        mock_popen.return_value = proc_inst
+
+        receipt = execute_transient_task_unit(
+            task_id="t-auto",
+            command_argv=["echo", "hello"],
+            memory_mb=512,
+            workspace=str(self.repo),
+            tmpdir=None,
+            quse_json=self.valid_quse,
+        )
+        
+        expected_tmp = str(Path(self.repo).resolve() / ".local" / "tmp" / "t-auto")
+        
+        # Verify that subprocess.Popen was called with expected_tmp in env
+        call_kwargs = mock_popen.call_args[1]
+        env = call_kwargs.get("env", {})
+        self.assertEqual(env.get("TMPDIR"), expected_tmp)
+        self.assertEqual(env.get("TEMP"), expected_tmp)
+        self.assertEqual(env.get("TMP"), expected_tmp)
+        
+        # Verify the directory was created
+        self.assertTrue(Path(expected_tmp).exists())
+        import stat
+        self.assertEqual(stat.S_IMODE(Path(expected_tmp).stat().st_mode), 0o700)
 
     @patch("launcher.task_units.check_resources", return_value=True)
     @patch("launcher.task_units.verify_task_unit_cleanup")

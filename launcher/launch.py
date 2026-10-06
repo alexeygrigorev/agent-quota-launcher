@@ -285,6 +285,8 @@ def _bounded_timeout(payload):
 
 
 def do_run(store_path, task_id, cwd, tmpdir, lock_path):
+    if tmpdir is None:
+        tmpdir = str(Path(cwd).resolve() / ".local" / "tmp" / task_id)
     store = Store(store_path)
 
     task_data = store.get_task(task_id)

@@ -121,15 +121,18 @@ def spawn_ql_controller(args) -> int:
         "-p", "MemoryMax=256M", "-p", "TasksMax=100",
         "-p", f"WorkingDirectory={launcher_root}",
         "-E", f"PYTHONPATH={launcher_root}",
-        "-E", f"TMPDIR={args.tmpdir}",
+        # dynamically inject TMPDIR if unspecified
+        "-E", f"TMPDIR={args.tmpdir if args.tmpdir else str(Path(args.cwd).resolve() / '.local' / 'tmp' / args.id)}",
         "-E", f"PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         "-E", f"HOME={os.environ.get('HOME', '')}",
         "--",
         sys.executable, "-m", "launcher",
         "--config-dir", str(config_dir),
         "run", "--backend", "task-units", "--as-controller",
-        "--id", args.id, "--cwd", args.cwd, "--tmpdir", args.tmpdir,
+        "--id", args.id, "--cwd", args.cwd,
     ]
+    if args.tmpdir:
+        cmd.extend(["--tmpdir", args.tmpdir])
     res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
     if res.returncode != 0:
         print(json.dumps({
@@ -645,7 +648,7 @@ def main():
     parser_run = subparsers.add_parser("run", help="admit, reserve, launch, record")
     parser_run.add_argument("--id", required=True)
     parser_run.add_argument("--cwd", required=True)
-    parser_run.add_argument("--tmpdir", required=True)
+    parser_run.add_argument("--tmpdir", default=None, help="Optional. Defaults to cwd-local owned tmpdir")
     parser_run.add_argument(
         "--backend",
         default="aplexer",

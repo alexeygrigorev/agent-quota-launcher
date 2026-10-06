@@ -157,7 +157,7 @@ def admit_task_unit(
     task_id: str,
     memory_mb: int,
     workspace: str,
-    tmpdir: str,
+    tmpdir: Optional[str] = None,
     quse_json: Optional[Dict[str, Any]] = None,
     provider: Optional[str] = None,
     active_mem_mb: int = 0,
@@ -214,6 +214,8 @@ def admit_task_unit(
 
     # Enforce tmpdir strictly under repo .local/tmp
     repo_path = Path(workspace).resolve()
+    if tmpdir is None:
+        tmpdir = str(repo_path / ".local" / "tmp" / task_id)
     tmp_path = Path(tmpdir).resolve()
     allowed_tmp_root = repo_path / ".local" / "tmp"
     if not tmp_path.is_relative_to(allowed_tmp_root):
@@ -513,7 +515,7 @@ def execute_transient_task_unit(
     command_argv: List[str],
     memory_mb: int,
     workspace: str,
-    tmpdir: str,
+    tmpdir: Optional[str] = None,
     timeout_sec: float = 1200.0,
     quse_json: Optional[Dict[str, Any]] = None,
     provider: Optional[str] = None,
@@ -548,8 +550,10 @@ def execute_transient_task_unit(
     repo_dir = Path(workspace).resolve()
     if not repo_dir.is_dir():
         raise TaskUnitAdmissionError(f"workspace directory does not exist: {workspace}")
+    if tmpdir is None:
+        tmpdir = str(repo_dir / ".local" / "tmp" / task_id)
     tmpdir_path = Path(tmpdir).resolve()
-    tmpdir_path.mkdir(parents=True, exist_ok=True)
+    tmpdir_path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -789,7 +793,7 @@ def spawn_transient_task_unit(
     command_argv: List[str],
     memory_mb: int,
     workspace: str,
-    tmpdir: str,
+    tmpdir: Optional[str] = None,
     quse_json: Optional[Dict[str, Any]] = None,
     provider: Optional[str] = None,
     log_dir: Optional[str] = None,
@@ -821,8 +825,10 @@ def spawn_transient_task_unit(
     repo_dir = Path(workspace).resolve()
     if not repo_dir.is_dir():
         raise TaskUnitAdmissionError(f"workspace directory does not exist: {workspace}")
+    if tmpdir is None:
+        tmpdir = str(repo_dir / ".local" / "tmp" / task_id)
     tmpdir_path = Path(tmpdir).resolve()
-    tmpdir_path.mkdir(parents=True, exist_ok=True)
+    tmpdir_path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
     out_dir.mkdir(parents=True, exist_ok=True)
