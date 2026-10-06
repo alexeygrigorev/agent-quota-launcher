@@ -167,7 +167,7 @@ class WatchRefillTests(unittest.TestCase):
             self.assertEqual(captured["tmpdir"], expected_tmp)
             self.assertNotEqual(captured["tmpdir"], foreign_tmp)
 
-    def test_run_task_units_does_not_trigger_refill_on_exit_zero(self):
+    def test_disjoint_horizontal_queue_refill(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = Path(tmp_dir)
             store = Store(str(cfg / "state.db"))
@@ -175,13 +175,27 @@ class WatchRefillTests(unittest.TestCase):
             task_tmp = os.path.join(task_cwd, ".local", "tmp")
             os.makedirs(task_tmp, exist_ok=True)
 
+            # Task A
             store.submit_task(
-                "t-run", "k-run",
-                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "test goal", "provider": "grok"},
-                [str(cfg / "p-run")],
+                "t-a", "k-a",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "goal A", "provider": "grok"},
+                [str(cfg / "p-a")],
             )
+            # Task B (Disjoint)
+            store.submit_task(
+                "t-b", "k-b",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "goal B", "provider": "grok"},
+                [str(cfg / "p-b")],
+            )
+            # Task C (Depends on A)
+            store.submit_task(
+                "t-c", "k-c",
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "goal C", "provider": "grok", "dependencies": ["t-a"]},
+                [str(cfg / "p-c")],
+            )
+
             args = argparse.Namespace(
-                id="t-run",
+                id="t-a",
                 cwd=task_cwd,
                 tmpdir=task_tmp,
                 backend="task-units",
@@ -189,18 +203,34 @@ class WatchRefillTests(unittest.TestCase):
                 as_controller=True,
             )
 
-            with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
-                 patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
-                 patch("launcher.task_units.execute_transient_task_unit",
-                       return_value={"exit_code": 0, "unit": "u", "invocation_id": "inv"}), \
-                 patch("launcher.watch.watch_loop") as mock_watch:
+            with patch("launcher.admission.fetch_quse", return_value={"ok": True}),                  patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]),                  patch("launcher.task_units.execute_transient_task_unit",
+                       return_value={"exit_code": 0, "unit": "u", "invocation_id": "inv"}),                  patch("launcher.watch.watch_loop") as mock_watch:
                 rc = run_task_units(args)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(store.get_task("t-run")["state"], "completed-awaiting-review")
-            # Verify watch_loop was NOT called (refill is held waiting for review acceptance)
-            mock_watch.assert_not_called()
+            self.assertEqual(store.get_task("t-a")["state"], "completed-awaiting-review")
+            
+            # Refill should be triggered
+            mock_watch.assert_called_once()
+            called_args = mock_watch.call_args[0][0]
+            self.assertEqual(called_args.wait_for_review, "dependencies")
 
+            # Verify watch loop behavior with _next_dispatchable manually
+            # t-a is unreviewed.
+            # t-b is disjoint, so it should be dispatchable.
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertEqual(tid, "t-b")
+
+            # If t-b is starting, t-c should remain blocked
+            store.transition_task("t-b", "starting", ("queued",), reason="lease")
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertIsNone(tid)
+            self.assertIn("1 queued, all blocked", note)
+            
+            # If t-a is accepted, t-c becomes dispatchable
+            store.accept_task("t-a", reviewer="alice")
+            tid, note = _next_dispatchable(store, wait_for_review="dependencies")
+            self.assertEqual(tid, "t-c")
     def test_accept_triggers_refill_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = Path(tmp_dir)

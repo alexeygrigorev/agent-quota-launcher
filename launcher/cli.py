@@ -315,10 +315,20 @@ def run_task_units(args):
             print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
 
     if completed_ok:
-        print(
-            f"task {args.id} completed-awaiting-review; "
-            f"automatic refill held waiting for distinct independent review acceptance"
+        print(f"task {args.id} completed-awaiting-review")
+        from types import SimpleNamespace
+        from launcher.watch import watch_loop
+        refill_args = SimpleNamespace(
+            config_dir=config_dir,
+            backend=getattr(args, "backend", "task-units"),
+            once=True,
+            wait_for_review="dependencies",
         )
+        print(f"triggering automated disjoint horizontal refill after completion of {args.id}")
+        try:
+            watch_loop(refill_args, max_passes=1)
+        except Exception as e:
+            print(f"refill dispatch error: {e}")
         return 0
     return 1
 
