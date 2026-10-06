@@ -541,28 +541,42 @@ def watch(args):
     return watch_loop(args)
 
 
+def load_receipt_arg(receipt_str: str) -> dict:
+    if not receipt_str:
+        raise ValueError("missing --receipt")
+    trimmed = receipt_str.strip()
+    if trimmed.startswith("{") or "\n" in trimmed:
+        return json.loads(trimmed)
+    try:
+        p = Path(trimmed)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    return json.loads(trimmed)
+
+
 def verify_review(args):
     """Validate a review receipt against anti-self-review, prompt independence,
-    report hash, temporal consistency, and valid verdict."""
+    report hash, temporal consistency, valid verdict, and optional runtime witness."""
     from launcher.review_receipt import validate_review_receipt
     try:
-        if args.receipt:
-            p = Path(args.receipt)
-            if p.exists():
-                receipt = json.loads(p.read_text(encoding="utf-8"))
-            else:
-                receipt = json.loads(args.receipt)
-        else:
-            print(json.dumps({"error": "missing --receipt"}))
-            return 1
+        receipt = load_receipt_arg(args.receipt)
     except Exception as e:
         print(json.dumps({"error": f"failed to load receipt JSON: {e}"}))
         return 1
 
     verify_files = not getattr(args, "no_verify_files", False)
     verify_git = not getattr(args, "no_verify_git", False)
+    require_witness = getattr(args, "require_witness", False)
+    store = get_store(args) if getattr(args, "verify_task_in_store", False) else None
+
     is_accepted, status, details = validate_review_receipt(
-        receipt, verify_files=verify_files, verify_git=verify_git
+        receipt,
+        verify_files=verify_files,
+        verify_git=verify_git,
+        require_witness=require_witness,
+        store=store,
     )
     result = {
         "accepted": is_accepted,
@@ -577,25 +591,23 @@ def record_review(args):
     """Validate and record a review receipt into store preserving negative history."""
     from launcher.review_receipt import validate_review_receipt
     try:
-        if args.receipt:
-            p = Path(args.receipt)
-            if p.exists():
-                receipt = json.loads(p.read_text(encoding="utf-8"))
-            else:
-                receipt = json.loads(args.receipt)
-        else:
-            print(json.dumps({"error": "missing --receipt"}))
-            return 1
+        receipt = load_receipt_arg(args.receipt)
     except Exception as e:
         print(json.dumps({"error": f"failed to load receipt JSON: {e}"}))
         return 1
 
     verify_files = not getattr(args, "no_verify_files", False)
     verify_git = not getattr(args, "no_verify_git", False)
-    is_accepted, status, details = validate_review_receipt(
-        receipt, verify_files=verify_files, verify_git=verify_git
-    )
+    require_witness = getattr(args, "require_witness", False)
     store = get_store(args)
+
+    is_accepted, status, details = validate_review_receipt(
+        receipt,
+        verify_files=verify_files,
+        verify_git=verify_git,
+        require_witness=require_witness,
+        store=store,
+    )
     store.add_review_receipt(receipt, status, details)
 
     result = {
@@ -698,6 +710,8 @@ def main():
     parser_verify.add_argument("--receipt", required=True, help="path to receipt JSON or inline JSON string")
     parser_verify.add_argument("--no-verify-files", action="store_true", help="skip on-disk report file hash check")
     parser_verify.add_argument("--no-verify-git", action="store_true", help="skip git rev-parse commit check")
+    parser_verify.add_argument("--require-witness", action="store_true", help="require verified systemd or aplexer runtime witness")
+    parser_verify.add_argument("--verify-task-in-store", action="store_true", help="verify task_id exists in store")
     parser_verify.set_defaults(func=verify_review)
 
     parser_record = subparsers.add_parser(
@@ -707,6 +721,7 @@ def main():
     parser_record.add_argument("--receipt", required=True, help="path to receipt JSON or inline JSON string")
     parser_record.add_argument("--no-verify-files", action="store_true", help="skip on-disk report file hash check")
     parser_record.add_argument("--no-verify-git", action="store_true", help="skip git rev-parse commit check")
+    parser_record.add_argument("--require-witness", action="store_true", help="require verified systemd or aplexer runtime witness")
     parser_record.set_defaults(func=record_review)
 
     args = parser.parse_args()

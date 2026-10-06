@@ -83,10 +83,55 @@ def compute_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def check_runtime_witness(reviewer_info: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """Check if runtime witness evidence exists for the reviewer (systemd unit, aplexer session)."""
+    unit_name = reviewer_info.get("unit_name")
+    session_id = reviewer_info.get("session_id")
+    witness_details: Dict[str, Any] = {}
+
+    if unit_name:
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "status", unit_name],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3.0,
+            )
+            if res.returncode in (0, 3):  # 0: active, 3: inactive (finished)
+                witness_details["systemd_unit_witnessed"] = True
+                witness_details["unit_name"] = unit_name
+            else:
+                witness_details["systemd_unit_witnessed"] = False
+                witness_details["systemd_unit_returncode"] = res.returncode
+        except Exception as e:
+            witness_details["systemd_unit_witnessed"] = False
+            witness_details["systemd_unit_error"] = str(e)
+
+    if session_id:
+        aplexer_sock = Path(f"/run/user/{os.getuid()}/aplexer/sessions/{session_id}/control.sock")
+        aplexer_hist = Path(os.path.expanduser(f"~/.local/state/aplexer/sessions/{session_id}/history.bin"))
+        if aplexer_sock.exists() or aplexer_hist.exists():
+            witness_details["aplexer_session_witnessed"] = True
+            witness_details["session_id"] = session_id
+        else:
+            witness_details["aplexer_session_witnessed"] = False
+
+    is_witnessed = any(
+        witness_details.get(k) is True
+        for k in ("systemd_unit_witnessed", "aplexer_session_witnessed")
+    )
+    if not is_witnessed:
+        return False, "unverified_runtime_witness", witness_details
+    return True, "witnessed", witness_details
+
+
 def validate_review_receipt(
     receipt: Dict[str, Any],
     verify_files: bool = True,
     verify_git: bool = True,
+    require_witness: bool = False,
+    store: Optional[Any] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Validate a review receipt against independence, contract, hash, and timing rules.
 
@@ -98,6 +143,16 @@ def validate_review_receipt(
     task_id = (receipt.get("task_id") or "").strip()
     if not task_id:
         return False, "missing_task_id", {"error": "task_id is required"}
+
+    if store is not None:
+        try:
+            t = store.get_task(task_id)
+            if not t:
+                return False, "rejected_unknown_task", {
+                    "error": f"task_id '{task_id}' not found in store",
+                }
+        except Exception:
+            pass
 
     head_session = (receipt.get("head_session_id") or receipt.get("author_session_id") or "").strip()
     reviewer_info = receipt.get("reviewer") or {}
@@ -186,6 +241,15 @@ def validate_review_receipt(
                     "error": f"report file mtime ({mtime}) predates reviewer start ({started_at})",
                 }
 
+        # Verify report modification time does not postdate reviewer completion
+        if completed_at:
+            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            # Allow up to 5 seconds clock skew / file sync
+            if (mtime - completed_at).total_seconds() > 5.0:
+                return False, "rejected_temporal_inconsistency", {
+                    "error": f"report file mtime ({mtime}) postdates reviewer completion ({completed_at})",
+                }
+
     # 7. Git Source Pin Verification
     source_commit = (receipt.get("source_commit") or "").strip()
     source_repo = receipt.get("source_repo")
@@ -202,6 +266,28 @@ def validate_review_receipt(
                 return False, "rejected_source_mismatch", {
                     "error": f"source_commit '{source_commit}' does not exist in repo {source_repo}",
                 }
+            if started_at:
+                commit_ts_res = subprocess.run(
+                    ["git", "-C", str(repo_path), "log", "-1", "--format=%ct", source_commit],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if commit_ts_res.returncode == 0 and commit_ts_res.stdout.strip().isdigit():
+                    commit_dt = datetime.fromtimestamp(int(commit_ts_res.stdout.strip()), tz=timezone.utc)
+                    if (commit_dt - started_at).total_seconds() > 2.0:
+                        return False, "rejected_temporal_inconsistency", {
+                            "error": f"source_commit authoring time ({commit_dt}) postdates reviewer start ({started_at})",
+                        }
+
+    # 8. Runtime Witness Attestation Check (Optional)
+    if require_witness:
+        is_witnessed, witness_status, witness_details = check_runtime_witness(reviewer_info)
+        if not is_witnessed:
+            return False, "rejected_missing_runtime_witness", {
+                "error": "Runtime witness required but no valid systemd unit or aplexer session found",
+                "witness_details": witness_details,
+            }
 
     # If verdict is REJECT or CHANGES_REQUESTED, receipt is valid but not accepted
     if verdict != "ACCEPT":

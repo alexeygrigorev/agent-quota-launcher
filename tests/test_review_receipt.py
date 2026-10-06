@@ -188,6 +188,61 @@ class TestReviewReceiptValidation(unittest.TestCase):
         self.assertEqual(history[1]["status"], "rejected_forced_prompt")
         self.assertEqual(history[2]["status"], "accepted")
 
+    def test_temporal_inconsistency_report_postdates_reviewer_completion(self):
+        """Report modified after review completed must be rejected (detecting post-completion tampering)."""
+        now = datetime.now(timezone.utc)
+        future_time = (now + timedelta(seconds=60)).timestamp()
+        os.utime(self.report_file, (future_time, future_time))
+
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            started_at=(now - timedelta(seconds=120)).isoformat(),
+            completed_at=(now - timedelta(seconds=10)).isoformat(),
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_temporal_inconsistency")
+        self.assertIn("postdates reviewer completion", details["error"])
+
+    def test_unknown_task_in_store_rejection(self):
+        """When store is provided, unknown task_id must be rejected."""
+        receipt = dict(self.base_receipt, task_id="nonexistent-task-uuid")
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_unknown_task")
+        self.assertIn("not found in store", details["error"])
+
+    def test_runtime_witness_verification(self):
+        """Runtime witness requirement must verify systemd or aplexer traces."""
+        # Nonexistent unit and session must fail when require_witness=True
+        fake_receipt = dict(self.base_receipt)
+        fake_receipt["reviewer"] = dict(
+            fake_receipt["reviewer"],
+            unit_name="nonexistent-agent-unit-xyz.service",
+            session_id="00000000-0000-0000-0000-000000000000",
+        )
+        accepted, status, details = validate_review_receipt(
+            fake_receipt, verify_files=True, verify_git=False, require_witness=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_runtime_witness")
+
+    def test_cli_load_receipt_arg_long_inline_json(self):
+        """load_receipt_arg must safely parse inline JSON strings > 255 chars without OSError."""
+        from launcher.cli import load_receipt_arg
+        long_receipt = dict(self.base_receipt)
+        long_receipt["review_prompt"] = "A" * 500  # length > 500 chars
+        raw_json = json.dumps(long_receipt)
+        self.assertGreater(len(raw_json), 255)
+        parsed = load_receipt_arg(raw_json)
+        self.assertEqual(parsed["task_id"], "test-task-1")
+        self.assertEqual(len(parsed["review_prompt"]), 500)
+
 
 if __name__ == "__main__":
     unittest.main()
