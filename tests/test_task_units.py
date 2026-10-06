@@ -227,11 +227,25 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         self.assertIn("TasksMax=100", cmd)
         self.assertIn("-E", cmd)
         self.assertIn("TMPDIR=/repo/.local/tmp/t1", cmd)
+        self.assertTrue(any(arg.startswith("PATH=") for arg in cmd))
+        self.assertTrue(any(arg.startswith("HOME=") for arg in cmd))
+        self.assertTrue(any(arg.startswith("USER=") for arg in cmd))
         self.assertIn("--", cmd)
         self.assertEqual(cmd[-3:], ["python3", "worker.py", "--arg"])
 
         # Crucial architectural assertion: NEVER use --scope!
         self.assertNotIn("--scope", cmd)
+
+    def test_build_systemd_run_argv_propagates_extra_env(self):
+        cmd = build_systemd_run_argv(
+            unit_name="agent-task-t1.service",
+            command_argv=["python3", "worker.py"],
+            memory_mb=768,
+            tmpdir="/repo/.local/tmp/t1",
+            extra_env={"CUSTOM_KEY": "CUSTOM_VAL", "FOO": "BAR"},
+        )
+        self.assertIn("CUSTOM_KEY=CUSTOM_VAL", cmd)
+        self.assertIn("FOO=BAR", cmd)
 
     def test_build_systemd_run_argv_requires_service_suffix(self):
         with self.assertRaises(TaskUnitAdmissionError):

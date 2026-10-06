@@ -238,6 +238,7 @@ def build_systemd_run_argv(
     stderr_path: Optional[str] = None,
     wait: bool = False,
     slice_name: str = "app.slice",
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Construct systemd-run invocation for a detached transient service unit.
 
@@ -264,6 +265,37 @@ def build_systemd_run_argv(
         "-E", f"TEMP={tmpdir}",
         "-E", f"TMP={tmpdir}",
     ])
+
+    # Propagate standard execution PATH, HOME, USER to transient unit
+    path_entries = [
+        "/home/alexey/.local/bin",
+        "/home/alexey/.nvm/versions/node/v24.13.1/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    current_path = os.environ.get("PATH", "")
+    if current_path:
+        for p in current_path.split(":"):
+            if p and p not in path_entries and os.path.isdir(p):
+                path_entries.append(p)
+    unit_path = ":".join(path_entries)
+
+    argv.extend([
+        "-E", f"PATH={unit_path}",
+        "-E", f"HOME={os.environ.get('HOME', '/home/alexey')}",
+        "-E", f"USER={os.environ.get('USER', 'alexey')}",
+    ])
+
+    # Propagate ZCode runtime environment if present
+    zcode_cjs = os.environ.get("ZCODE_CJS", "/opt/ZCode/resources/glm/zcode.cjs")
+    if os.path.exists(zcode_cjs):
+        argv.extend(["-E", f"ZCODE_CJS={zcode_cjs}"])
+
+    if extra_env:
+        for k, v in extra_env.items():
+            if k and v is not None:
+                argv.extend(["-E", f"{k}={v}"])
     if workspace:
         ws_path = Path(workspace).resolve()
         if not ws_path.is_dir():
