@@ -31,7 +31,14 @@ def init(args):
 def submit(args):
     store = get_store(args)
     payload = json.loads(args.payload)
-    task_id = store.submit_task(args.id, args.key, payload, args.paths)
+    paths_arg = args.paths or []
+    normalized_paths = []
+    for p_arg in paths_arg:
+        for p in p_arg.split(','):
+            stripped = p.strip()
+            if stripped:
+                normalized_paths.append(stripped)
+    task_id = store.submit_task(args.id, args.key, payload, normalized_paths)
     print(f"submitted: {task_id}")
     return 0
 

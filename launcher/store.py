@@ -164,6 +164,14 @@ class Store:
         if not payload.get("owner") or not payload.get("cwd") or not payload.get("timeout"):
             raise ValueError("Missing owner/cwd/timeout in payload")
 
+        normalized_paths = []
+        if paths:
+            for p_arg in paths:
+                for p in str(p_arg).split(','):
+                    stripped = p.strip()
+                    if stripped:
+                        normalized_paths.append(stripped)
+
         payload_str = json.dumps(payload, sort_keys=True)
 
         with self.transaction() as conn:
@@ -177,13 +185,13 @@ class Store:
                     raise ValueError("Conflicting payload for idempotency key")
 
             active_paths = self.get_active_paths(conn)
-            self.check_path_overlap(paths, active_paths)
+            self.check_path_overlap(normalized_paths, active_paths)
 
             conn.execute(
                 "INSERT INTO tasks (id, idempotency_key, payload, state) VALUES (?, ?, ?, ?)",
                 (task_id, idempotency_key, payload_str, "queued")
             )
-            for p in paths:
+            for p in normalized_paths:
                 conn.execute("INSERT INTO task_paths (task_id, path) VALUES (?, ?)", (task_id, str(Path(p).resolve())))
 
             conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, memory_mb, disk_mb))
@@ -241,18 +249,22 @@ class Store:
             cursor = conn.execute(query, params)
             for row in cursor.fetchall():
                 task_id, mem, disk = row
-                res = subprocess.run(["aplexer", "status", run_tag_for(task_id), "--json"],
-                                     capture_output=True, text=True, timeout=15)
-                if res.returncode == 0:
-                    try:
-                        info = self._extract_json(res.stdout)
-                        if info.get("phase") in ["running", "starting", "working", "launching"]:
+                try:
+                    res = subprocess.run(["aplexer", "status", run_tag_for(task_id), "--json"],
+                                         capture_output=True, text=True, timeout=15)
+                    if res.returncode == 0:
+                        try:
+                            info = self._extract_json(res.stdout)
+                            if info.get("phase") in ["running", "starting", "working", "launching"]:
+                                total_mem += (mem or 0)
+                                total_disk += (disk or 0)
+                        except Exception:
                             total_mem += (mem or 0)
                             total_disk += (disk or 0)
-                    except Exception:
+                    else:
                         total_mem += (mem or 0)
                         total_disk += (disk or 0)
-                else:
+                except FileNotFoundError:
                     total_mem += (mem or 0)
                     total_disk += (disk or 0)
 

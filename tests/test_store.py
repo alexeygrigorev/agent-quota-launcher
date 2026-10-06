@@ -24,6 +24,29 @@ class TestStore(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.submit_task("t3", "key1", payload_diff, [])
 
+    def test_path_normalization(self):
+        with tempfile.TemporaryDirectory() as d:
+            dir_path = Path(d)
+            p1 = dir_path / "a"
+            p2 = dir_path / "b"
+            p3 = dir_path / "c"
+            
+            # submit with comma-separated paths and multiple arguments
+            self.store.submit_task("t1", "key1", PAYLOAD, [f" {p1} , {p2} ", f"{p3}"])
+            
+            # verify they are stored as distinct rows in task_paths
+            with self.store.get_conn() as conn:
+                cursor = conn.execute("SELECT path FROM task_paths WHERE task_id = 't1'")
+                stored_paths = {row[0] for row in cursor.fetchall()}
+            
+            self.assertEqual(stored_paths, {str(p1.resolve()), str(p2.resolve()), str(p3.resolve())})
+            
+            # verify overlap conflict with one of the comma-separated paths
+            p1_sub = p1 / "sub"
+            with self.assertRaises(ValueError) as ctx:
+                self.store.submit_task("t2", "key2", PAYLOAD, [str(p1_sub)])
+            self.assertIn("Path overlap", str(ctx.exception))
+
     def test_path_overlap(self):
         with tempfile.TemporaryDirectory() as d:
             dir_path = Path(d)
