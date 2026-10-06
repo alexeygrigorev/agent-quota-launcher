@@ -69,8 +69,9 @@ class TestStructuredTelemetry(unittest.TestCase):
             events = extract_telemetry_events(stdout_path)
             self.assertEqual(len(events), 6)
 
-            tools = parse_tool_events(events)
+            tools, raw_count = parse_tool_events(events)
             self.assertEqual(len(tools), 2)
+            self.assertEqual(raw_count, 2)
             self.assertEqual(tools[0]["tool_name"], "write_to_file")
             self.assertEqual(tools[0]["state"], "DONE")
             self.assertEqual(tools[0]["duration_seconds"], 0.05)
@@ -88,8 +89,9 @@ class TestStructuredTelemetry(unittest.TestCase):
             )
             events = extract_telemetry_events(stdout_path)
             self.assertEqual(events, [])
-            tools = parse_tool_events(events)
+            tools, raw_count = parse_tool_events(events)
             self.assertEqual(tools, [])
+            self.assertEqual(raw_count, 0)
 
     def test_execute_transient_task_unit_preserves_telemetry_alongside_artifact(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

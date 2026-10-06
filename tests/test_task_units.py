@@ -32,6 +32,7 @@ from launcher.task_units import (
     spawn_transient_task_unit,
     timeout_output_text,
     verify_task_unit_cleanup,
+    parse_tool_events,
 )
 
 
@@ -838,3 +839,50 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestParseToolEvents(unittest.TestCase):
+    def test_parse_tool_events_deduplicates_paired_events(self):
+        events = [
+            {"step_update": {"step_type": "tool", "tool_name": "t1", "state": "ACTIVE", "step_index": 1}},
+            {"step_update": {"step_type": "tool", "tool_name": "t1", "state": "DONE", "step_index": 1, "duration_seconds": 1.5}},
+            {"step_update": {"step_type": "tool", "tool_name": "t2", "state": "ACTIVE", "step_index": 2}},
+        ]
+        distinct, raw_count = parse_tool_events(events)
+        self.assertEqual(raw_count, 3)
+        self.assertEqual(len(distinct), 2)
+        self.assertEqual(distinct[0]["tool_name"], "t1")
+        self.assertEqual(distinct[0]["state"], "DONE")
+        self.assertEqual(distinct[0]["duration_seconds"], 1.5)
+        self.assertEqual(distinct[1]["tool_name"], "t2")
+        self.assertEqual(distinct[1]["state"], "ACTIVE")
+
+    def test_parse_tool_events_handles_single_tool_use(self):
+        events = [
+            {"type": "tool_use", "name": "t3", "input": {}},
+            {"step_update": {"step_type": "tool", "tool_name": "t4", "state": "DONE", "step_index": 5}}
+        ]
+        distinct, raw_count = parse_tool_events(events)
+        self.assertEqual(raw_count, 2)
+        self.assertEqual(len(distinct), 2)
+        self.assertEqual(distinct[0]["tool_name"], "t3")
+        self.assertEqual(distinct[0]["state"], "DONE")
+        self.assertEqual(distinct[1]["tool_name"], "t4")
+        self.assertEqual(distinct[1]["step_index"], 5)
+
+    def test_parse_tool_events_handles_malformed_and_unindexed_streams(self):
+        events = [
+            {"step_update": {"step_type": "tool", "tool_name": "t1", "state": "ACTIVE"}},
+            {"step_update": {"step_type": "tool", "tool_name": "t1", "state": "DONE"}},
+            {"step_update": {"step_type": "tool", "tool_name": "t2", "state": "ACTIVE"}},
+            {"step_update": {"step_type": "tool", "tool_name": "t2", "state": "ACTIVE"}},
+            {"unknown_format": True}
+        ]
+        distinct, raw_count = parse_tool_events(events)
+        self.assertEqual(raw_count, 4)
+        self.assertEqual(len(distinct), 3)
+        self.assertEqual(distinct[0]["tool_name"], "t1")
+        self.assertEqual(distinct[0]["state"], "DONE")
+        self.assertEqual(distinct[1]["tool_name"], "t2")
+        self.assertEqual(distinct[1]["state"], "ACTIVE")
+        self.assertEqual(distinct[2]["tool_name"], "t2")
+        self.assertEqual(distinct[2]["state"], "ACTIVE")

@@ -701,7 +701,7 @@ def execute_transient_task_unit(
 
     # 6. Extract genuine structured telemetry events (no synthesized events)
     events = extract_telemetry_events(stdout_log)
-    tool_calls = parse_tool_events(events)
+    tool_calls, raw_tool_events_count = parse_tool_events(events)
     first_tool = tool_calls[0] if tool_calls else None
 
     result_info = None
@@ -750,6 +750,7 @@ def execute_transient_task_unit(
         "telemetry_events_path": str(events_artifact) if events else None,
         "log_telemetry_path": str(log_events_path) if events else None,
         "tool_calls_count": len(tool_calls),
+        "tool_events_count": raw_tool_events_count,
         "first_tool": first_tool,
         "model_status": result_info.get("status") if result_info else None,
         "usage": result_info.get("usage") if result_info else None,
@@ -788,9 +789,9 @@ def extract_telemetry_events(stdout_path: Path) -> List[Dict[str, Any]]:
     return events
 
 
-def parse_tool_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Extract genuine tool-call events from structured event stream."""
-    tool_calls = []
+def parse_tool_events(events: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Extract distinct tool-call events and the total count of raw tool events from stream."""
+    raw_tools = []
     for ev in events:
         step = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else ev
         if (
@@ -806,15 +807,55 @@ def parse_tool_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "duration_seconds": step.get("duration_seconds"),
                 "tool_info": step.get("tool_info"),
             }
-            tool_calls.append(tool_entry)
+            raw_tools.append(tool_entry)
         elif ev.get("type") in ("tool_use", "tool_call"):
             tool_entry = {
                 "tool_name": ev.get("name") or ev.get("tool_name"),
                 "state": ev.get("state", "DONE"),
                 "parameters": ev.get("parameters") or ev.get("input"),
             }
-            tool_calls.append(tool_entry)
-    return tool_calls
+            raw_tools.append(tool_entry)
+
+    distinct = []
+    seen_indices = set()
+    indexed = {}
+    for tc in raw_tools:
+        idx = tc.get("step_index")
+        if idx is not None:
+            if idx not in indexed:
+                indexed[idx] = []
+            indexed[idx].append(tc)
+
+    i = 0
+    while i < len(raw_tools):
+        tc = raw_tools[i]
+        idx = tc.get("step_index")
+        if idx is not None:
+            if idx not in seen_indices:
+                seen_indices.add(idx)
+                best = tc
+                for c in indexed[idx]:
+                    if c.get("state") == "DONE":
+                        best = c
+                        break
+                distinct.append(best)
+            i += 1
+        else:
+            state = tc.get("state")
+            if state == "ACTIVE":
+                found_done = False
+                for j in range(i + 1, len(raw_tools)):
+                    future = raw_tools[j]
+                    if future.get("step_index") is None and future.get("tool_name") == tc.get("tool_name") and future.get("state") == "DONE":
+                        found_done = True
+                        break
+                if not found_done:
+                    distinct.append(tc)
+            else:
+                distinct.append(tc)
+            i += 1
+
+    return distinct, len(raw_tools)
 
 
 def spawn_transient_task_unit(

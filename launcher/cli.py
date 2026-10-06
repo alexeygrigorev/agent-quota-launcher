@@ -107,7 +107,7 @@ def controller_unit_name(task_id: str) -> str:
     return f"ql-ctl-{safe}.service"
 
 
-def spawn_ql_controller(args) -> int:
+def spawn_ql_controller(args, return_dict=False):
     """Place the proven blocking public CLI in a sibling app.slice unit.
 
     Inner process still uses execute_transient_task_unit(--wait) so ExecMainStatus
@@ -135,19 +135,26 @@ def spawn_ql_controller(args) -> int:
     ]
     res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
     if res.returncode != 0:
-        print(json.dumps({
+        err_res = {
             "error": f"ql-ctl spawn failed rc={res.returncode}",
             "stderr": (res.stderr or "")[:400],
             "task_id": args.id,
-        }))
+        }
+        if return_dict:
+            return err_res
+        print(json.dumps(err_res))
         return 1
-    print(json.dumps({
+    
+    success_res = {
         "backend": "task-units",
         "detached_controller": True,
         "controller_unit": unit,
         "task_id": args.id,
         "state": "queued-or-starting",
-    }))
+    }
+    if return_dict:
+        return success_res
+    print(json.dumps(success_res))
     return 0
 
 
@@ -335,9 +342,93 @@ def run_task_units(args):
     return 1
 
 
+def request(args):
+    import uuid
+    from launcher.task_profiles import resolve_task_bounds, validate_source_commit
+
+    store = get_store(args)
+    task_id = args.id or f"task-{uuid.uuid4().hex[:8]}"
+    idem_key = getattr(args, 'key', None) or str(uuid.uuid4())
+    cwd = args.cwd or os.getcwd()
+    
+    payload = {
+        "goal": args.goal,
+        "cwd": cwd,
+        "owner": os.environ.get("USER", "alexey")
+    }
+    if args.profile:
+        payload["profile"] = args.profile
+    if args.memory_mb:
+        payload["memory_mb"] = args.memory_mb
+    if args.timeout:
+        payload["timeout"] = args.timeout
+
+    bounds = resolve_task_bounds(payload)
+    
+    source_receipt = None
+    if args.target_commit or args.target_worktree:
+        try:
+            source_receipt = validate_source_commit(
+                repo_path=args.target_worktree or cwd,
+                commit_ref=args.target_commit or "HEAD",
+                require_clean=False
+            )
+            payload["source_receipt"] = source_receipt
+        except Exception as e:
+            print(json.dumps({"error": f"Source validation failed: {e}"}))
+            return 1
+
+    paths_arg = args.paths or []
+    normalized_paths = []
+    for p_arg in paths_arg:
+        for p in p_arg.split(','):
+            stripped = p.strip()
+            if stripped:
+                normalized_paths.append(stripped)
+
+    # Submit task
+    store.submit_task(task_id, idem_key, payload, normalized_paths)
+    
+    # Spawn controller
+    class SpawnArgs:
+        def __init__(self, t_id, t_cwd, t_config_dir):
+            self.id = t_id
+            self.cwd = t_cwd
+            self.tmpdir = None
+            self.config_dir = t_config_dir
+    spawn_args = SpawnArgs(task_id, cwd, getattr(args, 'config_dir', None))
+    
+    ctrl_res = spawn_ql_controller(spawn_args, return_dict=True)
+    
+    if "error" in ctrl_res:
+        print(json.dumps(ctrl_res))
+        return 1
+
+    out = {
+        "task_id": task_id,
+        "controller_unit": ctrl_res["controller_unit"],
+        "status": ctrl_res["state"],
+        "profile": bounds,
+        "timeout": bounds["timeout"],
+    }
+    if source_receipt:
+        out["source_receipt"] = source_receipt
+        
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def status(args):
     store = get_store(args)
-    print(json.dumps(store.list_tasks(), indent=2))
+    if getattr(args, 'id', None):
+        task = store.get_task(args.id)
+        if task:
+            print(json.dumps(task, indent=2))
+        else:
+            print(json.dumps({"error": f"unknown task {args.id}"}))
+            return 1
+    else:
+        print(json.dumps(store.list_tasks(), indent=2))
     return 0
 
 
@@ -674,7 +765,20 @@ def main():
     )
     parser_run.set_defaults(func=run)
 
+    parser_request = subparsers.add_parser("request", help="one-command admission, validation, and execution")
+    parser_request.add_argument("--goal", required=True, help="Task goal/prompt")
+    parser_request.add_argument("--cwd", help="Task working directory")
+    parser_request.add_argument("--target-commit", help="Target commit SHA to validate")
+    parser_request.add_argument("--target-worktree", help="Path to worktree to validate commit")
+    parser_request.add_argument("--profile", help="Task profile")
+    parser_request.add_argument("--memory-mb", type=int, help="Memory override")
+    parser_request.add_argument("--timeout", type=float, help="Timeout override")
+    parser_request.add_argument("--paths", action="append", default=[])
+    parser_request.add_argument("--id", help="Explicit task ID")
+    parser_request.set_defaults(func=request)
+
     parser_status = subparsers.add_parser("status", help="show task/lifecycle")
+    parser_status.add_argument("--id", help="show structured status for specific task")
     parser_status.set_defaults(func=status)
 
     parser_complete = subparsers.add_parser("complete",
