@@ -12,6 +12,8 @@ from launcher.resources import check_disk_pressure
 from launcher.store import Store, launch_lock
 from launcher.tags import run_tag_for
 
+DEFAULT_CLEANUP_TIMEOUT_SEC = 600
+
 CLEANUP_PAYLOAD = {
     "goal": (
         "Prune expired scratch/temporary files in .local/tmp/. "
@@ -21,7 +23,7 @@ CLEANUP_PAYLOAD = {
     "cwd": "/home/alexey/git/cloudflare-agent-git",
     "tmpdir": "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup",
     "owner": "ant-head-continuation-resume-20261005",
-    "timeout": 120,
+    "timeout": DEFAULT_CLEANUP_TIMEOUT_SEC,
     "model_requirements": {"provider": "antigravity"},
 }
 
@@ -228,10 +230,14 @@ def watch_loop(args, max_passes=None):
                 cleanup_key = f"disk-pressure-cleanup-{ep}"
                 cleanup_id = cleanup_key
                 try:
+                    payload = dict(CLEANUP_PAYLOAD)
+                    cleanup_to = getattr(args, "cleanup_timeout", None)
+                    if cleanup_to is not None:
+                        payload["timeout"] = float(cleanup_to)
                     store.submit_task(
                         task_id=cleanup_id,
                         idempotency_key=cleanup_key,
-                        payload=CLEANUP_PAYLOAD,
+                        payload=payload,
                         paths=[],
                     )
                     print(f"watcher: disk pressure detected ({pressure_info.get('free_bytes')} B); enqueued cleanup task {cleanup_id}")

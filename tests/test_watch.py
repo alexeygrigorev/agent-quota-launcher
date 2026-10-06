@@ -308,7 +308,7 @@ class WatchRefillTests(unittest.TestCase):
             self.assertEqual(payload["cwd"], "/home/alexey/git/cloudflare-agent-git")
             self.assertEqual(payload["tmpdir"], "/home/alexey/git/cloudflare-agent-git/.local/tmp/cleanup")
             self.assertEqual(payload["owner"], "ant-head-continuation-resume-20261005")
-            self.assertEqual(payload["timeout"], 120)
+            self.assertEqual(payload["timeout"], 600)
             self.assertEqual(payload["model_requirements"], {"provider": "antigravity"})
             self.assertEqual(cleanup_task["state"], "queued")
 
