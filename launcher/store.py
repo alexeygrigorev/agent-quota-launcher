@@ -31,6 +31,23 @@ CREATE TABLE IF NOT EXISTS task_resources (
     disk_mb INTEGER,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
+
+CREATE TABLE IF NOT EXISTS review_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    source_commit TEXT,
+    source_repo TEXT,
+    reviewer_session TEXT NOT NULL,
+    reviewer_model TEXT,
+    head_session TEXT NOT NULL,
+    review_prompt TEXT,
+    report_path TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # States that hold RAM/disk reservations: live or possibly-live launches.
@@ -278,6 +295,61 @@ class Store:
             return [
                 {"id": r[0], "state": r[1], "created_at": r[2], "updated_at": r[3],
                  "reviewer": r[4], "reason": r[5]}
+                for r in cursor.fetchall()
+            ]
+
+    def add_review_receipt(self, receipt: dict, status: str, details: dict = None):
+        """Record review receipt into review_receipts table preserving negative history."""
+        reviewer = receipt.get("reviewer") or {}
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_receipts (
+                    task_id, source_commit, source_repo, reviewer_session,
+                    reviewer_model, head_session, review_prompt, report_path,
+                    report_sha256, verdict, status, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt.get("task_id"),
+                    receipt.get("source_commit"),
+                    receipt.get("source_repo"),
+                    reviewer.get("session_id", ""),
+                    reviewer.get("model", ""),
+                    receipt.get("head_session_id", ""),
+                    receipt.get("review_prompt", ""),
+                    receipt.get("report_path", ""),
+                    receipt.get("report_sha256", ""),
+                    receipt.get("verdict", ""),
+                    status,
+                    json.dumps(details or {}),
+                ),
+            )
+
+    def list_review_receipts(self, task_id: str = None):
+        """Retrieve review receipts ordered by creation time."""
+        with self.get_conn() as conn:
+            if task_id:
+                cursor = conn.execute(
+                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at FROM review_receipts WHERE task_id = ? ORDER BY created_at",
+                    (task_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at FROM review_receipts ORDER BY created_at"
+                )
+            return [
+                {
+                    "id": r[0],
+                    "task_id": r[1],
+                    "source_commit": r[2],
+                    "reviewer_session": r[3],
+                    "reviewer_model": r[4],
+                    "verdict": r[5],
+                    "status": r[6],
+                    "details": json.loads(r[7]) if r[7] else {},
+                    "created_at": r[8],
+                }
                 for r in cursor.fetchall()
             ]
 
