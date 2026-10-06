@@ -172,6 +172,48 @@ class TestResources(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stage 50 capacity exceeded"):
             check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50)
 
+    def test_evaluate_stage_capacity_human_ram_override(self):
+        from launcher.resources import evaluate_stage_capacity
+        # Remaining below 3GiB, but > 0
+        mem = 15 * 1024 * 1024 * 1024  # 15 GiB
+        # target_stage 50 typical needs ~23.92 GiB, which is > 15 GiB. So it will be < 0 remaining.
+        # Let's try mem = 25 GiB. target_stage 50 needs 23.92 GiB. Remaining is ~1.08 GiB.
+        mem_25 = 25 * 1024 * 1024 * 1024
+        
+        # ignore_ram=False (strict 3GiB reserve) -> not feasible
+        res_strict = evaluate_stage_capacity(50, mem_available_bytes=mem_25, ignore_ram=False)
+        self.assertFalse(res_strict["feasible"])
+        self.assertFalse(res_strict["human_ram_override_active"])
+        
+        # ignore_ram=True (no 3GiB reserve) -> feasible because remaining > 0
+        res_override = evaluate_stage_capacity(50, mem_available_bytes=mem_25, ignore_ram=True)
+        self.assertTrue(res_override["feasible"])
+        self.assertTrue(res_override["human_ram_override_active"])
+        
+        # environmental variable fallback check
+        with patch.dict('os.environ', {"HUMAN_RAM_OVERRIDE": "1"}):
+            res_env = evaluate_stage_capacity(50, mem_available_bytes=mem_25)
+            self.assertTrue(res_env["feasible"])
+            self.assertTrue(res_env["human_ram_override_active"])
+
+    def test_check_resources_human_ram_override(self):
+        from launcher.resources import check_resources
+        # memory patch gives 15 GiB. 
+        # Stage 50 needs ~23.92 GiB. So if we want remaining > 0, 15 GiB won't cut it.
+        # We need a custom patch for check_resources.
+        import launcher.resources as res
+        with patch.object(res, 'get_mem_available', return_value=25 * 1024 * 1024 * 1024):
+            # Normally (no override) it fails
+            with self.assertRaisesRegex(ValueError, "stage 50 capacity exceeded"):
+                check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50)
+                
+            # With ignore_ram=True it passes
+            self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50, ignore_ram=True))
+            
+            # With ENV var it passes
+            with patch.dict('os.environ', {"HUMAN_RAM_OVERRIDE": "1"}):
+                self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50))
+
     def test_disk_floor(self):
         with patch('shutil.disk_usage', return_value=DiskUsage(21 * GiB)):
             with self.assertRaisesRegex(ValueError, "free < 20GiB"):
