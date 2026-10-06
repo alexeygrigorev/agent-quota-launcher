@@ -10,6 +10,98 @@ MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
 WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
 MAX_DISK_SPIKE_BYTES = 512 * 1024 * 1024
 
+STAGE_1_CONCURRENCY = 10
+STAGE_2_CONCURRENCY = 25
+STAGE_3_CONCURRENCY = 50
+STAGES = (10, 25, 50)
+TYPICAL_WORKER_RSS_BYTES = 350 * 1024 * 1024  # 350 MiB empirical
+MAX_WORKER_RSS_BYTES = 768 * 1024 * 1024      # 768 MiB (cgroup limit)
+CONTROLLER_RSS_BYTES = 140 * 1024 * 1024      # 140 MiB
+MIN_HOST_RESERVE_RAM_BYTES = 3 * 1024 * 1024 * 1024  # 3 GiB host headroom
+
+def estimate_stage_memory_bytes(concurrency: int, peak: bool = False) -> int:
+    worker_mem = MAX_WORKER_RSS_BYTES if peak else TYPICAL_WORKER_RSS_BYTES
+    return concurrency * (worker_mem + CONTROLLER_RSS_BYTES)
+
+def evaluate_stage_capacity(concurrency: int = 10, current_active: int = 0, mem_available_bytes: int = None, peak: bool = False) -> dict:
+    if mem_available_bytes is None:
+        mem_available_bytes = get_mem_available()
+    
+    needed_workers = max(0, concurrency - current_active)
+    projected_needed_bytes = estimate_stage_memory_bytes(needed_workers, peak)
+    remaining_after_stage_bytes = mem_available_bytes - projected_needed_bytes
+    feasible = remaining_after_stage_bytes >= MIN_HOST_RESERVE_RAM_BYTES
+    recommendation = "proceed" if feasible else "scale_down"
+    
+    return {
+        "target_stage": concurrency,
+        "feasible": feasible,
+        "projected_needed_bytes": projected_needed_bytes,
+        "projected_needed_gib": projected_needed_bytes / (1024**3),
+        "mem_available_bytes": mem_available_bytes,
+        "mem_available_gib": mem_available_bytes / (1024**3),
+        "remaining_after_stage_bytes": remaining_after_stage_bytes,
+        "remaining_after_stage_gib": remaining_after_stage_bytes / (1024**3),
+        "peak_estimate": peak,
+        "recommendation": recommendation,
+    }
+
+def get_max_feasible_stage(mem_available_bytes: int = None, peak: bool = False) -> int:
+    if mem_available_bytes is None:
+        mem_available_bytes = get_mem_available()
+    for stage in (50, 25, 10):
+        cap = evaluate_stage_capacity(concurrency=stage, current_active=0, mem_available_bytes=mem_available_bytes, peak=peak)
+        if cap["feasible"]:
+            return stage
+    return 0
+
+
+STAGE_1_CONCURRENCY = 10
+STAGE_2_CONCURRENCY = 25
+STAGE_3_CONCURRENCY = 50
+STAGES = (10, 25, 50)
+TYPICAL_WORKER_RSS_BYTES = 350 * 1024 * 1024  # 350 MiB empirical
+MAX_WORKER_RSS_BYTES = 768 * 1024 * 1024      # 768 MiB (cgroup limit)
+CONTROLLER_RSS_BYTES = 140 * 1024 * 1024      # 140 MiB
+MIN_HOST_RESERVE_RAM_BYTES = 3 * 1024 * 1024 * 1024  # 3 GiB host headroom
+
+def estimate_stage_memory_bytes(concurrency: int, peak: bool = False) -> int:
+    worker_mem = MAX_WORKER_RSS_BYTES if peak else TYPICAL_WORKER_RSS_BYTES
+    return concurrency * (worker_mem + CONTROLLER_RSS_BYTES)
+
+def evaluate_stage_capacity(concurrency: int = 10, current_active: int = 0, mem_available_bytes: int = None, peak: bool = False) -> dict:
+    if mem_available_bytes is None:
+        mem_available_bytes = get_mem_available()
+    
+    needed_workers = max(0, concurrency - current_active)
+    projected_needed_bytes = estimate_stage_memory_bytes(needed_workers, peak)
+    remaining_after_stage_bytes = mem_available_bytes - projected_needed_bytes
+    feasible = remaining_after_stage_bytes >= MIN_HOST_RESERVE_RAM_BYTES
+    recommendation = "proceed" if feasible else "scale_down"
+    
+    return {
+        "target_stage": concurrency,
+        "feasible": feasible,
+        "projected_needed_bytes": projected_needed_bytes,
+        "projected_needed_gib": projected_needed_bytes / (1024**3),
+        "mem_available_bytes": mem_available_bytes,
+        "mem_available_gib": mem_available_bytes / (1024**3),
+        "remaining_after_stage_bytes": remaining_after_stage_bytes,
+        "remaining_after_stage_gib": remaining_after_stage_bytes / (1024**3),
+        "peak_estimate": peak,
+        "recommendation": recommendation,
+    }
+
+def get_max_feasible_stage(mem_available_bytes: int = None, peak: bool = False) -> int:
+    if mem_available_bytes is None:
+        mem_available_bytes = get_mem_available()
+    for stage in (50, 25, 10):
+        cap = evaluate_stage_capacity(concurrency=stage, current_active=0, mem_available_bytes=mem_available_bytes, peak=peak)
+        if cap["feasible"]:
+            return stage
+    return 0
+
+
 
 def get_mem_available():
     with open('/proc/meminfo') as f:
@@ -31,7 +123,7 @@ def _get_disk_usage(path):
 
 def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     active_mem_mb=0, active_disk_mb=0, repo_root=None,
-                    ignore_ram=None, requested_disk_mb=0):
+                    ignore_ram=None, requested_disk_mb=0, target_stage=None):
     if requested_memory_mb > MAX_WORKER_MEMORY_MB:
         raise ValueError("requested worker memory > 1500MiB")
 
@@ -40,12 +132,17 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
     if ignore_ram is None:
         ignore_ram = os.environ.get("HUMAN_RAM_OVERRIDE", "0") == "1"
 
+    mem_avail = get_mem_available()
     if not ignore_ram:
-        mem_avail = get_mem_available()
         req_mem = requested_memory_mb * 1024 * 1024
         act_mem = active_mem_mb * 1024 * 1024
         if mem_avail - act_mem - req_mem < MIN_MEM_AVAILABLE_BYTES:
             raise ValueError("host MemAvailable < 10GiB")
+
+    if target_stage is not None:
+        cap = evaluate_stage_capacity(concurrency=target_stage, mem_available_bytes=mem_avail)
+        if not cap["feasible"]:
+            raise ValueError(f"stage {target_stage} capacity exceeded")
 
     tmp_path = Path(requested_tmpdir).resolve()
     if tmp_path == Path('/tmp') or tmp_path.parts[:2] == ('/', 'tmp'):

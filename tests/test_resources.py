@@ -97,6 +97,81 @@ class TestResources(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repo root required"):
             check_resources(1000, self.repo, str(self.owned_tmp), repo_root=None)
 
+
+    def test_estimate_stage_memory_bytes(self):
+        from launcher.resources import estimate_stage_memory_bytes
+        # 350 + 140 = 490
+        # 10 * 490 = 4900 MiB = 5138022400 bytes
+        self.assertEqual(estimate_stage_memory_bytes(10), 10 * (350 + 140) * 1024 * 1024)
+        self.assertEqual(estimate_stage_memory_bytes(25), 25 * (350 + 140) * 1024 * 1024)
+        self.assertEqual(estimate_stage_memory_bytes(50), 50 * (350 + 140) * 1024 * 1024)
+        
+        # 768 + 140 = 908
+        self.assertEqual(estimate_stage_memory_bytes(10, peak=True), 10 * (768 + 140) * 1024 * 1024)
+        self.assertEqual(estimate_stage_memory_bytes(50, peak=True), 50 * (768 + 140) * 1024 * 1024)
+
+    def test_evaluate_stage_capacity(self):
+        from launcher.resources import evaluate_stage_capacity
+        # 28 GiB available
+        mem_28 = 28 * 1024 * 1024 * 1024
+        
+        # Stage 50 typical: 50 * 490 MiB = 24500 MiB = 23.92 GiB
+        # Remaining = 28 - 23.92 = 4.08 GiB > 3 GiB (feasible)
+        res_50 = evaluate_stage_capacity(50, mem_available_bytes=mem_28)
+        self.assertTrue(res_50["feasible"])
+        self.assertEqual(res_50["target_stage"], 50)
+        
+        # Stage 50 peak: 50 * 908 MiB = 45400 MiB = 44.33 GiB > 28 GiB (not feasible)
+        res_50_peak = evaluate_stage_capacity(50, mem_available_bytes=mem_28, peak=True)
+        self.assertFalse(res_50_peak["feasible"])
+        
+        # Evaluate throttling with lower mem available (e.g. 15 GiB)
+        mem_15 = 15 * 1024 * 1024 * 1024
+        # Stage 25 typical: 25 * 490 MiB = 12250 MiB = 11.96 GiB
+        # Remaining = 15 - 11.96 = 3.04 GiB > 3 GiB (feasible)
+        res_25 = evaluate_stage_capacity(25, mem_available_bytes=mem_15)
+        self.assertTrue(res_25["feasible"])
+        
+        # Stage 25 peak: 25 * 908 MiB = 22700 MiB = 22.16 GiB (not feasible)
+        res_25_peak = evaluate_stage_capacity(25, mem_available_bytes=mem_15, peak=True)
+        self.assertFalse(res_25_peak["feasible"])
+        
+        # current_active adjustment
+        # Want stage 50, but 30 already active, so we only need 20 more.
+        # 20 * 490 MiB = 9800 MiB = 9.57 GiB
+        # Remaining from 15 = 15 - 9.57 = 5.43 GiB (feasible)
+        res_active = evaluate_stage_capacity(50, current_active=30, mem_available_bytes=mem_15)
+        self.assertTrue(res_active["feasible"])
+
+    def test_get_max_feasible_stage(self):
+        from launcher.resources import get_max_feasible_stage
+        
+        mem_28 = 28 * 1024 * 1024 * 1024
+        self.assertEqual(get_max_feasible_stage(mem_available_bytes=mem_28), 50)
+        
+        mem_15 = 15 * 1024 * 1024 * 1024
+        self.assertEqual(get_max_feasible_stage(mem_available_bytes=mem_15), 25)
+        
+        mem_8 = 8 * 1024 * 1024 * 1024
+        self.assertEqual(get_max_feasible_stage(mem_available_bytes=mem_8), 10)
+        
+        mem_2 = 2 * 1024 * 1024 * 1024
+        self.assertEqual(get_max_feasible_stage(mem_available_bytes=mem_2), 0)
+
+    def test_check_resources_target_stage(self):
+        from launcher.resources import check_resources
+        
+        # 15 GiB MemAvailable. Can support 25 typical, but NOT 50 typical.
+        # Wait, check_resources doesn't pass current_active to evaluate_stage_capacity.
+        
+        # Should pass for target_stage 25
+        # mem_patch is 15 GiB in setUp
+        self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=25))
+        
+        # Should fail for target_stage 50
+        with self.assertRaisesRegex(ValueError, "stage 50 capacity exceeded"):
+            check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50)
+
     def test_disk_floor(self):
         with patch('shutil.disk_usage', return_value=DiskUsage(21 * GiB)):
             with self.assertRaisesRegex(ValueError, "free < 20GiB"):
