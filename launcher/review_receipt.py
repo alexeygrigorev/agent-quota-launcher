@@ -83,44 +83,76 @@ def compute_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def check_runtime_witness(reviewer_info: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+import uuid
+
+def check_runtime_witness(task_id: str, reviewer_info: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     """Check if runtime witness evidence exists for the reviewer (systemd unit, aplexer session)."""
     unit_name = reviewer_info.get("unit_name")
     session_id = reviewer_info.get("session_id")
+    expected_invocation_id = reviewer_info.get("invocation_id")
     witness_details: Dict[str, Any] = {}
 
-    if unit_name:
-        try:
-            res = subprocess.run(
-                ["systemctl", "--user", "status", unit_name],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=3.0,
-            )
-            if res.returncode in (0, 3):  # 0: active, 3: inactive (finished)
-                witness_details["systemd_unit_witnessed"] = True
-                witness_details["unit_name"] = unit_name
-            else:
-                witness_details["systemd_unit_witnessed"] = False
-                witness_details["systemd_unit_returncode"] = res.returncode
-        except Exception as e:
+    if not session_id:
+        return False, "unverified_runtime_witness", {"error": "session_id is required for runtime witness"}
+
+    try:
+        uuid.UUID(str(session_id))
+    except ValueError:
+        return False, "unverified_runtime_witness", {"error": "session_id must be a valid UUID"}
+
+    if not unit_name:
+        return False, "unverified_runtime_witness", {"error": "unit_name is required for runtime witness"}
+
+    if not isinstance(unit_name, str):
+        return False, "unverified_runtime_witness", {"error": "unit_name must be a string"}
+
+    if not re.match(r"^agent-task-[a-zA-Z0-9._-]+\.service$", unit_name):
+        return False, "unverified_runtime_witness", {"error": f"unit_name '{unit_name}' does not match allowed pattern"}
+
+    expected_unit = f"agent-task-{task_id}.service"
+    if unit_name != expected_unit:
+        return False, "unverified_runtime_witness", {"error": f"unit_name '{unit_name}' does not match expected '{expected_unit}'"}
+
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", unit_name, "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+        props = dict(line.split("=", 1) for line in res.stdout.strip().split("\n") if "=" in line)
+        
+        active_state = props.get("ActiveState")
+        sub_state = props.get("SubState")
+        invocation_id = props.get("InvocationID", "")
+        
+        if active_state == "inactive" and sub_state == "dead" and not invocation_id:
             witness_details["systemd_unit_witnessed"] = False
-            witness_details["systemd_unit_error"] = str(e)
-
-    if session_id:
-        aplexer_sock = Path(f"/run/user/{os.getuid()}/aplexer/sessions/{session_id}/control.sock")
-        aplexer_hist = Path(os.path.expanduser(f"~/.local/state/aplexer/sessions/{session_id}/history.bin"))
-        if aplexer_sock.exists() or aplexer_hist.exists():
-            witness_details["aplexer_session_witnessed"] = True
-            witness_details["session_id"] = session_id
+            witness_details["systemd_unit_error"] = "Unit has never run (inactive/dead)"
+        elif expected_invocation_id and expected_invocation_id != invocation_id:
+            witness_details["systemd_unit_witnessed"] = False
+            witness_details["systemd_unit_error"] = f"InvocationID mismatch: expected {expected_invocation_id}, got {invocation_id}"
         else:
-            witness_details["aplexer_session_witnessed"] = False
+            witness_details["systemd_unit_witnessed"] = True
+            witness_details["unit_name"] = unit_name
+            witness_details["active_state"] = active_state
+            witness_details["sub_state"] = sub_state
+            witness_details["invocation_id"] = invocation_id
+    except Exception as e:
+        witness_details["systemd_unit_witnessed"] = False
+        witness_details["systemd_unit_error"] = str(e)
 
-    is_witnessed = any(
-        witness_details.get(k) is True
-        for k in ("systemd_unit_witnessed", "aplexer_session_witnessed")
-    )
+    aplexer_sock = Path(f"/run/user/{os.getuid()}/aplexer/sessions/{session_id}/control.sock")
+    aplexer_hist = Path(os.path.expanduser(f"~/.local/state/aplexer/sessions/{session_id}/history.bin"))
+    if aplexer_sock.exists() or aplexer_hist.exists():
+        witness_details["aplexer_session_witnessed"] = True
+        witness_details["session_id"] = session_id
+    else:
+        witness_details["aplexer_session_witnessed"] = False
+
+    is_witnessed = witness_details.get("systemd_unit_witnessed", False) and witness_details.get("aplexer_session_witnessed", False)
+    
     if not is_witnessed:
         return False, "unverified_runtime_witness", witness_details
     return True, "witnessed", witness_details
@@ -282,7 +314,7 @@ def validate_review_receipt(
 
     # 8. Runtime Witness Attestation Check (Optional)
     if require_witness:
-        is_witnessed, witness_status, witness_details = check_runtime_witness(reviewer_info)
+        is_witnessed, witness_status, witness_details = check_runtime_witness(task_id, reviewer_info)
         if not is_witnessed:
             return False, "rejected_missing_runtime_witness", {
                 "error": "Runtime witness required but no valid systemd unit or aplexer session found",

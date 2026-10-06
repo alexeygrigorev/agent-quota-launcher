@@ -223,11 +223,71 @@ class TestReviewReceiptValidation(unittest.TestCase):
         fake_receipt = dict(self.base_receipt)
         fake_receipt["reviewer"] = dict(
             fake_receipt["reviewer"],
-            unit_name="nonexistent-agent-unit-xyz.service",
+            unit_name=f"agent-task-{fake_receipt['task_id']}.service",
             session_id="00000000-0000-0000-0000-000000000000",
         )
         accepted, status, details = validate_review_receipt(
             fake_receipt, verify_files=True, verify_git=False, require_witness=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_runtime_witness")
+
+    def test_reject_systemd_argument_injection(self):
+        """Reject argument injection like '--help'."""
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            unit_name="--help",
+            session_id="00000000-0000-0000-0000-000000000000",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_witness=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_runtime_witness")
+        self.assertIn("does not match allowed pattern", details["witness_details"]["error"])
+
+    def test_reject_foreign_service_unit(self):
+        """Reject foreign service units like 'dbus.service'."""
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            unit_name="dbus.service",
+            session_id="00000000-0000-0000-0000-000000000000",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_witness=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_runtime_witness")
+        self.assertIn("does not match allowed pattern", details["witness_details"]["error"])
+
+    def test_reject_mismatched_task_unit_name(self):
+        """Reject unit name that does not match task_id."""
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            unit_name="agent-task-different-task.service",
+            session_id="00000000-0000-0000-0000-000000000000",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_witness=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_runtime_witness")
+        self.assertIn("does not match expected", details["witness_details"]["error"])
+
+    def test_reject_mismatched_invocation_id(self):
+        """Reject if InvocationID does not match expected."""
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            unit_name=f"agent-task-{receipt['task_id']}.service",
+            session_id="00000000-0000-0000-0000-000000000000",
+            invocation_id="fake-invocation-id",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_witness=True
         )
         self.assertFalse(accepted)
         self.assertEqual(status, "rejected_missing_runtime_witness")
