@@ -18,7 +18,7 @@ import pathlib
 import subprocess
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 DEFAULT_MAX_CONCURRENT_ZAI = 26
 DEFAULT_COOLDOWN_SEC = 60.0
@@ -139,8 +139,8 @@ def get_live_zai_pids(proc_root: Optional[pathlib.Path] = None) -> List[int]:
     return sorted(set(pids))
 
 
-def _state_paths(config_dir: Optional[pathlib.Path] = None) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    base = config_dir or pathlib.Path(os.path.expanduser("~/.config/agent-quota-launcher"))
+def _state_paths(config_dir: Optional[Union[pathlib.Path, str]] = None) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    base = pathlib.Path(config_dir) if config_dir else pathlib.Path(os.path.expanduser("~/.config/agent-quota-launcher"))
     base.mkdir(parents=True, exist_ok=True)
     lock_file = base / "provider_capacity.lock"
     cooldown_file = base / "provider_cooldown.json"
@@ -148,7 +148,7 @@ def _state_paths(config_dir: Optional[pathlib.Path] = None) -> Tuple[pathlib.Pat
     return lock_file, cooldown_file, res_file
 
 
-def check_cooldown(provider: str = "zai", config_dir: Optional[pathlib.Path] = None,
+def check_cooldown(provider: str = "zai", config_dir: Optional[Union[pathlib.Path, str]] = None,
                    now_ts: Optional[float] = None) -> Tuple[bool, float]:
     """Check if provider is in active backoff cooldown. Returns (is_active, remaining_seconds)."""
     _, cooldown_file, _ = _state_paths(config_dir)
@@ -167,7 +167,7 @@ def check_cooldown(provider: str = "zai", config_dir: Optional[pathlib.Path] = N
 
 
 def record_429_event(provider: str = "zai", retry_after_sec: float = DEFAULT_COOLDOWN_SEC,
-                     reason: str = "429 Rate Limit", config_dir: Optional[pathlib.Path] = None):
+                     reason: str = "429 Rate Limit", config_dir: Optional[Union[pathlib.Path, str]] = None):
     """Record a 429 rate limit event with backoff cooldown for a provider."""
     lock_file, cooldown_file, _ = _state_paths(config_dir)
     now_ts = time.time()
@@ -193,6 +193,17 @@ def record_429_event(provider: str = "zai", retry_after_sec: float = DEFAULT_COO
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def record_cooldown(provider: str = "zai", retry_after_sec: float = DEFAULT_COOLDOWN_SEC,
+                    reason: str = "429 Rate Limit", config_dir: Optional[Union[pathlib.Path, str]] = None):
+    """Record a cooldown event for a provider (alias for record_429_event)."""
+    return record_429_event(
+        provider=provider,
+        retry_after_sec=retry_after_sec,
+        reason=reason,
+        config_dir=config_dir,
+    )
+
+
 def _load_reservations(res_file: pathlib.Path) -> Dict[str, Dict[str, Any]]:
     if not res_file.exists():
         return {}
@@ -211,7 +222,7 @@ def _save_reservations(res_file: pathlib.Path, data: Dict[str, Dict[str, Any]]):
 def check_provider_capacity(
     provider: str,
     max_cap: Optional[int] = None,
-    config_dir: Optional[pathlib.Path] = None,
+    config_dir: Optional[Union[pathlib.Path, str]] = None,
     now_ts: Optional[float] = None,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     """Check provider capacity and cooldown without reserving a slot.
@@ -313,7 +324,7 @@ def reserve_provider_slot(
     provider: str,
     task_id: str,
     max_cap: Optional[int] = None,
-    config_dir: Optional[pathlib.Path] = None,
+    config_dir: Optional[Union[pathlib.Path, str]] = None,
     now_ts: Optional[float] = None,
 ) -> str:
     """Atomically reserve a provider slot.
@@ -373,7 +384,7 @@ def reserve_provider_slot(
 
 def release_provider_slot(
     token: str,
-    config_dir: Optional[pathlib.Path] = None,
+    config_dir: Optional[Union[pathlib.Path, str]] = None,
 ):
     """Release a held reservation slot on completion, timeout, or failure."""
     if not token:
@@ -390,12 +401,32 @@ def release_provider_slot(
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def get_active_reservations(
+    provider: Optional[str] = None,
+    config_dir: Optional[Union[pathlib.Path, str]] = None,
+    now_ts: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return active unexpired provider reservations, optionally filtered by provider."""
+    ts = now_ts or time.time()
+    lock_file, _, res_file = _state_paths(config_dir)
+    with open(lock_file, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        try:
+            reservations = _load_reservations(res_file)
+            cleaned = {tok: info for tok, info in reservations.items() if ts < info.get("expires_at", 0)}
+            if provider is not None:
+                cleaned = {tok: info for tok, info in cleaned.items() if info.get("provider") == provider}
+            return cleaned
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def provider_reservation(
     provider: str,
     task_id: str,
     max_cap: Optional[int] = None,
-    config_dir: Optional[pathlib.Path] = None,
+    config_dir: Optional[Union[pathlib.Path, str]] = None,
 ):
     """Context manager for atomic provider slot reservation and release."""
     token = reserve_provider_slot(provider, task_id, max_cap=max_cap, config_dir=config_dir)

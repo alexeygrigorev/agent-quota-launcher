@@ -13,6 +13,7 @@ from launcher.capacity import (
     CapacityError,
     ConcurrencyLimitExceeded,
     CooldownActive,
+    _state_paths,
     check_cooldown,
     check_provider_capacity,
     get_live_zai_pids,
@@ -312,6 +313,38 @@ class TestProviderCapacity(unittest.TestCase):
         can_admit, _, info = check_provider_capacity("codex", max_cap=5, config_dir=self.config_dir)
         self.assertTrue(can_admit)
         self.assertEqual(info["headroom"], 1)
+
+    def test_state_paths_accepts_str_config_dir(self):
+        target_dir = self.tmp / "str_config_paths"
+        str_path = str(target_dir)
+        lock_file, cooldown_file, res_file = _state_paths(str_path)
+        self.assertTrue(target_dir.is_dir())
+        self.assertIsInstance(lock_file, pathlib.Path)
+        self.assertIsInstance(cooldown_file, pathlib.Path)
+        self.assertIsInstance(res_file, pathlib.Path)
+        self.assertEqual(lock_file, target_dir / "provider_capacity.lock")
+        self.assertEqual(cooldown_file, target_dir / "provider_cooldown.json")
+        self.assertEqual(res_file, target_dir / "provider_reservations.json")
+
+    @patch("launcher.capacity.get_live_zai_pids", return_value=[])
+    def test_check_provider_capacity_accepts_str_config_dir(self, mock_pids):
+        str_config = str(self.config_dir)
+        can_admit, reason, info = check_provider_capacity("zai", config_dir=str_config)
+        self.assertTrue(can_admit)
+        self.assertIsNone(reason)
+        self.assertEqual(info.get("provider"), "zai")
+
+    @patch("launcher.capacity.get_live_zai_pids", return_value=[])
+    def test_validate_quse_accepts_str_config_dir(self, mock_pids):
+        str_config = str(self.config_dir)
+        valid_routes, rejections = validate_quse(
+            self.sample_quse,
+            check_capacity=True,
+            config_dir=str_config,
+        )
+        self.assertIn("zai", [r["provider"] for r in valid_routes])
+        self.assertIn("antigravity", [r["provider"] for r in valid_routes])
+        self.assertEqual(rejections, {})
 
 
 if __name__ == "__main__":
