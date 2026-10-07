@@ -1,4 +1,11 @@
 # Agent Quota Launcher
+
+## What this project works toward
+
+Make the Agent Quota Launcher start every worker and reviewer, check quota before each launch, route work to a provider that has quota left, and record usage statistics so its choices get smarter and it is useful outside this project.
+
+Heads read ~/git/cloudflare-agent-git/_docs/team/04-head.md for the role and ~/git/cloudflare-agent-git/_docs/04-communication.md for messaging.
+
 Read /home/alexey/git/cloudflare-agent-git/AGENTS.md and coordination/RESOURCE-POLICY.md, and ~/git/.agents/skills/a2a-communication/SKILL.md plus external-model-agents/SKILL.md.
 User authorizes this standalone project, private GitHub backup, Agent Branches as primary development platform, ordinary Git recovery, useful external execution and independent challenge. No purchases, Copilot, Rust builds/installs, secrets in Git, deleting worktrees, changing dirty quse/aplexer, or busy-pane injection. Claude/Codex sparse. Real Codex launches must use experiment scripts/launch-codex.sh and deny <=15% remaining/unknown.
 Fresh quse immediately before every external launch. Host MemAvailable must retain >=10GiB after reservation; disk target and scratch mount must retain >=50GiB plus 512MiB estimated spike; /tmp fails so TMPDIR under .local/tmp on root. aplexer --memory 1500M maximum per new worker, bounded timeout, genuine whoami, durable tasks, first tool action and incremental artifacts.
