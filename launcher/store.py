@@ -153,6 +153,13 @@ class Store:
             reason="head accepted reviewed artifacts", reviewer=reviewer,
         )
 
+    def reject_task(self, task_id, reviewer, reason):
+        """completed-awaiting-review -> rejected. Releases path lease."""
+        return self.transition_task(
+            task_id, "rejected", ("completed-awaiting-review",),
+            reason=reason, reviewer=reviewer,
+        )
+
     def get_active_paths(self, conn, exclude_task_id=None):
         placeholders = ",".join("?" for _ in LEASED_STATES)
         query = f"""

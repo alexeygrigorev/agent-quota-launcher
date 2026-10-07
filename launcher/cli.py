@@ -547,6 +547,21 @@ def accept(args):
     return 0
 
 
+def reject(args):
+    store = get_store(args)
+    task = store.get_task(args.id)
+    if not task:
+        print(f"error: unknown task {args.id}")
+        return 1
+    try:
+        store.reject_task(args.id, args.reviewer, args.reason)
+    except StateTransitionError as e:
+        print(f"error: {e}")
+        return 1
+    print(f"rejected: {args.id} (reviewer {args.reviewer}; reason: {args.reason})")
+    return 0
+
+
 def build_report(store, now=None, project_id=None):
     """Dashboard projection: hourly UTC buckets tiling the half-open window
     [as_of-24h, as_of) with explicit gap labels and a project_id on every
@@ -808,6 +823,12 @@ def main():
                                help="do not trigger automated refill dispatch after acceptance")
     parser_accept.add_argument("--backend", default="task-units", choices=["aplexer", "task-units"])
     parser_accept.set_defaults(func=accept)
+
+    parser_reject = subparsers.add_parser("reject", help="reject reviewed artifacts, releasing path lease")
+    parser_reject.add_argument("--id", required=True)
+    parser_reject.add_argument("--reviewer", required=True)
+    parser_reject.add_argument("--reason", required=True)
+    parser_reject.set_defaults(func=reject)
 
     parser_fail = subparsers.add_parser(
         "fail",
