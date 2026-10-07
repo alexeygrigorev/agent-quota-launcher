@@ -40,12 +40,70 @@ class CooldownActive(CapacityError):
     pass
 
 
-def get_live_zai_pids() -> List[int]:
+def is_genuine_zai_pid(pid: int, proc_root: Optional[pathlib.Path] = None) -> bool:
+    """Verify PID is genuinely executing zcode-cli, not a wrapper/shell process or zombie.
+
+    Only returns True if /proc/{pid}/comm == 'zcode-cli' or exe basename is 'zcode-cli',
+    AND the process is alive (not in zombie state 'Z').
+    Explicitly excludes wrapper processes (e.g. bash, sh, python3, timeout, pgrep, grep)
+    whose cmdline happens to contain 'zcode-cli'.
+    """
+    root = proc_root or pathlib.Path("/proc")
+    proc_dir = root / str(pid)
+    if not proc_dir.exists():
+        return False
+
+    # Check for zombie/defunct process state ('Z')
+    status_path = proc_dir / "status"
+    try:
+        if status_path.exists():
+            for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("State:") and "Z" in line:
+                    return False
+    except Exception:
+        pass
+
+    stat_path = proc_dir / "stat"
+    try:
+        if stat_path.exists():
+            stat_content = stat_path.read_text(encoding="utf-8", errors="ignore")
+            after_comm = stat_content.rpartition(")")[2].strip()
+            if after_comm and after_comm.split()[0] == "Z":
+                return False
+    except Exception:
+        pass
+
+    comm_path = proc_dir / "comm"
+    try:
+        if comm_path.exists():
+            comm = comm_path.read_text(encoding="utf-8", errors="ignore").strip()
+            if comm == "zcode-cli":
+                return True
+            if comm in {"bash", "sh", "zsh", "python", "python3", "timeout", "pgrep", "grep"}:
+                return False
+    except Exception:
+        pass
+
+    exe_path = proc_dir / "exe"
+    try:
+        if exe_path.is_symlink() or exe_path.exists():
+            target = os.readlink(str(exe_path))
+            if os.path.basename(target) == "zcode-cli":
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def get_live_zai_pids(proc_root: Optional[pathlib.Path] = None) -> List[int]:
     """Scan host for live zcode-cli backend processes across all user projects.
 
     Checks both pgrep and /proc to discover all active processes executing
-    zcode-cli anywhere on the host (internal or external projects).
+    zcode-cli anywhere on the host (internal or external projects), filtering
+    out wrapper scripts (bash, python3, timeout, etc.) that match cmdline.
     """
+    root = proc_root or pathlib.Path("/proc")
     pids = []
     try:
         res = subprocess.run(
@@ -60,19 +118,19 @@ def get_live_zai_pids() -> List[int]:
                 line = line.strip()
                 if line.isdigit():
                     pid = int(line)
-                    if os.path.exists(f"/proc/{pid}"):
+                    if is_genuine_zai_pid(pid, proc_root=root):
                         pids.append(pid)
     except Exception:
         pass
 
     if not pids:
         try:
-            for entry in pathlib.Path("/proc").iterdir():
+            for entry in root.iterdir():
                 if entry.name.isdigit():
                     try:
-                        cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="ignore")
-                        if "zcode-cli" in cmdline:
-                            pids.append(int(entry.name))
+                        pid = int(entry.name)
+                        if is_genuine_zai_pid(pid, proc_root=root):
+                            pids.append(pid)
                     except Exception:
                         pass
         except Exception:

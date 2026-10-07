@@ -16,6 +16,7 @@ from launcher.capacity import (
     check_cooldown,
     check_provider_capacity,
     get_live_zai_pids,
+    is_genuine_zai_pid,
     provider_reservation,
     record_429_event,
     release_provider_slot,
@@ -50,15 +51,139 @@ class TestProviderCapacity(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     @patch("launcher.capacity.subprocess.run")
-    def test_get_live_zai_pids_discovery(self, mock_run):
+    @patch("launcher.capacity.is_genuine_zai_pid", return_value=True)
+    def test_get_live_zai_pids_discovery(self, mock_is_genuine, mock_run):
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stdout = "1001\n1002\n1003\n"
         mock_run.return_value = mock_proc
 
-        with patch("os.path.exists", return_value=True):
-            pids = get_live_zai_pids()
-            self.assertEqual(pids, [1001, 1002, 1003])
+        pids = get_live_zai_pids()
+        self.assertEqual(pids, [1001, 1002, 1003])
+
+    def test_is_genuine_zai_pid_comm_and_exe_validation(self):
+        fake_proc = self.tmp / "proc"
+        fake_proc.mkdir(parents=True, exist_ok=True)
+
+        def make_proc(pid: int, comm: str, exe_target: str = None):
+            pdir = fake_proc / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "comm").write_text(comm, encoding="utf-8")
+            if exe_target:
+                (pdir / "exe").symlink_to(exe_target)
+
+        # Genuine processes
+        make_proc(10, "zcode-cli")
+        make_proc(11, "node", exe_target="/usr/bin/zcode-cli")
+
+        # Wrapper processes matching cmdline but having wrapper comm
+        make_proc(20, "bash")
+        make_proc(21, "sh")
+        make_proc(22, "python3")
+        make_proc(23, "timeout")
+        make_proc(24, "grep")
+        make_proc(25, "pgrep")
+        make_proc(26, "other_wrapper", exe_target="/bin/bash")
+
+        self.assertTrue(is_genuine_zai_pid(10, proc_root=fake_proc))
+        self.assertTrue(is_genuine_zai_pid(11, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(20, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(21, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(22, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(23, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(24, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(25, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(26, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(999, proc_root=fake_proc))  # non-existent
+
+    def test_is_genuine_zai_pid_excludes_zombie_defunct_processes(self):
+        fake_proc = self.tmp / "proc"
+        fake_proc.mkdir(parents=True, exist_ok=True)
+
+        def make_proc(pid: int, comm: str, status_state: str = None, stat_state: str = None):
+            pdir = fake_proc / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "comm").write_text(comm, encoding="utf-8")
+            if status_state:
+                (pdir / "status").write_text(f"Name:\t{comm}\nState:\t{status_state}\n", encoding="utf-8")
+            if stat_state:
+                (pdir / "stat").write_text(f"{pid} ({comm}) {stat_state} 1 1 1 0 0\n", encoding="utf-8")
+
+        # Live processes: S (sleeping) and R (running)
+        make_proc(30, "zcode-cli", status_state="S (sleeping)", stat_state="S")
+        make_proc(31, "zcode-cli", status_state="R (running)", stat_state="R")
+
+        # Zombie processes with comm='zcode-cli' and state='Z'
+        make_proc(40, "zcode-cli", status_state="Z (zombie)", stat_state="Z")
+        make_proc(41, "zcode-cli", status_state="Z (zombie)")
+        make_proc(42, "zcode-cli", stat_state="Z")
+
+        self.assertTrue(is_genuine_zai_pid(30, proc_root=fake_proc))
+        self.assertTrue(is_genuine_zai_pid(31, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(40, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(41, proc_root=fake_proc))
+        self.assertFalse(is_genuine_zai_pid(42, proc_root=fake_proc))
+
+    @patch("launcher.capacity.subprocess.run")
+    def test_get_live_zai_pids_excludes_wrapper_processes(self, mock_run):
+        fake_proc = self.tmp / "proc"
+        fake_proc.mkdir(parents=True, exist_ok=True)
+
+        def make_proc(pid: int, comm: str, exe_target: str = None, status_state: str = None):
+            pdir = fake_proc / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "comm").write_text(comm, encoding="utf-8")
+            if exe_target:
+                (pdir / "exe").symlink_to(exe_target)
+            if status_state:
+                (pdir / "status").write_text(f"Name:\t{comm}\nState:\t{status_state}\n", encoding="utf-8")
+
+        # 4 false wrapper matches from pgrep cmdline search
+        make_proc(201, "bash")
+        make_proc(202, "python3")
+        make_proc(203, "sh")
+        make_proc(204, "timeout")
+
+        # 2 genuine zcode-cli processes
+        make_proc(205, "zcode-cli")
+        make_proc(206, "zcode-cli")
+
+        # 1 zombie process with comm='zcode-cli'
+        make_proc(207, "zcode-cli", status_state="Z (zombie)")
+
+        # pgrep returns all 7 because cmdline matches 'zcode-cli'
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "201\n202\n203\n204\n205\n206\n207\n"
+        mock_run.return_value = mock_proc
+
+        pids = get_live_zai_pids(proc_root=fake_proc)
+        # Only genuine live 205 and 206 should be discovered; zombie 207 and wrappers excluded
+        self.assertEqual(pids, [205, 206])
+
+    @patch("launcher.capacity.subprocess.run")
+    def test_get_live_zai_pids_iterdir_fallback_excludes_wrappers(self, mock_run):
+        # Simulate pgrep failure/empty
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stdout = ""
+        mock_run.return_value = mock_proc
+
+        fake_proc = self.tmp / "proc"
+        fake_proc.mkdir(parents=True, exist_ok=True)
+
+        def make_proc(pid: int, comm: str):
+            pdir = fake_proc / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "comm").write_text(comm, encoding="utf-8")
+
+        make_proc(301, "bash")
+        make_proc(302, "zcode-cli")
+        make_proc(303, "python3")
+        make_proc(304, "sh")
+
+        pids = get_live_zai_pids(proc_root=fake_proc)
+        self.assertEqual(pids, [302])
 
     @patch("launcher.capacity.get_live_zai_pids")
     def test_check_provider_capacity_under_ceiling(self, mock_pids):
