@@ -352,6 +352,123 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         self.assertIn("current_cwd != os.path.realpath(expected_ws)", code)
         self.assertIn("sys.exit(99)", code)
 
+    def test_build_systemd_run_argv_mount_isolation_flags(self):
+        cmd = build_systemd_run_argv(
+            unit_name="agent-task-t1.service",
+            command_argv=["python3", "worker.py"],
+            memory_mb=768,
+            tmpdir="/repo/.local/tmp/t1",
+            protect_system="strict",
+            read_only_paths=["/repo"],
+            read_write_paths=["/repo/work", "/repo/tmp"],
+        )
+        self.assertIn("-p", cmd)
+        pairs = list(zip(cmd[:-1], cmd[1:]))
+        self.assertIn(("-p", "ProtectSystem=strict"), pairs)
+        self.assertIn(("-p", "ReadOnlyPaths=/repo"), pairs)
+        self.assertIn(("-p", "ReadWritePaths=/repo/work"), pairs)
+        self.assertIn(("-p", "ReadWritePaths=/repo/tmp"), pairs)
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {"ControlGroup": "app.slice/agent-task-t1.service", "ActiveState": "inactive", "SubState": "dead", "InvocationID": "inv12345"}))
+    @patch("subprocess.Popen")
+    @patch("launcher.task_units.build_systemd_run_argv")
+    def test_execute_transient_task_unit_mount_isolation_propagation(self, mock_build, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.returncode = 0
+        proc_inst.communicate.return_value = ("Running as unit: agent-task-t1.service; invocation ID: inv12345\n", "")
+        mock_popen.return_value = proc_inst
+        mock_build.return_value = ["systemd-run", "--unit=agent-task-t1.service", "--"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Path(tmp_dir) / "repo"
+            repo.mkdir()
+            tmpdir = repo / ".local" / "tmp" / "t1"
+            tmpdir.mkdir(parents=True)
+            valid_quse = {
+                "zai": {
+                    "status": "ok",
+                    "windows": {
+                        "7d": {
+                            "percent_remaining": 65.0,
+                            "reset_at": "2099-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            }
+
+            receipt = execute_transient_task_unit(
+                task_id="t1",
+                command_argv=["echo", "hello"],
+                memory_mb=512,
+                workspace=str(repo),
+                tmpdir=str(tmpdir),
+                quse_json=valid_quse,
+                protect_system="strict",
+                read_only_paths=["/repo"],
+                read_write_paths=["/repo/work", "/repo/tmp"],
+            )
+
+            mock_build.assert_called_once()
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs.get("protect_system"), "strict")
+            self.assertEqual(kwargs.get("read_only_paths"), ["/repo"])
+            self.assertEqual(kwargs.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+
+            self.assertEqual(receipt.get("protect_system"), "strict")
+            self.assertEqual(receipt.get("read_only_paths"), ["/repo"])
+            self.assertEqual(receipt.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("subprocess.run")
+    @patch("launcher.task_units.build_systemd_run_argv")
+    def test_spawn_transient_task_unit_mount_isolation_propagation(self, mock_build, mock_run, mock_res):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "Running as unit: agent-task-t1.service; invocation ID: inv12345\n"
+        mock_proc.stderr = ""
+        mock_run.return_value = mock_proc
+        mock_build.return_value = ["systemd-run", "--unit=agent-task-t1.service", "--"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo = Path(tmp_dir) / "repo"
+            repo.mkdir()
+            tmpdir = repo / ".local" / "tmp" / "t1"
+            tmpdir.mkdir(parents=True)
+            valid_quse = {
+                "zai": {
+                    "status": "ok",
+                    "windows": {
+                        "7d": {
+                            "percent_remaining": 65.0,
+                            "reset_at": "2099-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            }
+
+            receipt = spawn_transient_task_unit(
+                task_id="t1",
+                command_argv=["echo", "hello"],
+                memory_mb=512,
+                workspace=str(repo),
+                tmpdir=str(tmpdir),
+                quse_json=valid_quse,
+                protect_system="strict",
+                read_only_paths=["/repo"],
+                read_write_paths=["/repo/work", "/repo/tmp"],
+            )
+
+            mock_build.assert_called_once()
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs.get("protect_system"), "strict")
+            self.assertEqual(kwargs.get("read_only_paths"), ["/repo"])
+            self.assertEqual(kwargs.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+
+            self.assertEqual(receipt.get("protect_system"), "strict")
+            self.assertEqual(receipt.get("read_only_paths"), ["/repo"])
+            self.assertEqual(receipt.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+
 
 class TestCGroupDissolutionAndCleanup(unittest.TestCase):
     def setUp(self):

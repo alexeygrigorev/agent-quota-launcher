@@ -241,6 +241,9 @@ def build_systemd_run_argv(
     wait: bool = False,
     slice_name: str = "app.slice",
     extra_env: Optional[Dict[str, str]] = None,
+    protect_system: Optional[str] = None,
+    read_only_paths: Optional[List[str]] = None,
+    read_write_paths: Optional[List[str]] = None,
 ) -> List[str]:
     """Construct systemd-run invocation for a detached transient service unit.
 
@@ -310,6 +313,15 @@ def build_systemd_run_argv(
         argv.extend(["-p", f"StandardError=file:{stderr_path}"])
     if not stdout_path and not stderr_path and not wait:
         argv.append("--pipe")
+
+    if protect_system:
+        argv.extend(["-p", f"ProtectSystem={protect_system}"])
+    if read_only_paths:
+        for p in read_only_paths:
+            argv.extend(["-p", f"ReadOnlyPaths={p}"])
+    if read_write_paths:
+        for p in read_write_paths:
+            argv.extend(["-p", f"ReadWritePaths={p}"])
 
     argv.append("--")
     argv.extend(list(command_argv))
@@ -522,6 +534,9 @@ def execute_transient_task_unit(
     log_dir: Optional[str] = None,
     check_capacity: bool = False,
     config_dir: Optional[Path] = None,
+    protect_system: Optional[str] = None,
+    read_only_paths: Optional[List[str]] = None,
+    read_write_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -579,6 +594,9 @@ def execute_transient_task_unit(
         stdout_path=str(stdout_log),
         stderr_path=str(stderr_log),
         wait=True,
+        protect_system=protect_system,
+        read_only_paths=read_only_paths,
+        read_write_paths=read_write_paths,
     )
 
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -737,6 +755,9 @@ def execute_transient_task_unit(
         "cpu_usage_nsec": captured_cpu_usage,
         "workspace": str(repo_dir),
         "working_directory": str(repo_dir),
+        "protect_system": protect_system,
+        "read_only_paths": read_only_paths,
+        "read_write_paths": read_write_paths,
         "module_sha256": module_sha256,
         "provider": provider,
         "timeout_sec": timeout_sec,
@@ -880,6 +901,9 @@ def spawn_transient_task_unit(
     log_dir: Optional[str] = None,
     check_capacity: bool = False,
     config_dir: Optional[Path] = None,
+    protect_system: Optional[str] = None,
+    read_only_paths: Optional[List[str]] = None,
+    read_write_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -933,6 +957,9 @@ def spawn_transient_task_unit(
         stdout_path=str(stdout_log),
         stderr_path=str(stderr_log),
         wait=False,
+        protect_system=protect_system,
+        read_only_paths=read_only_paths,
+        read_write_paths=read_write_paths,
     )
 
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -965,6 +992,9 @@ def spawn_transient_task_unit(
         "invocation_id": inv_id,
         "workspace": str(repo_dir),
         "working_directory": str(repo_dir),
+        "protect_system": protect_system,
+        "read_only_paths": read_only_paths,
+        "read_write_paths": read_write_paths,
         "module_sha256": module_sha256,
         "provider": provider,
         "started_at": started_at,

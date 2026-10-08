@@ -206,6 +206,9 @@ def run_task_units(args):
     bounds = resolve_task_bounds(payload)
     memory_mb = int(payload.get("memory_mb") or bounds["memory_mb"])
     timeout_sec = float(payload.get("timeout") or bounds["timeout"])
+    protect_system = payload.get("protect_system")
+    read_only_paths = payload.get("read_only_paths")
+    read_write_paths = payload.get("read_write_paths")
     lock_path = config_dir / "launch.lock"
     # Concurrent sibling launches can collide on quse (observed rc=1). Retry
     # before leasing so a transient fetch failure leaves the task queued.
@@ -312,6 +315,9 @@ def run_task_units(args):
                 log_dir=str(config_dir),
                 check_capacity=False,
                 config_dir=config_dir,
+                protect_system=protect_system,
+                read_only_paths=read_only_paths,
+                read_write_paths=read_write_paths,
             )
     except Exception as e:
         with launch_lock(str(lock_path)):
