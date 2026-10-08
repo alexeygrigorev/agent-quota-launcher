@@ -304,11 +304,42 @@ def validate_review_receipt(
             "error": "report_path and report_sha256 are required",
         }
 
+    if store is not None:
+        collision_found = False
+        try:
+            if hasattr(store, "list_review_receipts"):
+                receipts = store.list_review_receipts()
+                for r in receipts:
+                    rec_path = r.get("report_path")
+                    rec_sha = (r.get("report_sha256") or "").strip().lower()
+                    if rec_path and rec_path == report_path_str and rec_sha and rec_sha != expected_sha:
+                        collision_found = True
+                        break
+            if not collision_found and hasattr(store, "get_conn"):
+                with store.get_conn() as conn:
+                    cursor = conn.execute(
+                        "SELECT id, report_sha256 FROM review_receipts WHERE report_path = ?",
+                        (report_path_str,),
+                    )
+                    for row in cursor.fetchall():
+                        rec_sha = (row[1] or "").strip().lower()
+                        if rec_sha and rec_sha != expected_sha:
+                            collision_found = True
+                            break
+        except Exception:
+            pass
+
+        if collision_found:
+            return False, "rejected_report_path_collision", {
+                "error": f"Report path '{report_path_str}' was already recorded with different hash; immutable unique report paths required across rounds",
+                "report_path": report_path_str,
+            }
+
     if verify_files:
         p = Path(report_path_str)
-        if not p.exists():
+        if not p.is_file() or p.is_symlink():
             return False, "missing_report_file", {
-                "error": f"report file does not exist at {report_path_str}",
+                "error": f"report file does not exist or is a symlink at {report_path_str}",
             }
         actual_sha = compute_file_sha256(p).lower()
         if actual_sha != expected_sha:

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from launcher.review_receipt import (
+    ReviewValidationError,
     compute_file_sha256,
     is_prompt_unbiased,
     validate_review_receipt,
@@ -609,6 +610,162 @@ class TestReviewReceiptValidation(unittest.TestCase):
         self.assertEqual(status, "rejected_temporal_inconsistency")
         self.assertIn("postdates completed_at", details["error"])
 
+    def test_report_path_collision_rejected_across_rounds(self):
+        """Submit round 1 receipt to store, then validate round 2 receipt with same report_path but different report_sha256. Verify validate_review_receipt returns status 'rejected_report_path_collision'."""
+        payload = {"goal": "test", "owner": "test-owner", "cwd": ".", "timeout": 600}
+        self.store.submit_task("test-task-1", "key-task-col-round1", payload, [])
+
+        # Submit round 1 receipt
+        r1 = dict(self.base_receipt)
+        r1["verdict"] = "CHANGES_REQUESTED"
+        accepted1, status1, details1 = validate_review_receipt(r1, verify_files=True, verify_git=False)
+        self.assertFalse(accepted1)
+        self.store.add_review_receipt(r1, status1, details1)
+
+        # Validate round 2 receipt with same report_path but different report_sha256
+        r2 = dict(self.base_receipt)
+        r2["report_sha256"] = "1111111111111111111111111111111111111111111111111111111111111111"
+        accepted2, status2, details2 = validate_review_receipt(
+            r2, verify_files=False, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted2)
+        self.assertEqual(status2, "rejected_report_path_collision")
+        self.assertIn("already recorded with different hash", details2["error"])
+        self.assertEqual(details2["report_path"], str(self.report_file))
+
+        # Also verify with file modified on disk (verify_files=True)
+        self.report_file.write_text("# Round 2 modified\nVerdict: ACCEPT\n", encoding="utf-8")
+        new_sha = compute_file_sha256(self.report_file)
+        r2["report_sha256"] = new_sha
+        accepted2_vf, status2_vf, details2_vf = validate_review_receipt(
+            r2, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted2_vf)
+        self.assertEqual(status2_vf, "rejected_report_path_collision")
+
+    def test_unique_report_path_accepted_across_rounds(self):
+        """Submit round 1 receipt, then validate round 2 receipt with distinct unique report_path (e.g. REV-TEST-ROUND02.md). Verify it is accepted."""
+        payload = {"goal": "test", "owner": "test-owner", "cwd": ".", "timeout": 600}
+        self.store.submit_task("test-task-1", "key-task-unique-round2", payload, [])
+
+        # Submit round 1 receipt
+        r1 = dict(self.base_receipt)
+        r1["verdict"] = "CHANGES_REQUESTED"
+        accepted1, status1, details1 = validate_review_receipt(r1, verify_files=True, verify_git=False)
+        self.assertFalse(accepted1)
+        self.store.add_review_receipt(r1, status1, details1)
+
+        # Round 2 receipt with distinct unique report_path
+        round2_file = self.tmp_path / "REV-TEST-ROUND02.md"
+        round2_content = "# Independent Review Report - Round 2\nVerdict: ACCEPT\n"
+        round2_file.write_text(round2_content, encoding="utf-8")
+        round2_sha = compute_file_sha256(round2_file)
+
+        now = datetime.now(timezone.utc)
+        r2 = dict(self.base_receipt)
+        r2["report_path"] = str(round2_file)
+        r2["report_sha256"] = round2_sha
+        r2["verdict"] = "ACCEPT"
+        r2["reviewer"] = dict(
+            self.base_receipt["reviewer"],
+            session_id="c67f0987-4ed8-5042-bf8d-fe187dcf59ca",
+            started_at=(now - timedelta(seconds=120)).isoformat(),
+            completed_at=now.isoformat(),
+            first_tool_timestamp=(now - timedelta(seconds=100)).isoformat(),
+        )
+
+        accepted2, status2, details2 = validate_review_receipt(
+            r2, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertTrue(accepted2)
+        self.assertEqual(status2, "accepted")
+        self.assertEqual(details2["verdict"], "ACCEPT")
+        self.assertEqual(details2["report_sha256"], round2_sha)
+
+    def test_add_review_receipt_raises_on_path_collision(self):
+        """Verify store.add_review_receipt raises ReviewValidationError when inserting a conflicting hash for an existing report_path."""
+        payload = {"goal": "test", "owner": "test-owner", "cwd": ".", "timeout": 600}
+        self.store.submit_task("test-task-1", "key-task-path-col", payload, [])
+
+        r1 = dict(self.base_receipt)
+        self.store.add_review_receipt(r1, "accepted", {"verdict": "ACCEPT"})
+
+        # Attempt to insert receipt with same report_path but conflicting hash
+        r2 = dict(self.base_receipt)
+        r2["report_sha256"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+        with self.assertRaises(ReviewValidationError) as ctx:
+            self.store.add_review_receipt(r2, "accepted", {"verdict": "ACCEPT"})
+
+        self.assertEqual(ctx.exception.status, "rejected_report_path_collision")
+        self.assertIn("Report path collision", str(ctx.exception))
+        self.assertIn(str(self.report_file), str(ctx.exception))
+
+    def test_relocate_historical_report_pointer(self):
+        """Verify store.relocate_historical_report_pointer safely updates report_path when SHA matches, and raises on SHA mismatch or missing file."""
+        payload = {"goal": "test", "owner": "test-owner", "cwd": ".", "timeout": 600}
+        self.store.submit_task("test-task-1", "key-task-relocate", payload, [])
+
+        r1 = dict(self.base_receipt)
+        self.store.add_review_receipt(r1, "accepted", {"verdict": "ACCEPT"})
+        receipts = self.store.list_review_receipts("test-task-1")
+        self.assertEqual(len(receipts), 1)
+        receipt_id = receipts[0]["id"]
+
+        # 1. Target file does not exist
+        non_existent = str(self.tmp_path / "non_existent.md")
+        with self.assertRaises(ValueError) as ctx:
+            self.store.relocate_historical_report_pointer(receipt_id, non_existent, self.report_sha)
+        self.assertIn("does not exist or is a symlink", str(ctx.exception))
+
+        # 2. Target file is a symlink
+        symlink_path = self.tmp_path / "symlink_report.md"
+        symlink_path.symlink_to(self.report_file)
+        with self.assertRaises(ValueError) as ctx:
+            self.store.relocate_historical_report_pointer(receipt_id, str(symlink_path), self.report_sha)
+        self.assertIn("does not exist or is a symlink", str(ctx.exception))
+
+        # 3. SHA mismatch between file and expected_sha
+        mismatched_file = self.tmp_path / "mismatched.md"
+        mismatched_file.write_text("different content", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            self.store.relocate_historical_report_pointer(receipt_id, str(mismatched_file), self.report_sha)
+        self.assertIn("SHA mismatch for relocated report", str(ctx.exception))
+
+        # 4. SHA mismatch between expected_sha and recorded SHA in receipt
+        wrong_expected_sha = compute_file_sha256(mismatched_file)
+        with self.assertRaises(ValueError) as ctx:
+            self.store.relocate_historical_report_pointer(receipt_id, str(mismatched_file), wrong_expected_sha)
+        self.assertIn("does not match expected", str(ctx.exception))
+
+        # 5. Non-existent receipt_id
+        target_file = self.tmp_path / "frozen_report.md"
+        target_file.write_text(self.report_content, encoding="utf-8")  # same content as report_file
+        with self.assertRaises(ValueError) as ctx:
+            self.store.relocate_historical_report_pointer(999999, str(target_file), self.report_sha)
+        self.assertIn("Review receipt #999999 not found", str(ctx.exception))
+
+        # 6. Successful relocation
+        res = self.store.relocate_historical_report_pointer(receipt_id, str(target_file), self.report_sha)
+        self.assertTrue(res)
+
+        # Verify update in DB
+        updated_receipts = self.store.list_review_receipts("test-task-1")
+        self.assertEqual(len(updated_receipts), 1)
+        self.assertEqual(updated_receipts[0]["report_path"], str(target_file))
+
+    def test_symlink_report_file_rejected(self):
+        """Verify validate_review_receipt rejects report file if it is a symlink when verify_files is True."""
+        symlink_report = self.tmp_path / "symlink_report_test.md"
+        symlink_report.symlink_to(self.report_file)
+
+        receipt = dict(self.base_receipt, report_path=str(symlink_report))
+        accepted, status, details = validate_review_receipt(receipt, verify_files=True, verify_git=False)
+        self.assertFalse(accepted)
+        self.assertEqual(status, "missing_report_file")
+        self.assertIn("is a symlink", details["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

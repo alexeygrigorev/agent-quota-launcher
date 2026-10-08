@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import re
 
 from launcher.tags import run_tag_for
+from launcher.review_receipt import ReviewValidationError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -331,7 +332,17 @@ class Store:
     def add_review_receipt(self, receipt: dict, status: str, details: dict = None):
         """Record review receipt into review_receipts table preserving negative history."""
         reviewer = receipt.get("reviewer") or {}
+        report_path = receipt.get("report_path")
+        report_sha = receipt.get("report_sha256")
         with self.transaction() as conn:
+            if report_path and report_sha:
+                cursor = conn.execute("SELECT id, report_sha256 FROM review_receipts WHERE report_path = ?", (report_path,))
+                for row in cursor.fetchall():
+                    if row[1] != report_sha:
+                        raise ReviewValidationError(
+                            f"Report path collision: '{report_path}' already recorded in receipt #{row[0]} with hash '{row[1]}'",
+                            status="rejected_report_path_collision",
+                        )
             conn.execute(
                 """
                 INSERT INTO review_receipts (
@@ -356,17 +367,40 @@ class Store:
                 ),
             )
 
+    def relocate_historical_report_pointer(self, receipt_id: int, new_path: str, expected_sha: str) -> bool:
+        """Audit-preserving relocation of historical report pointer to an immutable frozen path."""
+        p = Path(new_path)
+        if not p.is_file() or p.is_symlink():
+            raise ValueError(f"Target report file '{new_path}' does not exist or is a symlink")
+        import hashlib
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        actual_sha = h.hexdigest().lower()
+        if actual_sha != expected_sha.lower():
+            raise ValueError(f"SHA mismatch for relocated report: expected {expected_sha}, computed {actual_sha}")
+        with self.transaction() as conn:
+            cursor = conn.execute("SELECT id, report_sha256 FROM review_receipts WHERE id = ?", (receipt_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"Review receipt #{receipt_id} not found")
+            if row[1].lower() != expected_sha.lower():
+                raise ValueError(f"Receipt #{receipt_id} has recorded SHA '{row[1]}', does not match expected '{expected_sha}'")
+            conn.execute("UPDATE review_receipts SET report_path = ? WHERE id = ?", (str(p), receipt_id))
+        return True
+
     def list_review_receipts(self, task_id: str = None):
         """Retrieve review receipts ordered by creation time."""
         with self.get_conn() as conn:
             if task_id:
                 cursor = conn.execute(
-                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at FROM review_receipts WHERE task_id = ? ORDER BY created_at",
+                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at, report_path, report_sha256 FROM review_receipts WHERE task_id = ? ORDER BY created_at",
                     (task_id,),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at FROM review_receipts ORDER BY created_at"
+                    "SELECT id, task_id, source_commit, reviewer_session, reviewer_model, verdict, status, details, created_at, report_path, report_sha256 FROM review_receipts ORDER BY created_at"
                 )
             return [
                 {
@@ -379,6 +413,8 @@ class Store:
                     "status": r[6],
                     "details": json.loads(r[7]) if r[7] else {},
                     "created_at": r[8],
+                    "report_path": r[9],
+                    "report_sha256": r[10],
                 }
                 for r in cursor.fetchall()
             ]
