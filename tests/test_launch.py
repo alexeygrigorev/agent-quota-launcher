@@ -241,6 +241,10 @@ class TestAdapters(unittest.TestCase):
         self.assertNotIn("sh", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.1-pro-high")
 
+    def test_antigravity_supports_model_override(self):
+        argv = build_adapter_argv("antigravity", "goal", model="gemini-3.8-flash-high")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
+
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/home/alexey/.local/bin/zcodex")

@@ -63,11 +63,16 @@ MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 7200
 
 
-def build_adapter_argv(provider, goal):
+def build_adapter_argv(provider, goal, model=None):
     adapter = ADAPTERS.get(provider)
     if not adapter:
         raise ValueError(f"Unsupported provider: {provider}")
-    return list(adapter["argv"]) + [str(goal)]
+    argv = list(adapter["argv"])
+    if model:
+        if "--model" in argv:
+            idx = argv.index("--model")
+            argv[idx + 1] = str(model)
+    return argv + [str(goal)]
 
 
 def _has_time_evidence(data, start_json, now_ms):
@@ -367,7 +372,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
-    cmd.extend(build_adapter_argv(provider, payload.get("goal", "")))
+    cmd.extend(build_adapter_argv(provider, payload.get("goal", ""), model=payload.get("model")))
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
 
     deadline = time.monotonic() + timeout_seconds
