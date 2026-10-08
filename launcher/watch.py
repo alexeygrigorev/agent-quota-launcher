@@ -371,8 +371,8 @@ def _next_dispatchable(store, wait_for_review="dependencies"):
 
 
 def watch_loop(args, max_passes=None):
-    config_dir = Path(getattr(args, 'config_dir', None) or
-                      __import__('os').path.expanduser('~/.config/agent-quota-launcher'))
+    from launcher.cli import config_dir_for
+    config_dir = config_dir_for(args)
     store_path = str(config_dir / 'state.db')
     lock_path = str(config_dir / 'launch.lock')
     interval = float(getattr(args, 'interval', 10.0) or 10.0)

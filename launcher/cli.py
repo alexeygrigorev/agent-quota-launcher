@@ -16,7 +16,12 @@ REPORT = "report"  # exported so tests can build the projection
 
 
 def config_dir_for(args):
-    return Path(getattr(args, 'config_dir', os.path.expanduser('~/.config/agent-quota-launcher')))
+    val = getattr(args, 'config_dir', None)
+    if not val or not str(val).strip():
+        val = os.environ.get('LAUNCHER_CONFIG_DIR')
+    if not val or not str(val).strip():
+        raise ValueError("Configuration error: --config-dir or LAUNCHER_CONFIG_DIR environment variable must be set. The silent default ~/.config/agent-quota-launcher fallback is removed.")
+    return Path(val).resolve()
 
 
 def get_store(args):
@@ -771,8 +776,7 @@ def record_review(args):
 
 def main():
     parser = argparse.ArgumentParser(prog="launcher", description="Agent Quota Launcher")
-    parser.add_argument("--config-dir", default=os.path.expanduser("~/.config/agent-quota-launcher"),
-                        help="Path to config directory")
+    parser.add_argument("--config-dir", help="Path to config directory")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -897,7 +901,13 @@ def main():
     parser_record.set_defaults(func=record_review)
 
     args = parser.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ValueError as e:
+        if "Configuration error" in str(e):
+            parser.error(str(e))
+        else:
+            raise
 
 
 if __name__ == "__main__":

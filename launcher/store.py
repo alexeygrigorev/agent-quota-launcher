@@ -58,6 +58,40 @@ LEASED_STATES = ("queued", "starting", "launch-uncertain", "stalled",
                  "running", "completed-awaiting-review")
 
 
+def get_host_fencing_dir():
+    return Path(os.environ.get(
+        'LAUNCHER_HOST_FENCING_DIR',
+        os.path.expanduser('~/.local/share/agent-quota-launcher/host_fencing')
+    ))
+
+@contextmanager
+def host_fencing_lock():
+    fencing_dir = get_host_fencing_dir()
+    fencing_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = fencing_dir / "host_registry.lock"
+    with open(lock_path, 'w') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+@contextmanager
+def get_host_registry_conn():
+    fencing_dir = get_host_fencing_dir()
+    fencing_dir.mkdir(parents=True, exist_ok=True)
+    db_path = fencing_dir / "host_registry.db"
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        try:
+            conn.execute("SELECT 1 FROM stores LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("CREATE TABLE IF NOT EXISTS stores (db_path TEXT PRIMARY KEY)")
+        yield conn
+    finally:
+        conn.close()
+
+
 class StateTransitionError(ValueError):
     pass
 
@@ -66,6 +100,12 @@ class Store:
     def __init__(self, db_path):
         self.db_path = str(Path(db_path).resolve())
         self._init_db()
+        self._register_store()
+
+    def _register_store(self):
+        with host_fencing_lock():
+            with get_host_registry_conn() as reg_conn:
+                reg_conn.execute("INSERT OR IGNORE INTO stores (db_path) VALUES (?)", (self.db_path,))
 
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -185,6 +225,46 @@ class Store:
                 if req_p.is_relative_to(act_p) or act_p.is_relative_to(req_p):
                     raise ValueError(f"Path overlap: {req_p} overlaps with {act_p} (task {task_id})")
 
+    def check_host_wide_path_overlap(self, current_conn, requested_paths):
+        with get_host_registry_conn() as reg_conn:
+            cursor = reg_conn.execute("SELECT db_path FROM stores")
+            store_dbs = [row[0] for row in cursor.fetchall()]
+
+        for s_db in store_dbs:
+            if not os.path.exists(s_db):
+                with get_host_registry_conn() as reg_conn:
+                    reg_conn.execute("DELETE FROM stores WHERE db_path = ?", (s_db,))
+                continue
+            if s_db == self.db_path:
+                s_conn = current_conn
+                close_conn = False
+            else:
+                s_conn = sqlite3.connect(f"file:{s_db}?mode=ro", uri=True)
+                close_conn = True
+
+            try:
+                import time
+                start_time = time.time()
+                active_paths = None
+                while True:
+                    try:
+                        active_paths = self.get_active_paths(s_conn)
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() and time.time() - start_time < 1.0:
+                            time.sleep(0.1)
+                            continue
+                        raise ValueError(f"Cannot verify path exclusivity: store {s_db} is locked or unavailable") from e
+                self.check_path_overlap(requested_paths, active_paths)
+            except ValueError as e:
+                if "Cannot verify" not in str(e):
+                    raise ValueError(f"{str(e)} in store {s_db}")
+                raise
+            finally:
+                if close_conn:
+                    s_conn.close()
+
+
     def submit_task(self, task_id, idempotency_key, payload, paths, memory_mb=1500, disk_mb=512):
         from launcher.task_profiles import resolve_task_bounds, validate_source_commit, SourceValidationError
         
@@ -220,31 +300,32 @@ class Store:
 
         payload_str = json.dumps(payload, sort_keys=True)
 
-        with self.transaction() as conn:
-            cursor = conn.execute("SELECT id, payload FROM tasks WHERE idempotency_key = ?", (idempotency_key,))
-            row = cursor.fetchone()
-            if row:
-                existing_id, existing_payload_str = row
-                if existing_payload_str == payload_str:
-                    return existing_id
-                else:
-                    raise ValueError("Conflicting payload for idempotency key")
+        with host_fencing_lock():
+            with self.transaction() as conn:
+                cursor = conn.execute("SELECT id, payload FROM tasks WHERE idempotency_key = ?", (idempotency_key,))
+                row = cursor.fetchone()
+                if row:
+                    existing_id, existing_payload_str = row
+                    if existing_payload_str == payload_str:
+                        return existing_id
+                    else:
+                        raise ValueError("Conflicting payload for idempotency key")
 
-            active_paths = self.get_active_paths(conn)
-            self.check_path_overlap(normalized_paths, active_paths)
+                self.check_host_wide_path_overlap(conn, normalized_paths)
 
-            conn.execute(
-                "INSERT INTO tasks (id, idempotency_key, payload, state) VALUES (?, ?, ?, ?)",
-                (task_id, idempotency_key, payload_str, "queued")
-            )
-            for p in normalized_paths:
-                conn.execute("INSERT INTO task_paths (task_id, path) VALUES (?, ?)", (task_id, str(Path(p).resolve())))
+                conn.execute(
+                    "INSERT INTO tasks (id, idempotency_key, payload, state) VALUES (?, ?, ?, ?)",
+                    (task_id, idempotency_key, payload_str, "queued")
+                )
+                for p in normalized_paths:
+                    conn.execute("INSERT INTO task_paths (task_id, path) VALUES (?, ?)", (task_id, str(Path(p).resolve())))
 
-            # Record reservation in task_resources (explicit payload memory_mb wins, else parameter)
-            effective_mem = int(payload["memory_mb"]) if payload.get("memory_mb") else memory_mb
-            conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, effective_mem, disk_mb))
+                # Record reservation in task_resources (explicit payload memory_mb wins, else parameter)
+                effective_mem = int(payload["memory_mb"]) if payload.get("memory_mb") else memory_mb
+                conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, effective_mem, disk_mb))
 
         return task_id
+
 
     def get_task(self, task_id):
         with self.get_conn() as conn:

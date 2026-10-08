@@ -5,6 +5,6 @@ __pycache__/
 *.log
 *.jsonl
 payload*.json
-test_*.py
+/test_*.py
 reviews/
 .config/
