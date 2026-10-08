@@ -292,6 +292,9 @@ def run_task_units(args):
                               reason=f"task-units lease {provider}")
     try:
         with provider_reservation(provider, args.id, config_dir=config_dir):
+            with launch_lock(str(lock_path)):
+                store.transition_task(args.id, "running", ("starting",),
+                                      reason=f"task-units unit launched under app.slice ({provider})")
             receipt = execute_transient_task_unit(
                 task_id=args.id,
                 command_argv=argv,
@@ -307,21 +310,23 @@ def run_task_units(args):
             )
     except Exception as e:
         with launch_lock(str(lock_path)):
-            store.transition_task(args.id, "failed", ("starting",), reason=str(e)[:400])
+            store.transition_task(args.id, "failed", ("starting", "running"), reason=str(e)[:400])
         print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
         return 1
     completed_ok = False
     with launch_lock(str(lock_path)):
         if receipt.get("exit_code") == 0:
             store.transition_task(
-                args.id, "completed-awaiting-review", ("starting",),
+                args.id, "completed-awaiting-review", ("starting", "running"),
                 reason="task-units sibling unit exit 0",
             )
             print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
             completed_ok = True
         else:
-            store.transition_task(args.id, "failed", ("starting",),
-                                  reason=f"task-units exit {receipt.get('exit_code')}")
+            store.transition_task(
+                args.id, "failed", ("starting", "running"),
+                reason=f"task-units exit {receipt.get('exit_code')}",
+            )
             print(json.dumps({"backend": "task-units", "task_id": args.id, "receipt": receipt}))
 
     if completed_ok:

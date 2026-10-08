@@ -1,6 +1,7 @@
 """Unit and source tests for manager-spawned sibling systemd TASK units (C2438 / C2441)."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -10,6 +11,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from launcher.cli import run_task_units
+from launcher.store import Store
 
 from launcher.task_units import (
     HEAD_SCOPE_FORBIDDEN_MARKERS,
@@ -837,8 +841,6 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(kill_or_stop, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 class TestParseToolEvents(unittest.TestCase):
     def test_parse_tool_events_deduplicates_paired_events(self):
@@ -886,3 +888,196 @@ class TestParseToolEvents(unittest.TestCase):
         self.assertEqual(distinct[1]["state"], "ACTIVE")
         self.assertEqual(distinct[2]["tool_name"], "t2")
         self.assertEqual(distinct[2]["state"], "ACTIVE")
+
+
+class TestTaskUnitsLifecycleTransitions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Path(self.tmp.name)
+        self.store = Store(str(self.cfg / "state.db"))
+        self.task_id = "t-lifecycle-1"
+        self.store.submit_task(
+            self.task_id,
+            "k-lifecycle-1",
+            {"owner": "ql", "cwd": self.tmp.name, "timeout": 60, "goal": "test goal", "provider": "grok"},
+            [str(self.cfg / "p-1")],
+        )
+        self.args = argparse.Namespace(
+            id=self.task_id,
+            cwd=self.tmp.name,
+            tmpdir=str(self.cfg / "tmp"),
+            backend="task-units",
+            config_dir=str(self.cfg),
+            as_controller=True,
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_run_task_units_transitions_queued_starting_running_to_completed(self):
+        observed_states = []
+
+        def fake_execute(*args, **kwargs):
+            current_state = self.store.get_task(self.task_id)["state"]
+            observed_states.append(current_state)
+            return {"exit_code": 0, "unit": "agent-task-test.service", "invocation_id": "inv-1"}
+
+        transitions = []
+        orig_transition = self.store.transition_task
+
+        def spy_transition(tid, new_state, expected_states, **kwargs):
+            transitions.append((new_state, expected_states))
+            return orig_transition(tid, new_state, expected_states, **kwargs)
+
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute), \
+             patch.object(self.store, "transition_task", side_effect=spy_transition), \
+             patch("launcher.cli.get_store", return_value=self.store), \
+             patch("launcher.watch.watch_loop", return_value=None):
+            rc = run_task_units(self.args)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(observed_states, ["running"])
+        self.assertEqual(
+            transitions,
+            [
+                ("starting", ("queued",)),
+                ("running", ("starting",)),
+                ("completed-awaiting-review", ("starting", "running")),
+            ],
+        )
+        final_task = self.store.get_task(self.task_id)
+        self.assertEqual(final_task["state"], "completed-awaiting-review")
+
+    def test_run_task_units_transitions_running_to_failed_on_nonzero_exit(self):
+        observed_states = []
+
+        def fake_execute(*args, **kwargs):
+            current_state = self.store.get_task(self.task_id)["state"]
+            observed_states.append(current_state)
+            return {"exit_code": 1, "unit": "agent-task-test.service", "invocation_id": "inv-1"}
+
+        transitions = []
+        orig_transition = self.store.transition_task
+
+        def spy_transition(tid, new_state, expected_states, **kwargs):
+            transitions.append((new_state, expected_states))
+            return orig_transition(tid, new_state, expected_states, **kwargs)
+
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute), \
+             patch.object(self.store, "transition_task", side_effect=spy_transition), \
+             patch("launcher.cli.get_store", return_value=self.store):
+            rc = run_task_units(self.args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(observed_states, ["running"])
+        self.assertEqual(
+            transitions,
+            [
+                ("starting", ("queued",)),
+                ("running", ("starting",)),
+                ("failed", ("starting", "running")),
+            ],
+        )
+        final_task = self.store.get_task(self.task_id)
+        self.assertEqual(final_task["state"], "failed")
+
+    def test_run_task_units_transitions_running_to_failed_on_execution_exception(self):
+        observed_states = []
+
+        def fake_execute(*args, **kwargs):
+            current_state = self.store.get_task(self.task_id)["state"]
+            observed_states.append(current_state)
+            raise RuntimeError("transient unit execution failed")
+
+        transitions = []
+        orig_transition = self.store.transition_task
+
+        def spy_transition(tid, new_state, expected_states, **kwargs):
+            transitions.append((new_state, expected_states))
+            return orig_transition(tid, new_state, expected_states, **kwargs)
+
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute), \
+             patch.object(self.store, "transition_task", side_effect=spy_transition), \
+             patch("launcher.cli.get_store", return_value=self.store):
+            rc = run_task_units(self.args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(observed_states, ["running"])
+        self.assertEqual(
+            transitions,
+            [
+                ("starting", ("queued",)),
+                ("running", ("starting",)),
+                ("failed", ("starting", "running")),
+            ],
+        )
+        final_task = self.store.get_task(self.task_id)
+        self.assertEqual(final_task["state"], "failed")
+
+    def test_run_task_units_transitions_starting_to_failed_if_reservation_fails(self):
+        transitions = []
+        orig_transition = self.store.transition_task
+
+        def spy_transition(tid, new_state, expected_states, **kwargs):
+            transitions.append((new_state, expected_states))
+            return orig_transition(tid, new_state, expected_states, **kwargs)
+
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.capacity.provider_reservation", side_effect=RuntimeError("capacity full")), \
+             patch.object(self.store, "transition_task", side_effect=spy_transition), \
+             patch("launcher.cli.get_store", return_value=self.store):
+            rc = run_task_units(self.args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            transitions,
+            [
+                ("starting", ("queued",)),
+                ("failed", ("starting", "running")),
+            ],
+        )
+        final_task = self.store.get_task(self.task_id)
+        self.assertEqual(final_task["state"], "failed")
+
+    def test_store_complete_task_succeeds_on_running_task(self):
+        # Verify that entering 'running' allows Store.complete_task to succeed
+        def fake_execute(*args, **kwargs):
+            # In running state, Store.complete_task succeeds
+            self.store.complete_task(
+                self.task_id, reviewer="reviewer-head", reason="manual reviewer completion"
+            )
+            return {"exit_code": 0, "unit": "agent-task-test.service", "invocation_id": "inv-1"}
+
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute), \
+             patch("launcher.cli.get_store", return_value=self.store), \
+             patch("launcher.watch.watch_loop", return_value=None):
+            # Since complete_task already moved it to completed-awaiting-review,
+            # run_task_units will try to transition from starting/running to completed-awaiting-review.
+            # That will fail because task is already completed-awaiting-review.
+            pass
+
+        # Direct verification on store:
+        # submit -> starting -> running -> complete_task
+        task_id = "t-complete-test"
+        self.store.submit_task(
+            task_id, "k-complete",
+            {"owner": "ql", "cwd": self.tmp.name, "timeout": 60, "goal": "x", "provider": "grok"},
+            [str(self.cfg / "p-c")],
+        )
+        self.store.transition_task(task_id, "starting", ("queued",))
+        self.store.transition_task(task_id, "running", ("starting",))
+        self.store.complete_task(task_id, reviewer="reviewer-head", reason="completed")
+        self.assertEqual(self.store.get_task(task_id)["state"], "completed-awaiting-review")
+
+
+if __name__ == "__main__":
+    unittest.main()

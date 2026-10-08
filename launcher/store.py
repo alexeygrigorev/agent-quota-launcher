@@ -392,6 +392,14 @@ class Store:
 
     def list_review_receipts(self, task_id: str = None):
         """Retrieve review receipts ordered by creation time."""
+        def _parse_details(raw):
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return {"raw": raw}
+
         with self.get_conn() as conn:
             if task_id:
                 cursor = conn.execute(
@@ -411,7 +419,7 @@ class Store:
                     "reviewer_model": r[4],
                     "verdict": r[5],
                     "status": r[6],
-                    "details": json.loads(r[7]) if r[7] else {},
+                    "details": _parse_details(r[7]),
                     "created_at": r[8],
                     "report_path": r[9],
                     "report_sha256": r[10],

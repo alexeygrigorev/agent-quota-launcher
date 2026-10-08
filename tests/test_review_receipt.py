@@ -765,6 +765,48 @@ class TestReviewReceiptValidation(unittest.TestCase):
         self.assertEqual(status, "missing_report_file")
         self.assertIn("is a symlink", details["error"])
 
+    def test_list_review_receipts_handles_non_json_plain_text_details(self):
+        """Verify list_review_receipts safely handles legacy/corrupted non-JSON plain text details."""
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_receipts (
+                    task_id, source_commit, reviewer_session, reviewer_model,
+                    head_session, verdict, status, details, report_path, report_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "test-task-plain-text",
+                    "c0ffee1234567890abcdef1234567890abcdef12",
+                    "legacy-session-1",
+                    "legacy-model-1",
+                    "head-session-1",
+                    "ACCEPT",
+                    "accepted",
+                    "Historical audit note: manually verified report without JSON format",
+                    str(self.report_file),
+                    self.report_sha,
+                ),
+            )
+
+        # By task_id
+        receipts = self.store.list_review_receipts("test-task-plain-text")
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["task_id"], "test-task-plain-text")
+        self.assertEqual(
+            receipts[0]["details"],
+            {"raw": "Historical audit note: manually verified report without JSON format"},
+        )
+
+        # All receipts
+        all_receipts = self.store.list_review_receipts()
+        matched = [r for r in all_receipts if r["task_id"] == "test-task-plain-text"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(
+            matched[0]["details"],
+            {"raw": "Historical audit note: manually verified report without JSON format"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
