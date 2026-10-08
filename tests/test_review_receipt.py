@@ -33,6 +33,7 @@ class TestReviewReceiptValidation(unittest.TestCase):
             "source_repo": str(self.tmp_path),
             "source_commit": "abcdef1234567890abcdef1234567890abcdef12",
             "head_session_id": "0f125477-96a0-4474-b516-bd90ea78872d",
+            "author_model": "gpt-5-codex",
             "reviewer": {
                 "session_id": "b56e0876-3dc7-4931-ae7c-ed076cbf48b9",
                 "model": "glm-5.3-flash",
@@ -402,6 +403,211 @@ class TestReviewReceiptValidation(unittest.TestCase):
             details["error"],
             f"Task {task_id_rejected} is already in terminal state 'rejected'; review replay prohibited",
         )
+
+    def test_missing_author_model_rejection(self):
+        """Receipt without author_model or with empty string must be rejected when require_model_provenance=True."""
+        # 1. Missing author_model key
+        receipt_missing = dict(self.base_receipt)
+        receipt_missing.pop("author_model", None)
+        accepted, status, details = validate_review_receipt(
+            receipt_missing, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Author model provenance required: author_model must be a non-empty string",
+        )
+
+        # 2. None author_model
+        receipt_none = dict(self.base_receipt, author_model=None)
+        accepted, status, details = validate_review_receipt(
+            receipt_none, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Author model provenance required: author_model must be a non-empty string",
+        )
+
+        # 3. Empty string author_model
+        receipt_empty = dict(self.base_receipt, author_model="")
+        accepted, status, details = validate_review_receipt(
+            receipt_empty, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Author model provenance required: author_model must be a non-empty string",
+        )
+
+        # 4. Whitespace-only author_model
+        receipt_ws = dict(self.base_receipt, author_model="   ")
+        accepted, status, details = validate_review_receipt(
+            receipt_ws, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Author model provenance required: author_model must be a non-empty string",
+        )
+
+    def test_missing_reviewer_model_rejection(self):
+        """Receipt without reviewer.model must be rejected with rejected_missing_model_provenance."""
+        # 1. Missing model key in reviewer
+        receipt_missing = dict(self.base_receipt)
+        receipt_missing["reviewer"] = dict(receipt_missing["reviewer"])
+        receipt_missing["reviewer"].pop("model", None)
+        accepted, status, details = validate_review_receipt(
+            receipt_missing, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Reviewer model provenance required: reviewer.model must be a non-empty string",
+        )
+
+        # 2. None model in reviewer
+        receipt_none = dict(self.base_receipt)
+        receipt_none["reviewer"] = dict(receipt_none["reviewer"], model=None)
+        accepted, status, details = validate_review_receipt(
+            receipt_none, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Reviewer model provenance required: reviewer.model must be a non-empty string",
+        )
+
+        # 3. Empty string model in reviewer
+        receipt_empty = dict(self.base_receipt)
+        receipt_empty["reviewer"] = dict(receipt_empty["reviewer"], model="")
+        accepted, status, details = validate_review_receipt(
+            receipt_empty, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Reviewer model provenance required: reviewer.model must be a non-empty string",
+        )
+
+    def test_missing_first_tool_timestamp_rejection(self):
+        """Receipt without first_tool_timestamp is rejected with status missing_first_tool_timestamp."""
+        # 1. Missing first_tool_timestamp key
+        receipt_missing = dict(self.base_receipt)
+        receipt_missing["reviewer"] = dict(receipt_missing["reviewer"])
+        receipt_missing["reviewer"].pop("first_tool_timestamp", None)
+        accepted, status, details = validate_review_receipt(
+            receipt_missing, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "missing_first_tool_timestamp")
+        self.assertEqual(
+            details["error"],
+            "reviewer first_tool_timestamp is required for temporal qualification",
+        )
+
+        # 2. None first_tool_timestamp
+        receipt_none = dict(self.base_receipt)
+        receipt_none["reviewer"] = dict(receipt_none["reviewer"], first_tool_timestamp=None)
+        accepted, status, details = validate_review_receipt(
+            receipt_none, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "missing_first_tool_timestamp")
+        self.assertEqual(
+            details["error"],
+            "reviewer first_tool_timestamp is required for temporal qualification",
+        )
+
+        # 3. Empty string first_tool_timestamp
+        receipt_empty = dict(self.base_receipt)
+        receipt_empty["reviewer"] = dict(receipt_empty["reviewer"], first_tool_timestamp="")
+        accepted, status, details = validate_review_receipt(
+            receipt_empty, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "missing_first_tool_timestamp")
+        self.assertEqual(
+            details["error"],
+            "reviewer first_tool_timestamp is required for temporal qualification",
+        )
+
+        # 4. Invalid ISO timestamp format
+        receipt_invalid = dict(self.base_receipt)
+        receipt_invalid["reviewer"] = dict(receipt_invalid["reviewer"], first_tool_timestamp="not-a-valid-timestamp")
+        accepted, status, details = validate_review_receipt(
+            receipt_invalid, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "invalid_first_tool_timestamp")
+        self.assertIn("is not a valid ISO timestamp", details["error"])
+
+    def test_author_model_unknown_rejected_when_not_allowed(self):
+        """Receipt with author_model='unknown' must be rejected when allow_unknown_author=False."""
+        receipt = dict(self.base_receipt, author_model="unknown")
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_model_provenance=True, allow_unknown_author=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details["error"],
+            "Author model provenance required: 'unknown' author prohibited unless allow_unknown_author=True",
+        )
+
+        # Also test default allow_unknown_author=False
+        accepted_default, status_default, details_default = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_model_provenance=True
+        )
+        self.assertFalse(accepted_default)
+        self.assertEqual(status_default, "rejected_missing_model_provenance")
+        self.assertEqual(
+            details_default["error"],
+            "Author model provenance required: 'unknown' author prohibited unless allow_unknown_author=True",
+        )
+
+    def test_archival_receipt_with_unknown_author_allowed(self):
+        """Archival receipt with author_model='unknown' is allowed when allow_unknown_author=True or require_model_provenance=False."""
+        receipt = dict(self.base_receipt, author_model="unknown")
+        # Allowed when require_model_provenance=False
+        accepted_legacy, status_legacy, details_legacy = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_model_provenance=False
+        )
+        self.assertTrue(accepted_legacy)
+        self.assertEqual(status_legacy, "accepted")
+        self.assertEqual(details_legacy["verdict"], "ACCEPT")
+
+        # Also accepted when allow_unknown_author=True (with require_model_provenance=True)
+        accepted_archival, status_archival, details_archival = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False, require_model_provenance=True, allow_unknown_author=True
+        )
+        self.assertTrue(accepted_archival)
+        self.assertEqual(status_archival, "accepted")
+        self.assertEqual(details_archival["verdict"], "ACCEPT")
+
+    def test_temporal_inconsistency_first_tool_postdates_completed(self):
+        """Receipt where first_tool_timestamp postdates completed_at must be rejected."""
+        now = datetime.now(timezone.utc)
+        receipt = dict(self.base_receipt)
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            started_at=(now - timedelta(seconds=120)).isoformat(),
+            completed_at=(now - timedelta(seconds=60)).isoformat(),
+            first_tool_timestamp=now.isoformat(),
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=False, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_temporal_inconsistency")
+        self.assertIn("postdates completed_at", details["error"])
 
 
 if __name__ == "__main__":

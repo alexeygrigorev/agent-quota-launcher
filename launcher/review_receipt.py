@@ -9,6 +9,8 @@ Validates review receipts against:
 6. Negative History Preservation: all review attempts preserved without silent erasure.
 7. Anti-Same-Model-Review: reviewer model must not match author model.
 8. No-Terminal-Replay: review replay prohibited for tasks already in terminal state.
+9. Model Provenance: fail-closed validation of non-empty author_model and reviewer.model.
+10. First-Tool Evidence: verified first_tool command and valid ISO first_tool_timestamp.
 """
 from __future__ import annotations
 
@@ -166,6 +168,8 @@ def validate_review_receipt(
     verify_git: bool = True,
     require_witness: bool = False,
     store: Optional[Any] = None,
+    require_model_provenance: bool = True,
+    allow_unknown_author: bool = False,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Validate a review receipt against independence, contract, hash, and timing rules.
 
@@ -212,11 +216,26 @@ def validate_review_receipt(
             "head_session": head_session,
         }
 
-    # 1b. Anti-Same-Model-Review Rule
+    # 1b. Anti-Same-Model-Review & Model Provenance Rule
     raw_author_model = receipt.get("author_model")
     raw_reviewer_model = reviewer_info.get("model")
     author_model = str(raw_author_model).strip() if raw_author_model is not None else ""
     reviewer_model = str(raw_reviewer_model).strip() if raw_reviewer_model is not None else ""
+
+    if require_model_provenance:
+        if not reviewer_model:
+            return False, "rejected_missing_model_provenance", {
+                "error": "Reviewer model provenance required: reviewer.model must be a non-empty string",
+            }
+        if not author_model:
+            return False, "rejected_missing_model_provenance", {
+                "error": "Author model provenance required: author_model must be a non-empty string",
+            }
+        if author_model.lower() == "unknown" and not allow_unknown_author:
+            return False, "rejected_missing_model_provenance", {
+                "error": "Author model provenance required: 'unknown' author prohibited unless allow_unknown_author=True",
+            }
+
     if author_model and reviewer_model and author_model.lower() == reviewer_model.lower():
         return False, "rejected_same_model_review", {
             "error": "Same-model review rejected: reviewer model matches author model",
@@ -241,17 +260,27 @@ def validate_review_receipt(
             "verdict": verdict,
         }
 
-    # 4. First-Tool Evidence
+    # 4. First-Tool Evidence and Temporal Qualification
     first_tool = reviewer_info.get("first_tool")
     if not first_tool:
         return False, "missing_first_tool_evidence", {
             "error": "reviewer first_tool trace is required for independent verification",
         }
 
+    first_tool_time_str = reviewer_info.get("first_tool_timestamp")
+    if not first_tool_time_str:
+        return False, "missing_first_tool_timestamp", {
+            "error": "reviewer first_tool_timestamp is required for temporal qualification",
+        }
+    first_tool_time = parse_iso_time(first_tool_time_str)
+    if not first_tool_time:
+        return False, "invalid_first_tool_timestamp", {
+            "error": f"reviewer first_tool_timestamp '{first_tool_time_str}' is not a valid ISO timestamp",
+        }
+
     # 5. Temporal Consistency
     started_at = parse_iso_time(reviewer_info.get("started_at"))
     completed_at = parse_iso_time(reviewer_info.get("completed_at"))
-    first_tool_time = parse_iso_time(reviewer_info.get("first_tool_timestamp"))
 
     if started_at and completed_at and completed_at < started_at:
         return False, "rejected_temporal_inconsistency", {
@@ -260,6 +289,10 @@ def validate_review_receipt(
     if started_at and first_tool_time and first_tool_time < started_at:
         return False, "rejected_temporal_inconsistency", {
             "error": f"reviewer first_tool_timestamp ({first_tool_time}) precedes started_at ({started_at})",
+        }
+    if completed_at and first_tool_time and first_tool_time > completed_at:
+        return False, "rejected_temporal_inconsistency", {
+            "error": f"reviewer first_tool_timestamp ({first_tool_time}) postdates completed_at ({completed_at})",
         }
 
     # 6. Report File and Hash Integrity
