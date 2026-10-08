@@ -227,6 +227,7 @@ def run_task_units(args):
         return 1
 
     chosen_provider = None
+    chosen_model = None
     if quse == {"ok": True}:
         chosen_provider = requested_provider or "grok"
     else:
@@ -245,11 +246,13 @@ def run_task_units(args):
             ]
             if matching:
                 chosen_provider = requested_provider
+                chosen_model = matching[0].get("model")
             elif allow_fallback:
                 seed = int(time.time() * 1000)
                 chosen, provenance = select_candidate(valid_routes, seed=seed)
                 if chosen:
                     chosen_provider = chosen.get("provider")
+                    chosen_model = chosen.get("model")
             if not chosen_provider:
                 reason = rejections.get(requested_provider, "provider route rejected or at capacity")
                 full_reason = f"admission: requested provider '{requested_provider}' rejected: {reason}"
@@ -283,9 +286,11 @@ def run_task_units(args):
                     pass
                 return 1
             chosen_provider = chosen.get("provider")
+            chosen_model = chosen.get("model")
 
     provider = chosen_provider
-    argv = build_adapter_argv(provider, goal)
+    model = chosen_model or payload.get("model")
+    argv = build_adapter_argv(provider, goal, model=model)
     # C2456: hold launch.lock only for Store lease, not the model wait.
     with launch_lock(str(lock_path)):
         store.transition_task(args.id, "starting", ("queued",),

@@ -244,6 +244,54 @@ class TaskUnitsCliTests(unittest.TestCase):
         self.assertTrue(any(str(x).startswith("PATH=") for x in captured["cmd"]))
         self.assertNotIn("--wait", captured["cmd"])
 
+    def test_run_task_units_passes_model_to_build_adapter_argv(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name)
+        store = Store(str(cfg / "state.db"))
+        store.submit_task(
+            "t-model-bind", "k-model-bind",
+            {
+                "owner": "ql",
+                "cwd": tmp.name,
+                "timeout": 60,
+                "goal": "review",
+                "provider": "antigravity",
+                "model_requirements": {"models": ["gemini-3.8-flash-high"]},
+            },
+            [str(cfg / "p-mb")],
+        )
+        args = argparse.Namespace(
+            id="t-model-bind", cwd=tmp.name, tmpdir=str(cfg / "tmp"),
+            backend="task-units", config_dir=str(cfg), as_controller=True,
+        )
+        captured = {}
+        fake_quse = {
+            "gemini": {
+                "status": "ok",
+                "windows": {
+                    "7d": {
+                        "percent_remaining": 50.0,
+                        "reset_at": "2026-10-15T00:00:00+00:00",
+                    }
+                }
+            }
+        }
+        def fake_build_argv(provider, goal, model=None):
+            captured["provider"] = provider
+            captured["model"] = model
+            return ["/bin/true", "--model", model or ""]
+
+        with patch("launcher.admission.fetch_quse", return_value=fake_quse), \
+             patch("launcher.launch.build_adapter_argv", side_effect=fake_build_argv), \
+             patch("launcher.task_units.execute_transient_task_unit",
+                   return_value={"exit_code": 0, "unit": "x", "invocation_id": "i"}):
+            rc = run_task_units(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured.get("provider"), "antigravity")
+        self.assertEqual(captured.get("model"), "gemini-3.8-flash-high")
+        self.assertEqual(store.get_task("t-model-bind")["state"], "completed-awaiting-review")
+
 
 if __name__ == "__main__":
     unittest.main()
