@@ -303,6 +303,106 @@ class TestReviewReceiptValidation(unittest.TestCase):
         self.assertEqual(parsed["task_id"], "test-task-1")
         self.assertEqual(len(parsed["review_prompt"]), 500)
 
+    def test_same_model_review_rejection(self):
+        """Receipt with matching author_model and reviewer.model must be rejected."""
+        receipt = dict(self.base_receipt)
+        receipt["author_model"] = "gemini-3.8-flash-high"
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            model="gemini-3.8-flash-high",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_same_model_review")
+        self.assertEqual(
+            details["error"],
+            "Same-model review rejected: reviewer model matches author model",
+        )
+
+        # Case-insensitive and whitespace-stripped match
+        receipt_case = dict(self.base_receipt)
+        receipt_case["author_model"] = "  Gemini-3.8-Flash-High  "
+        receipt_case["reviewer"] = dict(
+            receipt_case["reviewer"],
+            model="gemini-3.8-flash-high",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt_case, verify_files=True, verify_git=False
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_same_model_review")
+
+    def test_different_model_review_accepted(self):
+        """Receipt with different models (e.g. gemini-3.8-flash-high vs gemini-3.1-pro-high) is accepted."""
+        receipt = dict(self.base_receipt)
+        receipt["author_model"] = "gemini-3.8-flash-high"
+        receipt["reviewer"] = dict(
+            receipt["reviewer"],
+            model="gemini-3.1-pro-high",
+        )
+        accepted, status, details = validate_review_receipt(
+            receipt, verify_files=True, verify_git=False
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(status, "accepted")
+        self.assertEqual(details["verdict"], "ACCEPT")
+
+    def test_terminal_task_replay_rejection(self):
+        """Submitting a review receipt for a task already in 'accepted' or 'failed' state in store is rejected."""
+        payload = {"goal": "test", "owner": "test-owner", "cwd": ".", "timeout": 600}
+
+        # 1. Terminal state 'accepted'
+        task_id_accepted = "task-terminal-accepted"
+        self.store.submit_task(task_id_accepted, "key-term-accepted", payload, [])
+        self.store.transition_task(task_id_accepted, "completed-awaiting-review", ("queued",))
+        self.store.accept_task(task_id_accepted, reviewer="rev-accept-1")
+
+        receipt_acc = dict(self.base_receipt, task_id=task_id_accepted)
+        accepted, status, details = validate_review_receipt(
+            receipt_acc, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_terminal_replay")
+        self.assertEqual(
+            details["error"],
+            f"Task {task_id_accepted} is already in terminal state 'accepted'; review replay prohibited",
+        )
+
+        # 2. Terminal state 'failed'
+        task_id_failed = "task-terminal-failed"
+        self.store.submit_task(task_id_failed, "key-term-failed", payload, [])
+        self.store.transition_task(task_id_failed, "failed", ("queued",), reason="native death")
+
+        receipt_fail = dict(self.base_receipt, task_id=task_id_failed)
+        accepted, status, details = validate_review_receipt(
+            receipt_fail, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_terminal_replay")
+        self.assertEqual(
+            details["error"],
+            f"Task {task_id_failed} is already in terminal state 'failed'; review replay prohibited",
+        )
+
+        # 3. Terminal state 'rejected'
+        task_id_rejected = "task-terminal-rejected"
+        self.store.submit_task(task_id_rejected, "key-term-rejected", payload, [])
+        self.store.transition_task(task_id_rejected, "completed-awaiting-review", ("queued",))
+        self.store.reject_task(task_id_rejected, reviewer="rev-reject-1", reason="verdict reject")
+
+        receipt_rej = dict(self.base_receipt, task_id=task_id_rejected)
+        accepted, status, details = validate_review_receipt(
+            receipt_rej, verify_files=True, verify_git=False, store=self.store
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(status, "rejected_terminal_replay")
+        self.assertEqual(
+            details["error"],
+            f"Task {task_id_rejected} is already in terminal state 'rejected'; review replay prohibited",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@ Validates review receipts against:
 4. Temporal Consistency: reviewer must start after source commit, report must not predate review.
 5. Valid Verdicts: ACCEPT, CHANGES_REQUESTED, REJECT.
 6. Negative History Preservation: all review attempts preserved without silent erasure.
+7. Anti-Same-Model-Review: reviewer model must not match author model.
+8. No-Terminal-Replay: review replay prohibited for tasks already in terminal state.
 """
 from __future__ import annotations
 
@@ -183,6 +185,13 @@ def validate_review_receipt(
                 return False, "rejected_unknown_task", {
                     "error": f"task_id '{task_id}' not found in store",
                 }
+            task_state = t.get("state") if isinstance(t, dict) else getattr(t, "state", None)
+            if task_state in ("accepted", "rejected", "failed"):
+                return False, "rejected_terminal_replay", {
+                    "error": f"Task {task_id} is already in terminal state '{task_state}'; review replay prohibited",
+                    "task_id": task_id,
+                    "task_state": task_state,
+                }
         except Exception:
             pass
 
@@ -201,6 +210,18 @@ def validate_review_receipt(
             "error": "Self-authored review rejected: reviewer session matches author/head session",
             "reviewer_session": reviewer_session,
             "head_session": head_session,
+        }
+
+    # 1b. Anti-Same-Model-Review Rule
+    raw_author_model = receipt.get("author_model")
+    raw_reviewer_model = reviewer_info.get("model")
+    author_model = str(raw_author_model).strip() if raw_author_model is not None else ""
+    reviewer_model = str(raw_reviewer_model).strip() if raw_reviewer_model is not None else ""
+    if author_model and reviewer_model and author_model.lower() == reviewer_model.lower():
+        return False, "rejected_same_model_review", {
+            "error": "Same-model review rejected: reviewer model matches author model",
+            "author_model": author_model,
+            "reviewer_model": reviewer_model,
         }
 
     # 2. Prompt Independence Rule
