@@ -28,6 +28,7 @@ from launcher.task_units import (
     assert_cgroup_outside_head,
     build_systemd_run_argv,
     execute_transient_task_unit,
+    find_enclosing_git_root,
     generate_prelude_code,
     invocation_ids_match,
     parse_invocation_id,
@@ -383,6 +384,8 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             repo = Path(tmp_dir) / "repo"
             repo.mkdir()
+            work_dir = repo / "work"
+            work_dir.mkdir()
             tmpdir = repo / ".local" / "tmp" / "t1"
             tmpdir.mkdir(parents=True)
             valid_quse = {
@@ -405,19 +408,19 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
                 tmpdir=str(tmpdir),
                 quse_json=valid_quse,
                 protect_system="strict",
-                read_only_paths=["/repo"],
-                read_write_paths=["/repo/work", "/repo/tmp"],
+                read_only_paths=[str(repo)],
+                read_write_paths=[str(work_dir), str(tmpdir)],
             )
 
             mock_build.assert_called_once()
             _, kwargs = mock_build.call_args
             self.assertEqual(kwargs.get("protect_system"), "strict")
-            self.assertEqual(kwargs.get("read_only_paths"), ["/repo"])
-            self.assertEqual(kwargs.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+            self.assertEqual(kwargs.get("read_only_paths"), [str(repo)])
+            self.assertEqual(kwargs.get("read_write_paths"), [str(work_dir), str(tmpdir)])
 
             self.assertEqual(receipt.get("protect_system"), "strict")
-            self.assertEqual(receipt.get("read_only_paths"), ["/repo"])
-            self.assertEqual(receipt.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+            self.assertEqual(receipt.get("read_only_paths"), [str(repo)])
+            self.assertEqual(receipt.get("read_write_paths"), [str(work_dir), str(tmpdir)])
 
     @patch("launcher.task_units.check_resources", return_value=True)
     @patch("subprocess.run")
@@ -433,6 +436,8 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             repo = Path(tmp_dir) / "repo"
             repo.mkdir()
+            work_dir = repo / "work"
+            work_dir.mkdir()
             tmpdir = repo / ".local" / "tmp" / "t1"
             tmpdir.mkdir(parents=True)
             valid_quse = {
@@ -455,19 +460,128 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
                 tmpdir=str(tmpdir),
                 quse_json=valid_quse,
                 protect_system="strict",
-                read_only_paths=["/repo"],
-                read_write_paths=["/repo/work", "/repo/tmp"],
+                read_only_paths=[str(repo)],
+                read_write_paths=[str(work_dir), str(tmpdir)],
             )
 
             mock_build.assert_called_once()
             _, kwargs = mock_build.call_args
             self.assertEqual(kwargs.get("protect_system"), "strict")
-            self.assertEqual(kwargs.get("read_only_paths"), ["/repo"])
-            self.assertEqual(kwargs.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+            self.assertEqual(kwargs.get("read_only_paths"), [str(repo)])
+            self.assertEqual(kwargs.get("read_write_paths"), [str(work_dir), str(tmpdir)])
 
             self.assertEqual(receipt.get("protect_system"), "strict")
-            self.assertEqual(receipt.get("read_only_paths"), ["/repo"])
-            self.assertEqual(receipt.get("read_write_paths"), ["/repo/work", "/repo/tmp"])
+            self.assertEqual(receipt.get("read_only_paths"), [str(repo)])
+            self.assertEqual(receipt.get("read_write_paths"), [str(work_dir), str(tmpdir)])
+
+    def test_find_enclosing_git_root(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_root = Path(tmp_dir).resolve()
+            repo = tmp_root / "repo"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            nested = repo / "a" / "b" / "c"
+            nested.mkdir(parents=True)
+
+            # Verifies returns repository root for nested paths
+            self.assertEqual(find_enclosing_git_root(nested), repo)
+            self.assertEqual(find_enclosing_git_root(str(nested)), repo)
+            self.assertEqual(find_enclosing_git_root(repo), repo)
+
+            # Falls back to path if no .git exists
+            no_git = tmp_root / "no_git_dir" / "sub"
+            no_git.mkdir(parents=True)
+            self.assertEqual(find_enclosing_git_root(no_git), no_git)
+            self.assertEqual(find_enclosing_git_root(str(no_git)), no_git)
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {"ControlGroup": "app.slice/agent-task-t_default.service", "ActiveState": "inactive", "SubState": "dead", "InvocationID": "inv12345"}))
+    @patch("subprocess.Popen")
+    @patch("launcher.task_units.build_systemd_run_argv")
+    def test_execute_transient_task_unit_derives_mandatory_isolation_policy(self, mock_build, mock_popen, mock_cleanup, mock_res):
+        proc_inst = MagicMock()
+        proc_inst.returncode = 0
+        proc_inst.communicate.return_value = ("Running as unit: agent-task-t_default.service; invocation ID: inv12345\n", "")
+        mock_popen.return_value = proc_inst
+        mock_build.return_value = ["systemd-run", "--unit=agent-task-t_default.service", "--"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_root = Path(tmp_dir).resolve()
+            repo = tmp_root / "repo"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            workspace = repo / "workspace"
+            workspace.mkdir()
+            tmpdir = workspace / ".local" / "tmp" / "t_default"
+            tmpdir.mkdir(parents=True)
+            valid_quse = {
+                "zai": {
+                    "status": "ok",
+                    "windows": {
+                        "7d": {
+                            "percent_remaining": 65.0,
+                            "reset_at": "2099-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            }
+
+            receipt = execute_transient_task_unit(
+                task_id="t_default",
+                command_argv=["echo", "hello"],
+                memory_mb=512,
+                workspace=str(workspace),
+                tmpdir=str(tmpdir),
+                quse_json=valid_quse,
+            )
+
+            expected_git_root = find_enclosing_git_root(workspace)
+            self.assertEqual(expected_git_root, repo)
+            self.assertEqual(receipt.get("protect_system"), "strict")
+            self.assertEqual(receipt.get("read_only_paths"), [str(find_enclosing_git_root(workspace))])
+            self.assertEqual(receipt.get("read_write_paths"), [str(workspace), str(tmpdir)])
+
+            mock_build.assert_called_once()
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs.get("protect_system"), "strict")
+            self.assertEqual(kwargs.get("read_only_paths"), [str(find_enclosing_git_root(workspace))])
+            self.assertEqual(kwargs.get("read_write_paths"), [str(workspace), str(tmpdir)])
+
+    @patch("launcher.task_units.check_resources", return_value=True)
+    def test_execute_transient_task_unit_rejects_escaping_read_write_paths(self, mock_res):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_root = Path(tmp_dir).resolve()
+            repo = tmp_root / "repo"
+            repo.mkdir()
+            tmpdir = repo / ".local" / "tmp" / "t_esc"
+            tmpdir.mkdir(parents=True)
+            valid_quse = {
+                "zai": {
+                    "status": "ok",
+                    "windows": {
+                        "7d": {
+                            "percent_remaining": 65.0,
+                            "reset_at": "2099-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            }
+
+            for escaping_path in ["/etc", "/home/alexey"]:
+                with self.assertRaises(TaskUnitAdmissionError) as ctx:
+                    execute_transient_task_unit(
+                        task_id="t_esc",
+                        command_argv=["echo", "hello"],
+                        memory_mb=512,
+                        workspace=str(repo),
+                        tmpdir=str(tmpdir),
+                        quse_json=valid_quse,
+                        read_write_paths=[escaping_path],
+                    )
+                self.assertIn(
+                    f"read_write_paths contains unauthorized escaping path outside workspace: '{escaping_path}'",
+                    str(ctx.exception),
+                )
 
 
 class TestCGroupDissolutionAndCleanup(unittest.TestCase):

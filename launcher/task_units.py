@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from launcher.admission import validate_quse
 from launcher.resources import check_resources
@@ -151,6 +151,23 @@ def assert_cgroup_outside_head(cgroup_path: str) -> bool:
                 f"cgroup '{cgroup_path}' is nested under forbidden head scope marker '{marker}'"
             )
     return True
+
+
+def find_enclosing_git_root(path: Union[str, Path]) -> Path:
+    """Traverse up from path.resolve() to find enclosing git root.
+
+    Traverses up from path.resolve() checking (current / ".git").exists().
+    If found, returns current. If root / is reached without finding .git,
+    returns Path(path).resolve().
+    """
+    current = Path(path).resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return Path(path).resolve()
+        current = parent
 
 
 def admit_task_unit(
@@ -568,6 +585,23 @@ def execute_transient_task_unit(
     if tmpdir is None:
         tmpdir = str(repo_dir / ".local" / "tmp" / task_id)
     tmpdir_path = Path(tmpdir).resolve()
+
+    # Mandatory policy binding & negative escaping path validation
+    if protect_system is None:
+        protect_system = "strict"
+    if read_only_paths is None:
+        repo_root = find_enclosing_git_root(repo_dir)
+        read_only_paths = [str(repo_root)]
+    if read_write_paths is None:
+        read_write_paths = [str(repo_dir), str(tmpdir_path)]
+    else:
+        for p in read_write_paths:
+            p_res = Path(p).resolve()
+            if not (p_res.is_relative_to(repo_dir) or p_res.is_relative_to(tmpdir_path)):
+                raise TaskUnitAdmissionError(
+                    f"read_write_paths contains unauthorized escaping path outside workspace: '{p}'"
+                )
+
     tmpdir_path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
@@ -933,6 +967,23 @@ def spawn_transient_task_unit(
     if tmpdir is None:
         tmpdir = str(repo_dir / ".local" / "tmp" / task_id)
     tmpdir_path = Path(tmpdir).resolve()
+
+    # Mandatory policy binding & negative escaping path validation
+    if protect_system is None:
+        protect_system = "strict"
+    if read_only_paths is None:
+        repo_root = find_enclosing_git_root(repo_dir)
+        read_only_paths = [str(repo_root)]
+    if read_write_paths is None:
+        read_write_paths = [str(repo_dir), str(tmpdir_path)]
+    else:
+        for p in read_write_paths:
+            p_res = Path(p).resolve()
+            if not (p_res.is_relative_to(repo_dir) or p_res.is_relative_to(tmpdir_path)):
+                raise TaskUnitAdmissionError(
+                    f"read_write_paths contains unauthorized escaping path outside workspace: '{p}'"
+                )
+
     tmpdir_path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     out_dir = Path(log_dir).resolve() if log_dir else repo_dir / ".local"
