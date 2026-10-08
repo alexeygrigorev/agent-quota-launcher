@@ -245,10 +245,24 @@ class TestAdapters(unittest.TestCase):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/home/alexey/.local/bin/zcodex")
         self.assertEqual(argv[1:4], ["exec", "--model", "glm-5.3-flash"])
+        self.assertIn("-s", argv)
+        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertIn("--json", argv)
         self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_CJS"),
                          "/opt/ZCode/resources/glm/zcode.cjs")
         self.assertEqual(argv[-1], "goal")
+
+    def test_zai_sandbox_workspace_write_enforced(self):
+        argv = build_adapter_argv("zai", "goal")
+        self.assertIn("-s", argv)
+        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_zai_no_ask_for_approval_in_exec(self):
+        argv = build_adapter_argv("zai", "goal")
+        self.assertNotIn("-a", argv)
+        self.assertNotIn("--ask-for-approval", argv)
 
     def test_codex_never_appears_as_adapter(self):
         self.assertNotIn("codex", ADAPTERS)

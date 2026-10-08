@@ -8,7 +8,7 @@ launch lifecycle. Provider argv sets are exactly:
                --effort high --dangerously-skip-permissions -p --print-timeout 0
                --output-format text <goal>   (OAuth route; ambient API keys stripped)
 - zai:         /home/alexey/.local/bin/zcodex exec --model glm-5.3-flash
-               --dangerously-bypass-approvals-and-sandbox -c
+               -s workspace-write -c
                check_for_update_on_startup=false --json <goal>
                with ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs
 
@@ -47,7 +47,7 @@ ADAPTERS = {
     },
     "zai": {
         "argv": [ZCODEX_BIN, "exec", "--model", "glm-5.3-flash",
-                 "--dangerously-bypass-approvals-and-sandbox",
+                 "-s", "workspace-write",
                  "-c", "check_for_update_on_startup=false", "--json"],
         "env": {"ZCODE_CJS": ZCODE_CJS},
     },
