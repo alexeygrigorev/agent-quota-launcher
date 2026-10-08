@@ -305,5 +305,76 @@ class TestTimeoutEnforcement(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be a number"):
             _bounded_timeout({"timeout": None})
 
+class TestDoRunWaitLoop(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        (Path(self.dir) / ".local").mkdir()
+        self.db_path = Path(self.dir) / "store.db"
+        self.store = Store(str(self.db_path))
+        self.task_id = "task1"
+        self.store.submit_task(self.task_id, "ikey", {"owner": "me", "cwd": self.dir, "timeout": 60}, [self.dir])
+        self.lock_path = str(Path(self.dir) / "launch.lock")
+
+    @patch("launcher.launch.fetch_quse")
+    @patch("launcher.launch.validate_quse")
+    @patch("launcher.launch.select_candidate")
+    @patch("launcher.launch.check_resources")
+    @patch("launcher.launch.subprocess.Popen")
+    @patch("launcher.launch.native_status")
+    @patch("launcher.launch.validate_first_action")
+    @patch("launcher.launch.time.sleep")
+    def test_early_termination_breaks_out_without_sleeping(self, mock_sleep, mock_vfa, mock_ns, mock_popen, mock_cr, mock_sc, mock_vq, mock_fq):
+        mock_vq.return_value = (["grok"], [])
+        mock_sc.return_value = ({"provider": "grok"}, "test")
+        
+        proc_mock = mock_popen.return_value
+        proc_mock.returncode = 0
+        proc_mock.communicate.return_value = ('{"id": "s1", "tag": "t1", "workspace": "/w"}', "")
+        
+        mock_vfa.return_value = False
+        mock_ns.return_value = ("dead", "process exited")
+        
+        from launcher.launch import do_run
+        
+        res = do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path)
+        
+        self.assertEqual(res, 1)
+        mock_sleep.assert_not_called()
+        self.assertEqual(mock_ns.call_count, 1)
+        
+        task = self.store.get_task(self.task_id)
+        self.assertEqual(task["state"], "failed")
+
+    @patch("launcher.launch.fetch_quse")
+    @patch("launcher.launch.validate_quse")
+    @patch("launcher.launch.select_candidate")
+    @patch("launcher.launch.check_resources")
+    @patch("launcher.launch.subprocess.Popen")
+    @patch("launcher.launch.native_status")
+    @patch("launcher.launch.validate_first_action")
+    @patch("launcher.launch.time.sleep")
+    def test_state_transition_collision_handled(self, mock_sleep, mock_vfa, mock_ns, mock_popen, mock_cr, mock_sc, mock_vq, mock_fq):
+        mock_vq.return_value = (["grok"], [])
+        mock_sc.return_value = ({"provider": "grok"}, "test")
+        
+        proc_mock = mock_popen.return_value
+        proc_mock.returncode = 0
+        proc_mock.communicate.return_value = ('{"id": "s1", "tag": "t1", "workspace": "/w"}', "")
+        
+        mock_vfa.return_value = False
+        
+        def side_effect_ns(*args, **kwargs):
+            self.store.transition_task(self.task_id, "failed", ("starting",), reason="watcher")
+            return ("dead", "process exited")
+            
+        mock_ns.side_effect = side_effect_ns
+        
+        from launcher.launch import do_run
+        
+        res = do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path)
+        self.assertEqual(res, 1)
+        task = self.store.get_task(self.task_id)
+        self.assertEqual(task["state"], "failed")
+
 if __name__ == '__main__':
     unittest.main()

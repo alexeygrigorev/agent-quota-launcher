@@ -98,28 +98,28 @@ class TestAdmission(unittest.TestCase):
         self.assertIn("Quota exhausted", rej.get("grok", ""))
 
     def test_codex_at_15_remaining_rejected(self):
-        data = {"codex": route({"7d": {"percent_remaining": 15, "reset_at": self.future1}})}
+        data = {"codex": route({"weekly": {"percent_remaining": 15, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
         self.assertIn("<= 15", rej.get("codex", ""))
 
     def test_codex_unknown_window_fail_closed(self):
         data = {"codex": route({"5h": {"percent_remaining": None, "reset_at": None},
-                                "7d": {"percent_remaining": 80, "reset_at": self.future1}})}
+                                "weekly": {"percent_remaining": 80, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
         self.assertIn("fail-closed: unknown window reading", rej.get("codex", ""))
 
     def test_codex_gate_helper(self):
-        ok = {"windows": {"7d": {"percent_remaining": 60,
+        ok = {"windows": {"weekly": {"percent_remaining": 60,
                                  "reset_at": (self.now + timedelta(days=3)).isoformat()}}}
         self.assertIsNone(codex_gate_reason(ok, self.now))
-        low = {"windows": {"7d": {"percent_remaining": 10,
+        low = {"windows": {"weekly": {"percent_remaining": 10,
                                   "reset_at": (self.now + timedelta(days=3)).isoformat()}}}
         self.assertIn("<= 15", codex_gate_reason(low, self.now))
 
     def test_codex_unsupported_even_when_ample(self):
-        data = {"codex": route({"7d": {"percent_remaining": 80, "reset_at": self.future1}})}
+        data = {"codex": route({"weekly": {"percent_remaining": 80, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
         self.assertIn("unsupported in launcher v0.1", rej.get("codex", ""))
@@ -245,11 +245,28 @@ class TestAdmission(unittest.TestCase):
 
     
     def test_codex_above_15_percent_passes_gate(self):
-        data = {"codex": route({"7d": {"percent_remaining": 15.1, "reset_at": self.future1}})}
+        data = {"codex": route({"weekly": {"percent_remaining": 15.1, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
         # It passes the 15% gate and hits the unsupported wrapper error instead.
         self.assertIn("unsupported in launcher v0.1", rej.get("codex", ""))
+
+    def test_codex_optional_absent_window_admitted(self):
+        # A missing secondary window (present: false) does not block admission if the required 'weekly' window is valid
+        data = {"codex": route({"weekly": {"percent_remaining": 80, "reset_at": self.future1},
+                                "daily": {"present": False}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        # Should hit unsupported wrapper error instead of window rejection
+        self.assertIn("unsupported in launcher v0.1", rej.get("codex", ""))
+
+    def test_codex_present_true_unknown_reading_rejected(self):
+        # If a secondary window is present: true but missing percent_remaining, it's rejected
+        data = {"codex": route({"weekly": {"percent_remaining": 80, "reset_at": self.future1},
+                                "daily": {"present": True, "reset_at": self.future1}})}
+        valid, rej = validate_quse(data)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("codex fail-closed: unknown window reading", rej.get("codex", ""))
 
 if __name__ == '__main__':
     unittest.main()

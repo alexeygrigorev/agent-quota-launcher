@@ -419,6 +419,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                               reason=record["reason"])
         return 1
 
+    launch_output_path.parent.mkdir(parents=True, exist_ok=True)
     launch_output_path.write_text(json.dumps(start_json, indent=2, sort_keys=True))
     record["wrapper_start_json"] = start_json
 
@@ -431,27 +432,45 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # --- first-action wait happens OUTSIDE the launch lock ---
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     record["first_action_path"] = str(fa_path)
+    
+    alive, detail = "unknown", "wait started"
     while time.monotonic() < deadline:
         if validate_first_action(str(fa_path), start_json,
                                  record["started_at_ts"], now_ms=time.time() * 1000):
-            store.transition_task(task_id, "running", ("starting",),
-                                  reason="genuine first action validated")
+            try:
+                store.transition_task(task_id, "running", ("starting",),
+                                      reason="genuine first action validated")
+            except StateTransitionError:
+                pass
             record["outcome"] = "running"
             record["first_action_validated_at"] = datetime.now(timezone.utc).isoformat()
             _write_launch_record(cwd, record)
             return 0
+            
+        alive, detail = native_status(sess_tag or run_tag)
+        if alive == "dead":
+            break
+            
         time.sleep(2)
 
-    # Deadline reached without first action.
-    alive, detail = native_status(sess_tag or run_tag)
+    # Deadline reached or early native death without first action.
+    if alive != "dead":
+        alive, detail = native_status(sess_tag or run_tag)
+        
     record["native_status_at_deadline"] = detail
     if alive == "alive":
-        store.transition_task(task_id, "stalled", ("starting",),
-                              reason=f"first action missing by deadline; native alive: {detail}")
+        try:
+            store.transition_task(task_id, "stalled", ("starting",),
+                                  reason=f"first action missing by deadline; native alive: {detail}")
+        except StateTransitionError:
+            pass
         record["outcome"] = "stalled"
     else:
-        store.transition_task(task_id, "failed", ("starting",),
-                              reason=f"first action missing by deadline; native death confirmed: {detail}")
+        try:
+            store.transition_task(task_id, "failed", ("starting",),
+                                  reason=f"first action missing; native death confirmed: {detail}")
+        except StateTransitionError:
+            pass
         record["outcome"] = "failed"
     _write_launch_record(cwd, record)
     return 1

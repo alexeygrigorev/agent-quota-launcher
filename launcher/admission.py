@@ -90,9 +90,19 @@ def codex_gate_reason(route, now):
     windows = route.get("windows")
     if not isinstance(windows, dict) or not windows:
         return "codex fail-closed: no window evidence"
+        
+    has_weekly = False
+    
     for win_name, win in windows.items():
         if not isinstance(win, dict):
             return f"codex fail-closed: malformed window {win_name}"
+            
+        if win.get("present") is False:
+            continue
+            
+        if win_name == "weekly":
+            has_weekly = True
+            
         perc = _percent(win)
         if perc is None:
             return f"codex fail-closed: unknown window reading ({win_name})"
@@ -103,6 +113,10 @@ def codex_gate_reason(route, now):
             return f"codex fail-closed: stale window evidence ({win_name})"
         if perc <= CODEX_MIN_REMAINING:
             return f"codex window {win_name} <= {CODEX_MIN_REMAINING:g}% remaining"
+            
+    if not has_weekly:
+        return "codex fail-closed: missing required weekly window"
+        
     return None
 
 
