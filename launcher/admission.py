@@ -18,6 +18,11 @@ ADAPTER_MODELS = {
     "antigravity": "gemini-3.1-pro-high",
     "zai": "glm-5.3-flash",
 }
+ADAPTER_SUPPORTED_MODELS = {
+    "grok": ("grok-4.6",),
+    "antigravity": ("gemini-3.1-pro-high", "gemini-3.8-flash-high"),
+    "zai": ("glm-5.3-flash",),
+}
 CODEX_MIN_REMAINING = 15.0
 GROK_MIN_REMAINING = 5.0
 
@@ -183,10 +188,20 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
     health = 1.0 if route.get("status") == "ok" else None
     task_fit = _task_fit(provider, task_requirements)
 
+    model = ADAPTER_MODELS[provider]
+    if isinstance(task_requirements, dict):
+        models = task_requirements.get("models")
+        if isinstance(models, (list, tuple)):
+            supported = ADAPTER_SUPPORTED_MODELS.get(provider, (model,))
+            for m in models:
+                if m in supported:
+                    model = m
+                    break
+
     return {
         "name": name,
         "provider": provider,
-        "model": ADAPTER_MODELS[provider],
+        "model": model,
         "health": health,
         "remaining_fraction": min_rem / 100.0,
         "hours_to_reset": min_hours,
@@ -209,7 +224,8 @@ def _task_fit(provider, task_requirements):
             return 0.0
     models = task_requirements.get("models")
     if isinstance(models, (list, tuple)):
-        if ADAPTER_MODELS[provider] not in models:
+        supported = ADAPTER_SUPPORTED_MODELS.get(provider, (ADAPTER_MODELS.get(provider),))
+        if not any(m in models for m in supported):
             return 0.0
     return 1.0
 
