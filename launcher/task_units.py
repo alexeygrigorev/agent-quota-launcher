@@ -340,8 +340,11 @@ def build_systemd_run_argv(
         for p in read_write_paths:
             argv.extend(["-p", f"ReadWritePaths={p}"])
 
+    # Prototype repair: exact child containment, independent of provider PATH.
+    from launcher.pid_isolation import manager_properties, wrap_command
+    argv.extend(manager_properties())
     argv.append("--")
-    argv.extend(list(command_argv))
+    argv.extend(wrap_command(command_argv, sys.executable))
     return argv
 
 
