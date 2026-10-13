@@ -24,6 +24,38 @@ ADAPTER_SUPPORTED_MODELS = {
     "zai": ("glm-5.3-flash",),
 }
 CODEX_MIN_REMAINING = 15.0
+
+# Provider window metadata. Codex plans have no 5-hour (or monthly) window:
+# quse reports those slots with a null reading AND a null reset. Such a slot is
+# "not applicable", not "unknown"; Codex is judged on the windows it has. A
+# slot that carries any reading/reset is still evaluated, and the weekly
+# window stays mandatory, so a missing 7d reading still fails closed.
+CODEX_REQUIRED_WINDOWS = ("7d", "weekly")
+CODEX_NOT_APPLICABLE_WINDOWS = ("5h", "monthly")
+
+# Task kinds each adapter route is a good fit for. Used when a task declares a
+# kind (directly as model_requirements["kind"] or via its task profile) instead
+# of pinning a provider/model. Explicit provider/model pins stay exclusions.
+GENERAL_TASK_KINDS = ("coding", "implementation", "docs", "review")
+PROVIDER_TASK_KINDS = {
+    "grok": GENERAL_TASK_KINDS,
+    "antigravity": GENERAL_TASK_KINDS,
+    "zai": GENERAL_TASK_KINDS,
+}
+PROFILE_TASK_KINDS = {"model-task": "implementation", "model-review": "review"}
+
+
+def task_requirements_for(payload):
+    """model_requirements plus the task kind implied by the payload profile."""
+    reqs = payload.get("model_requirements") if isinstance(payload, dict) else None
+    kind = PROFILE_TASK_KINDS.get(payload.get("profile")) if isinstance(payload, dict) else None
+    if kind is None:
+        return reqs
+    if reqs is None:
+        return {"kind": kind}
+    if isinstance(reqs, dict) and "kind" not in reqs:
+        return dict(reqs, kind=kind)
+    return reqs
 GROK_MIN_REMAINING = 5.0
 
 # Promotion stays disabled until a verified ZCode >=3.10 GLM-5.3-Flash
@@ -99,8 +131,13 @@ def codex_gate_reason(route, now):
             
         if win.get("present") is False:
             continue
-            
-        if win_name == "weekly":
+
+        if (win_name in CODEX_NOT_APPLICABLE_WINDOWS
+                and win.get("percent_remaining") is None
+                and win.get("reset_at") is None):
+            continue  # window does not exist for this plan
+
+        if win_name in CODEX_REQUIRED_WINDOWS:
             has_weekly = True
             
         perc = _percent(win)
@@ -232,7 +269,7 @@ def _eval_task_fit(provider, task_requirements):
     if not isinstance(task_requirements, dict) or not task_requirements:
         return None, default_model
 
-    recognized_keys = {"provider", "providers", "model", "models"}
+    recognized_keys = {"provider", "providers", "model", "models", "kind"}
     declared_keys = recognized_keys.intersection(task_requirements.keys())
     if not declared_keys:
         return None, default_model
@@ -273,6 +310,13 @@ def _eval_task_fit(provider, task_requirements):
     if req_providers is not None and provider not in req_providers:
         return 0.0, default_model
 
+    if "kind" in task_requirements:
+        raw_k = task_requirements["kind"]
+        if not isinstance(raw_k, str) or not raw_k.strip():
+            return 0.0, default_model
+        if raw_k.strip() not in PROVIDER_TASK_KINDS.get(provider, ()):
+            return 0.0, default_model
+
     # Validate model requirements if present
     req_m = None
     if "model" in task_requirements:
@@ -308,7 +352,7 @@ def _eval_task_fit(provider, task_requirements):
     elif req_models is not None:
         target_models = req_models
     else:
-        # Provider-only requirement declared and matched
+        # Provider-only and/or kind requirement declared and matched
         return 1.0, default_model
 
     supported = ADAPTER_SUPPORTED_MODELS.get(provider, (default_model,))

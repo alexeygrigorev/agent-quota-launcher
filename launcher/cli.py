@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from launcher.store import Store, launch_lock, StateTransitionError
+from launcher.admission import task_requirements_for
 from launcher.launch import do_run, native_status
 from launcher.tags import run_tag_for
 
@@ -72,7 +73,7 @@ def plan(args):
         quse_data = fetch_quse()
         config_dir = config_dir_for(args)
         valid_routes, rejections = validate_quse(
-            quse_data, task_requirements=payload.get("model_requirements"),
+            quse_data, task_requirements=task_requirements_for(payload),
             check_capacity=True, config_dir=config_dir)
         seed = 0  # deterministic dry-run projection
         chosen, provenance = select_candidate(valid_routes, seed=seed)
@@ -242,7 +243,7 @@ def run_task_units(args):
         # Capacity-aware route validation
         valid_routes, rejections = validate_quse(
             quse,
-            task_requirements=payload.get("model_requirements"),
+            task_requirements=task_requirements_for(payload),
             check_capacity=True,
             config_dir=config_dir,
         )

@@ -99,7 +99,7 @@ class TestAdmission(unittest.TestCase):
         self.assertIn("<= 15", rej.get("codex", ""))
 
     def test_codex_unknown_window_fail_closed(self):
-        data = {"codex": route({"5h": {"percent_remaining": None, "reset_at": None},
+        data = {"codex": route({"daily": {"percent_remaining": None, "reset_at": None},
                                 "weekly": {"percent_remaining": 80, "reset_at": self.future1}})}
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
@@ -559,3 +559,60 @@ class TestAdmission(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCodexNoFiveHourWindow(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime.now(timezone.utc)
+        self.reset = (self.now + timedelta(days=5)).isoformat()
+
+    def live_shape(self, pct=90.0):
+        return {"windows": {"5h": {"percent_remaining": None, "reset_at": None, "rolling": False},
+                            "7d": {"percent_remaining": pct, "reset_at": self.reset},
+                            "monthly": {"percent_remaining": None, "reset_at": None}}}
+
+    def test_codex_without_5h_judged_on_7d(self):
+        self.assertIsNone(codex_gate_reason(self.live_shape(90.0), self.now))
+        self.assertIn("<= 15", codex_gate_reason(self.live_shape(10.0), self.now))
+
+    def test_codex_missing_7d_still_fails_closed(self):
+        r = self.live_shape()
+        r["windows"]["7d"] = {"percent_remaining": None, "reset_at": self.reset}
+        self.assertIn("unknown window reading (7d)", codex_gate_reason(r, self.now))
+        del r["windows"]["7d"]
+        self.assertIn("missing required weekly window", codex_gate_reason(r, self.now))
+
+    def test_codex_5h_with_reset_but_no_reading_is_unknown(self):
+        r = self.live_shape()
+        r["windows"]["5h"] = {"percent_remaining": None, "reset_at": self.reset}
+        self.assertIn("unknown window reading (5h)", codex_gate_reason(r, self.now))
+
+
+class TestTaskKindFit(unittest.TestCase):
+    def setUp(self):
+        self.reset = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.data = {"zai": route({"7d": {"percent_remaining": 80, "reset_at": self.reset}})}
+
+    def test_zai_fits_general_kinds(self):
+        from launcher.ranking import calculate_weight
+        for kind in ("coding", "implementation", "docs", "review"):
+            valid, _ = validate_quse(self.data, task_requirements={"kind": kind})
+            self.assertEqual(valid[0]["task_fit"], 1.0, kind)
+            c = valid[0]
+            w, _ = calculate_weight(c["task_fit"], c["health"], c["remaining_fraction"],
+                                    c["hours_to_reset"], c["promo_multiplier"], provider="zai")
+            self.assertGreater(w, 0)
+
+    def test_profile_implies_kind(self):
+        from launcher.admission import task_requirements_for
+        reqs = task_requirements_for({"profile": "model-task"})
+        valid, _ = validate_quse(self.data, task_requirements=reqs)
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+        self.assertIsNone(task_requirements_for({}))
+
+    def test_real_exclusions_still_apply(self):
+        for reqs in ({"kind": "implementation", "providers": ["antigravity"]},
+                     {"kind": "implementation", "models": ["gemini-3.8-flash-high"]},
+                     {"kind": "video-editing"}):
+            valid, _ = validate_quse(self.data, task_requirements=reqs)
+            self.assertEqual(valid[0]["task_fit"], 0.0, reqs)
