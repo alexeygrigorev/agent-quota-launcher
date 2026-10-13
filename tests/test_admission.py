@@ -11,11 +11,6 @@ def grok_route(windows, status="ok", error=None, details=None):
     merged.update(details or {})
     return route(windows, status=status, error=error, details=merged)
 
-def grok_route(windows, status="ok", error=None, details=None):
-    merged = {"has_grok_code_access": True}
-    merged.update(details or {})
-    return route(windows, status=status, error=error, details=merged)
-
 class TestAdmission(unittest.TestCase):
     def setUp(self):
         self.now = datetime.now(timezone.utc)
@@ -267,6 +262,300 @@ class TestAdmission(unittest.TestCase):
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
         self.assertIn("codex fail-closed: unknown window reading", rej.get("codex", ""))
+
+    def test_gemini_default_model_is_flash_3_8_high(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 82.5, "reset_at": self.future1}})}
+        valid, rejections = validate_quse(data)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "antigravity")
+        self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high")
+        self.assertIsNone(valid[0]["task_fit"])
+
+    def test_gemini_explicit_argon_selection(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"models": ["gemini-4-argon-high"]}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "antigravity")
+        self.assertEqual(valid[0]["model"], "gemini-4-argon-high")
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_gemini_explicit_argon_selection_via_singular_model(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"model": "gemini-4-argon-high"}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "antigravity")
+        self.assertEqual(valid[0]["model"], "gemini-4-argon-high")
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_gemini_explicit_flash_selection(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"models": ["gemini-3.8-flash-high"]}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "antigravity")
+        self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high")
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_gemini_obsolete_pro_rejected_task_fit_zero(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"models": ["gemini-3.1-pro-high"]}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["task_fit"], 0.0)
+
+    def test_gemini_obsolete_pro_rejected_singular_model_task_fit_zero(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"model": "gemini-3.1-pro-high"}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["task_fit"], 0.0)
+
+    def test_gemini_obsolete_pro_not_chosen_in_ranking(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"models": ["gemini-3.1-pro-high"]}
+        valid, _ = validate_quse(data, task_requirements=reqs)
+        chosen, prov = select_candidate(valid, seed=42)
+        self.assertIsNone(chosen)
+        self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+        self.assertEqual(prov["candidates"][0]["reason"], "task fit or health is zero")
+
+    def test_gemini_unknown_model_rejected_task_fit_zero(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        reqs = {"models": ["gemini-unknown-model-99"]}
+        valid, rejections = validate_quse(data, task_requirements=reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["task_fit"], 0.0)
+
+    def test_gemini_supported_order_selection_consistent(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        # Argon first in requested models -> argon selected
+        reqs_argon_first = {"models": ["gemini-4-argon-high", "gemini-3.8-flash-high"]}
+        valid1, _ = validate_quse(data, task_requirements=reqs_argon_first)
+        self.assertEqual(valid1[0]["model"], "gemini-4-argon-high")
+        self.assertEqual(valid1[0]["task_fit"], 1.0)
+
+        # Flash first in requested models -> flash selected
+        reqs_flash_first = {"models": ["gemini-3.8-flash-high", "gemini-4-argon-high"]}
+        valid2, _ = validate_quse(data, task_requirements=reqs_flash_first)
+        self.assertEqual(valid2[0]["model"], "gemini-3.8-flash-high")
+        self.assertEqual(valid2[0]["task_fit"], 1.0)
+
+        # Obsolete pro first, argon second -> pro skipped, argon selected
+        reqs_pro_argon = {"models": ["gemini-3.1-pro-high", "gemini-4-argon-high"]}
+        valid3, _ = validate_quse(data, task_requirements=reqs_pro_argon)
+        self.assertEqual(valid3[0]["model"], "gemini-4-argon-high")
+        self.assertEqual(valid3[0]["task_fit"], 1.0)
+
+    def test_gemini_fails_closed_on_stale_or_missing_or_nonfinite_quota(self):
+        # Exhausted
+        data_exhausted = {"gemini": route({"5h": {"percent_remaining": 0, "reset_at": self.future1}})}
+        v, rej = validate_quse(data_exhausted)
+        self.assertEqual(len(v), 0)
+        self.assertIn("Quota exhausted", rej.get("gemini", ""))
+
+        # Stale evidence
+        data_stale = {"gemini": route({"5h": {"percent_remaining": 50, "reset_at": self.past}})}
+        v, rej = validate_quse(data_stale)
+        self.assertEqual(len(v), 0)
+        self.assertIn("Stale route evidence", rej.get("gemini", ""))
+
+        # Missing reset_at
+        data_missing = {"gemini": route({"5h": {"percent_remaining": 50}})}
+        v, rej = validate_quse(data_missing)
+        self.assertEqual(len(v), 0)
+        self.assertIn("Missing valid route evidence", rej.get("gemini", ""))
+
+        # Nonfinite percent
+        data_nan = {"gemini": route({"5h": {"percent_remaining": float("nan"), "reset_at": self.future1}})}
+        v, rej = validate_quse(data_nan)
+        self.assertEqual(len(v), 0)
+        self.assertIn("Missing valid route evidence", rej.get("gemini", ""))
+
+    def test_negative_probes_conflicting_dual_model_fails_closed(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        conflicts = [
+            {"models": ["gemini-3.8-flash-high"], "model": "gemini-3.1-pro-high"},
+            {"models": ["gemini-3.8-flash-high"], "model": "gemini-4-argon-high"},
+            {"models": ["gemini-4-argon-high"], "model": "gemini-3.8-flash-high"},
+            {"models": ["gemini-3.8-flash-high", "gemini-4-argon-high"], "model": "gemini-unknown"},
+        ]
+        for req in conflicts:
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1, f"Failed on {req}")
+            self.assertEqual(valid[0]["task_fit"], 0.0, f"Failed on {req}")
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high", f"Failed on {req}")
+            chosen, prov = select_candidate(valid, seed=42)
+            self.assertIsNone(chosen, f"Should not choose conflicting req {req}")
+            self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+
+    def test_negative_probes_malformed_model_types_fail_closed(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        malformed = [
+            {"model": None},
+            {"model": 123},
+            {"model": {"name": "gemini-3.1-pro-high"}},
+            {"model": True},
+            {"model": False},
+            {"model": ["gemini-4-argon-high"]},
+            {"model": ""},
+            {"model": "   "},
+        ]
+        for req in malformed:
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1, f"Failed on {req}")
+            self.assertEqual(valid[0]["task_fit"], 0.0, f"Failed on {req}")
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high", f"Failed on {req}")
+            chosen, prov = select_candidate(valid, seed=42)
+            self.assertIsNone(chosen, f"Should not choose malformed req {req}")
+            self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+
+    def test_negative_probes_malformed_models_types_fail_closed(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        malformed = [
+            {"models": "gemini-3.1-pro-high"},
+            {"models": None},
+            {"models": 123},
+            {"models": True},
+            {"models": False},
+            {"models": {}},
+            {"models": []},
+            {"models": ()},
+            {"models": ["gemini-3.8-flash-high", 123]},
+            {"models": ["gemini-3.8-flash-high", None]},
+            {"models": ["gemini-3.8-flash-high", True]},
+            {"models": ["gemini-3.8-flash-high", ""]},
+            {"models": ["gemini-3.8-flash-high", "   "]},
+            {"models": ["   "]},
+            {"models": [""]},
+        ]
+        for req in malformed:
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1, f"Failed on {req}")
+            self.assertEqual(valid[0]["task_fit"], 0.0, f"Failed on {req}")
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high", f"Failed on {req}")
+            chosen, prov = select_candidate(valid, seed=42)
+            self.assertIsNone(chosen, f"Should not choose malformed req {req}")
+            self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+
+    def test_negative_probes_malformed_provider_and_providers_fail_closed(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        malformed = [
+            {"provider": None},
+            {"provider": 123},
+            {"provider": True},
+            {"provider": ""},
+            {"provider": "   "},
+            {"providers": None},
+            {"providers": 123},
+            {"providers": "antigravity"},
+            {"providers": []},
+            {"providers": ["antigravity", 123]},
+            {"providers": ["antigravity", None]},
+            {"providers": ["antigravity", ""]},
+            {"providers": ["   "]},
+            {"provider": "antigravity", "providers": ["grok"]},
+        ]
+        for req in malformed:
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1, f"Failed on {req}")
+            self.assertEqual(valid[0]["task_fit"], 0.0, f"Failed on {req}")
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high", f"Failed on {req}")
+            chosen, prov = select_candidate(valid, seed=42)
+            self.assertIsNone(chosen, f"Should not choose malformed req {req}")
+            self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+
+    def test_negative_probes_empty_and_unknown_only_requirements(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        for req in ({}, {"unknown_key": "some_value"}, {"foo": 1, "bar": [2]}):
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1)
+            self.assertIsNone(valid[0]["task_fit"])
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high")
+            chosen, prov = select_candidate(valid, seed=42)
+            self.assertIsNone(chosen)
+            self.assertEqual(prov["candidates"][0]["weight"], 0.0)
+            self.assertIn("unknown task_fit/health", prov["candidates"][0]["reason"])
+
+    def test_negative_probes_unallowlisted_models_fail_closed(self):
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        probes = [
+            {"models": ["gemini-unknown-model-99"]},
+            {"models": ["gemini-4-argon-medium"]},
+            {"model": "gemini-4-argon-low"},
+            {"model": "gemini-3.8-flash-medium"},
+        ]
+        for req in probes:
+            valid, _ = validate_quse(data, task_requirements=req)
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(valid[0]["task_fit"], 0.0)
+            self.assertEqual(valid[0]["model"], "gemini-3.8-flash-high")
+
+    def test_valid_provider_only_declarations_preserve_default_model(self):
+        from launcher.ranking import select_candidate
+        data = {
+            "gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}}),
+            "grok": grok_route({"7d": {"percent_remaining": 80.0, "reset_at": self.future1}}),
+        }
+        req_anti = {"provider": "antigravity"}
+        valid, _ = validate_quse(data, task_requirements=req_anti)
+        anti = [r for r in valid if r["provider"] == "antigravity"][0]
+        grok = [r for r in valid if r["provider"] == "grok"][0]
+        self.assertEqual(anti["task_fit"], 1.0)
+        self.assertEqual(anti["model"], "gemini-3.8-flash-high")
+        self.assertEqual(grok["task_fit"], 0.0)
+
+        req_anti_list = {"providers": ["antigravity"]}
+        valid2, _ = validate_quse(data, task_requirements=req_anti_list)
+        anti2 = [r for r in valid2 if r["provider"] == "antigravity"][0]
+        grok2 = [r for r in valid2 if r["provider"] == "grok"][0]
+        self.assertEqual(anti2["task_fit"], 1.0)
+        self.assertEqual(anti2["model"], "gemini-3.8-flash-high")
+        self.assertEqual(grok2["task_fit"], 0.0)
+
+        chosen, _ = select_candidate(valid, seed=42)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["provider"], "antigravity")
+
+    def test_compatible_dual_model_specifications(self):
+        from launcher.ranking import select_candidate
+        data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future1}})}
+        # Compatible: both specify Argon
+        req_argon_dual = {
+            "models": ["gemini-3.8-flash-high", "gemini-4-argon-high"],
+            "model": "gemini-4-argon-high",
+        }
+        valid, _ = validate_quse(data, task_requirements=req_argon_dual)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+        self.assertEqual(valid[0]["model"], "gemini-4-argon-high")
+
+        # Compatible: both specify Flash
+        req_flash_dual = {
+            "models": ["gemini-3.8-flash-high"],
+            "model": "gemini-3.8-flash-high",
+        }
+        valid2, _ = validate_quse(data, task_requirements=req_flash_dual)
+        self.assertEqual(len(valid2), 1)
+        self.assertEqual(valid2[0]["task_fit"], 1.0)
+        self.assertEqual(valid2[0]["model"], "gemini-3.8-flash-high")
+
+        # Compatible matching obsolete pro -> both agree on obsolete pro, rejected task_fit 0.0
+        req_pro_dual = {
+            "models": ["gemini-3.1-pro-high"],
+            "model": "gemini-3.1-pro-high",
+        }
+        valid3, _ = validate_quse(data, task_requirements=req_pro_dual)
+        self.assertEqual(len(valid3), 1)
+        self.assertEqual(valid3[0]["task_fit"], 0.0)
+        self.assertEqual(valid3[0]["model"], "gemini-3.8-flash-high")
 
 if __name__ == '__main__':
     unittest.main()

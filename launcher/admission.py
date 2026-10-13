@@ -15,12 +15,12 @@ from pathlib import Path
 ADAPTER_ROUTES = ("grok", "antigravity", "zai")
 ADAPTER_MODELS = {
     "grok": "grok-4.6",
-    "antigravity": "gemini-3.1-pro-high",
+    "antigravity": "gemini-3.8-flash-high",
     "zai": "glm-5.3-flash",
 }
 ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
-    "antigravity": ("gemini-3.1-pro-high", "gemini-3.8-flash-high"),
+    "antigravity": ("gemini-3.8-flash-high", "gemini-4-argon-high"),
     "zai": ("glm-5.3-flash",),
 }
 CODEX_MIN_REMAINING = 15.0
@@ -200,17 +200,7 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
             return None, cap_reason
 
     health = 1.0 if route.get("status") == "ok" else None
-    task_fit = _task_fit(provider, task_requirements)
-
-    model = ADAPTER_MODELS[provider]
-    if isinstance(task_requirements, dict):
-        models = task_requirements.get("models")
-        if isinstance(models, (list, tuple)):
-            supported = ADAPTER_SUPPORTED_MODELS.get(provider, (model,))
-            for m in models:
-                if m in supported:
-                    model = m
-                    break
+    task_fit, model = _eval_task_fit(provider, task_requirements)
 
     return {
         "name": name,
@@ -224,24 +214,116 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
     }, None
 
 
+def _eval_task_fit(provider, task_requirements):
+    """Evaluate task fit and model selection for a provider.
+
+    Returns (task_fit, selected_model).
+    task_fit is:
+      - None when no recognized requirements are declared (or task_requirements is None/empty)
+      - 0.0 when requirements conflict, are malformed, or do not match provider/supported models
+      - 1.0 when declared requirements are matched by this provider
+
+    selected_model is:
+      - The matched supported model if model requirements matched
+      - ADAPTER_MODELS[provider] (default model) otherwise (including when task_fit is 0.0 or None)
+    """
+    default_model = ADAPTER_MODELS.get(provider)
+
+    if not isinstance(task_requirements, dict) or not task_requirements:
+        return None, default_model
+
+    recognized_keys = {"provider", "providers", "model", "models"}
+    declared_keys = recognized_keys.intersection(task_requirements.keys())
+    if not declared_keys:
+        return None, default_model
+
+    # Validate provider requirements if present
+    req_provider = None
+    if "provider" in task_requirements:
+        raw_p = task_requirements["provider"]
+        if not isinstance(raw_p, str) or isinstance(raw_p, bool) or not raw_p.strip():
+            return 0.0, default_model
+        req_provider = raw_p.strip()
+
+    req_providers = None
+    if "providers" in task_requirements:
+        raw_ps = task_requirements["providers"]
+        if (
+            not isinstance(raw_ps, (list, tuple))
+            or isinstance(raw_ps, (str, bytes))
+            or len(raw_ps) == 0
+            or not all(
+                isinstance(x, str)
+                and not isinstance(x, bool)
+                and x.strip()
+                for x in raw_ps
+            )
+        ):
+            return 0.0, default_model
+        req_providers = [x.strip() for x in raw_ps]
+
+    # Check provider conflicts
+    if req_provider is not None and req_providers is not None:
+        if req_provider not in req_providers:
+            return 0.0, default_model
+
+    # Check match against this provider
+    if req_provider is not None and provider != req_provider:
+        return 0.0, default_model
+    if req_providers is not None and provider not in req_providers:
+        return 0.0, default_model
+
+    # Validate model requirements if present
+    req_m = None
+    if "model" in task_requirements:
+        raw_m = task_requirements["model"]
+        if not isinstance(raw_m, str) or isinstance(raw_m, bool) or not raw_m.strip():
+            return 0.0, default_model
+        req_m = raw_m.strip()
+
+    req_models = None
+    if "models" in task_requirements:
+        raw_ms = task_requirements["models"]
+        if (
+            not isinstance(raw_ms, (list, tuple))
+            or isinstance(raw_ms, (str, bytes))
+            or len(raw_ms) == 0
+            or not all(
+                isinstance(x, str)
+                and not isinstance(x, bool)
+                and x.strip()
+                for x in raw_ms
+            )
+        ):
+            return 0.0, default_model
+        req_models = [x.strip() for x in raw_ms]
+
+    # Check conflicting / ambiguous dual specification
+    if req_m is not None and req_models is not None:
+        if req_m not in req_models:
+            return 0.0, default_model
+        target_models = [req_m]
+    elif req_m is not None:
+        target_models = [req_m]
+    elif req_models is not None:
+        target_models = req_models
+    else:
+        # Provider-only requirement declared and matched
+        return 1.0, default_model
+
+    supported = ADAPTER_SUPPORTED_MODELS.get(provider, (default_model,))
+    for m in target_models:
+        if m in supported:
+            return 1.0, m
+
+    return 0.0, default_model
+
+
 def _task_fit(provider, task_requirements):
     """Known (1.0/0.0) only against declared model requirements; unknown (None)
     otherwise so ranking weights the route at 0 instead of fabricating fit."""
-    if not isinstance(task_requirements, dict):
-        return None
-    req_provider = task_requirements.get("provider")
-    if req_provider and provider != req_provider:
-        return 0.0
-    providers = task_requirements.get("providers")
-    if isinstance(providers, (list, tuple)):
-        if provider not in providers:
-            return 0.0
-    models = task_requirements.get("models")
-    if isinstance(models, (list, tuple)):
-        supported = ADAPTER_SUPPORTED_MODELS.get(provider, (ADAPTER_MODELS.get(provider),))
-        if not any(m in models for m in supported):
-            return 0.0
-    return 1.0
+    fit, _ = _eval_task_fit(provider, task_requirements)
+    return fit
 
 
 def validate_quse(quse_data, task_requirements=None, check_capacity=False, config_dir=None):
