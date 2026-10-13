@@ -7,10 +7,12 @@ launch lifecycle. Provider argv sets are exactly:
 - antigravity: env -u GEMINI_API_KEY -u GOOGLE_API_KEY agy --model gemini-3.1-pro-high
                --effort high --dangerously-skip-permissions -p --print-timeout 0
                --output-format text <goal>   (OAuth route; ambient API keys stripped)
-- zai:         /home/alexey/.local/bin/zcodex exec --model glm-5.3-flash
+- zai:         /usr/bin/env ZCODE_NODE=/home/alexey/.nvm/versions/node/v24.13.1/bin/node
+               ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs
+               /home/alexey/.local/bin/zcodex exec --model glm-5.3-flash
                -s workspace-write -c
                check_for_update_on_startup=false --json <goal>
-               with ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs
+               with ZCODE_NODE and ZCODE_CJS runtime pins propagated via argv and env
 
 Codex is unsupported in v0.1 (protected wrapper scripts/launch-codex.sh not
 configured in this repo); `codex-cli -p` and `zai -p` never appear here.
@@ -29,8 +31,49 @@ from launcher.resources import check_resources
 from launcher.store import Store, launch_lock, StateTransitionError
 from launcher.tags import run_tag_for
 
+ZCODE_NODE = "/home/alexey/.nvm/versions/node/v24.13.1/bin/node"
 ZCODE_CJS = "/opt/ZCode/resources/glm/zcode.cjs"
 ZCODEX_BIN = "/home/alexey/.local/bin/zcodex"
+
+
+class ZaiRuntimeError(RuntimeError, ValueError, OSError):
+    """Raised when ZAI runtime requirements are missing or unexecutable."""
+    pass
+
+
+class ZaiRuntimeMissingError(ZaiRuntimeError, FileNotFoundError):
+    """Raised when ZAI runtime dependencies (node, cjs, zcodex) are missing."""
+    pass
+
+
+class ZaiRuntimeUnexecutableError(ZaiRuntimeError, PermissionError):
+    """Raised when ZAI runtime dependencies lack execution/read permissions."""
+    pass
+
+
+def validate_zai_runtime(node=None, cjs=None, zbin=None):
+    """Validate that the pinned Node runtime, ZCode CJS bundle, and zcodex binary exist and are executable."""
+    node_path = node if node is not None else ZCODE_NODE
+    cjs_path = cjs if cjs is not None else ZCODE_CJS
+    zbin_path = zbin if zbin is not None else ZCODEX_BIN
+
+    if not os.path.exists(node_path) or not os.path.isfile(node_path):
+        raise ZaiRuntimeMissingError(f"ZAI node runtime missing: {node_path}")
+    if not os.access(node_path, os.X_OK):
+        raise ZaiRuntimeUnexecutableError(f"ZAI node runtime not executable: {node_path}")
+
+    if not os.path.exists(cjs_path) or not os.path.isfile(cjs_path):
+        raise ZaiRuntimeMissingError(f"ZAI CJS runtime missing: {cjs_path}")
+    if not os.access(cjs_path, os.R_OK):
+        raise ZaiRuntimeUnexecutableError(f"ZAI CJS runtime not readable: {cjs_path}")
+
+    if not os.path.exists(zbin_path) or not os.path.isfile(zbin_path):
+        raise ZaiRuntimeMissingError(f"ZAI zcodex binary missing: {zbin_path}")
+    if not os.access(zbin_path, os.X_OK):
+        raise ZaiRuntimeUnexecutableError(f"ZAI zcodex binary not executable: {zbin_path}")
+
+    return node_path, cjs_path, zbin_path
+
 
 ADAPTERS = {
     "grok": {
@@ -46,10 +89,11 @@ ADAPTERS = {
         "env": {},
     },
     "zai": {
-        "argv": [ZCODEX_BIN, "exec", "--model", "glm-5.3-flash",
+        "argv": ["/usr/bin/env", f"ZCODE_NODE={ZCODE_NODE}", f"ZCODE_CJS={ZCODE_CJS}",
+                 ZCODEX_BIN, "exec", "--model", "glm-5.3-flash",
                  "-s", "workspace-write",
                  "-c", "check_for_update_on_startup=false", "--json"],
-        "env": {"ZCODE_CJS": ZCODE_CJS},
+        "env": {"ZCODE_CJS": ZCODE_CJS, "ZCODE_NODE": ZCODE_NODE},
     },
 }
 
@@ -67,7 +111,27 @@ def build_adapter_argv(provider, goal, model=None):
     adapter = ADAPTERS.get(provider)
     if not adapter:
         raise ValueError(f"Unsupported provider: {provider}")
-    argv = list(adapter["argv"])
+    if provider == "zai":
+        node, cjs, zbin = validate_zai_runtime()
+        argv = [
+            "/usr/bin/env",
+            f"ZCODE_NODE={node}",
+            f"ZCODE_CJS={cjs}",
+            zbin,
+        ]
+        base_argv = list(adapter["argv"])
+        if zbin in base_argv:
+            idx = base_argv.index(zbin) + 1
+            argv.extend(base_argv[idx:])
+        elif ZCODEX_BIN in base_argv:
+            idx = base_argv.index(ZCODEX_BIN) + 1
+            argv.extend(base_argv[idx:])
+        else:
+            argv.extend(["exec", "--model", "glm-5.3-flash",
+                         "-s", "workspace-write",
+                         "-c", "check_for_update_on_startup=false", "--json"])
+    else:
+        argv = list(adapter["argv"])
     if model:
         if "--model" in argv:
             idx = argv.index("--model")
@@ -368,6 +432,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         "--tag", run_tag,
     ]
     child_env = dict(ADAPTERS[provider]["env"])
+    if provider == "zai":
+        node, cjs, _ = validate_zai_runtime()
+        child_env["ZCODE_NODE"] = node
+        child_env["ZCODE_CJS"] = cjs
     child_env["TMPDIR"] = tmpdir_resolved
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])

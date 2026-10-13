@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from launcher.launch import (validate_first_action, build_adapter_argv,
-                             ADAPTERS, _kill_process_group, _bounded_timeout)
+                             ADAPTERS, _kill_process_group, _bounded_timeout,
+                             ZCODE_NODE, ZCODE_CJS, ZCODEX_BIN,
+                             validate_zai_runtime, ZaiRuntimeError,
+                             ZaiRuntimeMissingError, ZaiRuntimeUnexecutableError)
 from launcher.store import Store
 
 PAYLOAD = {"goal": "write report", "owner": "head-x", "cwd": ".",
@@ -247,15 +250,43 @@ class TestAdapters(unittest.TestCase):
 
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
-        self.assertEqual(argv[0], "/home/alexey/.local/bin/zcodex")
-        self.assertEqual(argv[1:4], ["exec", "--model", "glm-5.3-flash"])
+        self.assertEqual(argv[0], "/usr/bin/env")
+        self.assertIn(f"ZCODE_NODE={ZCODE_NODE}", argv)
+        self.assertIn(f"ZCODE_CJS={ZCODE_CJS}", argv)
+        z_idx = argv.index(ZCODEX_BIN)
+        self.assertEqual(argv[z_idx + 1:z_idx + 4], ["exec", "--model", "glm-5.3-flash"])
         self.assertIn("-s", argv)
         self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertIn("--json", argv)
         self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_CJS"),
-                         "/opt/ZCode/resources/glm/zcode.cjs")
+                         ZCODE_CJS)
+        self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_NODE"),
+                         ZCODE_NODE)
         self.assertEqual(argv[-1], "goal")
+
+    def test_zai_adapter_argv_exact_propagation(self):
+        argv = build_adapter_argv("zai", "task payload")
+        expected = [
+            "/usr/bin/env",
+            f"ZCODE_NODE={ZCODE_NODE}",
+            f"ZCODE_CJS={ZCODE_CJS}",
+            ZCODEX_BIN,
+            "exec",
+            "--model",
+            "glm-5.3-flash",
+            "-s",
+            "workspace-write",
+            "-c",
+            "check_for_update_on_startup=false",
+            "--json",
+            "task payload",
+        ]
+        self.assertEqual(argv, expected)
+
+    def test_zai_supports_model_override(self):
+        argv = build_adapter_argv("zai", "goal", model="custom-zai-model")
+        self.assertEqual(argv[argv.index("--model") + 1], "custom-zai-model")
 
     def test_zai_sandbox_workspace_write_enforced(self):
         argv = build_adapter_argv("zai", "goal")
@@ -267,6 +298,90 @@ class TestAdapters(unittest.TestCase):
         argv = build_adapter_argv("zai", "goal")
         self.assertNotIn("-a", argv)
         self.assertNotIn("--ask-for-approval", argv)
+
+    def test_zai_runtime_missing_node_fails_closed(self):
+        with patch("launcher.launch.ZCODE_NODE", "/tmp/nonexistent-node-binary"):
+            with self.assertRaises(ZaiRuntimeError) as ctx:
+                build_adapter_argv("zai", "goal")
+            self.assertIn("node runtime missing", str(ctx.exception).lower())
+            self.assertTrue(isinstance(ctx.exception, RuntimeError))
+            self.assertTrue(isinstance(ctx.exception, FileNotFoundError))
+
+    def test_zai_runtime_unexecutable_node_fails_closed(self):
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            f.write("#!/bin/sh\n")
+            f.flush()
+            os.chmod(f.name, 0o644)  # non-executable
+            with patch("launcher.launch.ZCODE_NODE", f.name):
+                with self.assertRaises(ZaiRuntimeError) as ctx:
+                    build_adapter_argv("zai", "goal")
+                self.assertIn("not executable", str(ctx.exception).lower())
+                self.assertTrue(isinstance(ctx.exception, RuntimeError))
+                self.assertTrue(isinstance(ctx.exception, PermissionError))
+
+    def test_zai_runtime_missing_cjs_fails_closed(self):
+        with patch("launcher.launch.ZCODE_CJS", "/tmp/nonexistent-zcode.cjs"):
+            with self.assertRaises(ZaiRuntimeError) as ctx:
+                build_adapter_argv("zai", "goal")
+            self.assertIn("cjs runtime missing", str(ctx.exception).lower())
+            self.assertTrue(isinstance(ctx.exception, RuntimeError))
+            self.assertTrue(isinstance(ctx.exception, FileNotFoundError))
+
+    def test_zai_runtime_unreadable_cjs_fails_closed(self):
+        real_access = os.access
+
+        def mock_access(path, mode, *args, **kwargs):
+            if path == "/tmp/test-unreadable.cjs" and mode & os.R_OK:
+                return False
+            return real_access(path, mode, *args, **kwargs)
+
+        with patch("os.path.isfile", return_value=True), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.access", side_effect=mock_access), \
+             patch("launcher.launch.ZCODE_CJS", "/tmp/test-unreadable.cjs"):
+            with self.assertRaises(ZaiRuntimeError) as ctx:
+                build_adapter_argv("zai", "goal")
+            self.assertIn("not readable", str(ctx.exception).lower())
+            self.assertTrue(isinstance(ctx.exception, RuntimeError))
+
+    def test_zai_runtime_missing_zcodex_bin_fails_closed(self):
+        with patch("launcher.launch.ZCODEX_BIN", "/tmp/nonexistent-zcodex"):
+            with self.assertRaises(ZaiRuntimeError) as ctx:
+                build_adapter_argv("zai", "goal")
+            self.assertIn("zcodex binary missing", str(ctx.exception).lower())
+            self.assertTrue(isinstance(ctx.exception, RuntimeError))
+            self.assertTrue(isinstance(ctx.exception, FileNotFoundError))
+
+    def test_zai_runtime_unexecutable_zcodex_bin_fails_closed(self):
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            f.write("#!/bin/sh\n")
+            f.flush()
+            os.chmod(f.name, 0o644)  # non-executable
+            with patch("launcher.launch.ZCODEX_BIN", f.name):
+                with self.assertRaises(ZaiRuntimeError) as ctx:
+                    build_adapter_argv("zai", "goal")
+                self.assertIn("not executable", str(ctx.exception).lower())
+                self.assertTrue(isinstance(ctx.exception, RuntimeError))
+                self.assertTrue(isinstance(ctx.exception, PermissionError))
+
+    def test_validate_zai_runtime_direct(self):
+        node, cjs, zbin = validate_zai_runtime()
+        self.assertEqual(node, ZCODE_NODE)
+        self.assertEqual(cjs, ZCODE_CJS)
+        self.assertEqual(zbin, ZCODEX_BIN)
+        self.assertTrue(os.path.isfile(node) and os.access(node, os.X_OK))
+        self.assertTrue(os.path.isfile(cjs) and os.access(cjs, os.R_OK))
+        self.assertTrue(os.path.isfile(zbin) and os.access(zbin, os.X_OK))
+
+    def test_other_providers_unaffected_by_zai_runtime_state(self):
+        # When ZAI runtime is broken/missing, other providers still build normally
+        with patch("launcher.launch.ZCODE_NODE", "/tmp/nonexistent-node-binary"), \
+             patch("launcher.launch.ZCODE_CJS", "/tmp/nonexistent-cjs"), \
+             patch("launcher.launch.ZCODEX_BIN", "/tmp/nonexistent-zcodex"):
+            grok_argv = build_adapter_argv("grok", "grok goal")
+            self.assertIn("/home/alexey/.local/bin/grok", grok_argv)
+            agy_argv = build_adapter_argv("antigravity", "agy goal")
+            self.assertIn("/home/alexey/.local/bin/agy", agy_argv)
 
     def test_codex_never_appears_as_adapter(self):
         self.assertNotIn("codex", ADAPTERS)
