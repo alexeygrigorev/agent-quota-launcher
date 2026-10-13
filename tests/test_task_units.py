@@ -246,6 +246,7 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         self.assertIn("--slice=app.slice", cmd)
         self.assertNotIn("--remain-after-exit", cmd)
         self.assertIn("--collect", cmd)
+        self.assertIn("--expand-environment=no", cmd)
         self.assertIn("--pipe", cmd)
         self.assertIn("-p", cmd)
         self.assertIn("MemoryMax=768M", cmd)
@@ -488,11 +489,19 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
             self.assertEqual(find_enclosing_git_root(str(nested)), repo)
             self.assertEqual(find_enclosing_git_root(repo), repo)
 
-            # Falls back to path if no .git exists
+            # Falls back to path if no .git exists up to filesystem root
+            orig_exists = Path.exists
+
+            def no_git_exists(self_path):
+                if self_path.name == ".git":
+                    return False
+                return orig_exists(self_path)
+
             no_git = tmp_root / "no_git_dir" / "sub"
             no_git.mkdir(parents=True)
-            self.assertEqual(find_enclosing_git_root(no_git), no_git)
-            self.assertEqual(find_enclosing_git_root(str(no_git)), no_git)
+            with patch.object(Path, "exists", no_git_exists):
+                self.assertEqual(find_enclosing_git_root(no_git), no_git)
+                self.assertEqual(find_enclosing_git_root(str(no_git)), no_git)
 
     @patch("launcher.task_units.check_resources", return_value=True)
     @patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {"ControlGroup": "app.slice/agent-task-t_default.service", "ActiveState": "inactive", "SubState": "dead", "InvocationID": "inv12345"}))
@@ -584,6 +593,165 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
                 )
 
 
+
+class TestTaskUnitEnvironmentExpansionLiteralPreservation(unittest.TestCase):
+    """Tests reproducing the issue66 systemd environment-expansion hazard and verifying literal preservation."""
+
+    def test_build_systemd_run_argv_places_expand_environment_before_separator(self):
+        cmd = build_systemd_run_argv(
+            unit_name="agent-task-literal.service",
+            command_argv=["node", "-e", "console.log('test')"],
+            memory_mb=512,
+            tmpdir="/repo/.local/tmp/literal",
+            wait=True,
+        )
+        self.assertIn("--expand-environment=no", cmd)
+        sep_index = cmd.index("--")
+        flag_index = cmd.index("--expand-environment=no")
+        self.assertLess(flag_index, sep_index)
+
+    def test_build_systemd_run_argv_preserves_typescript_template_literals(self):
+        # Exact mismatch expressions from parent receipt / review transport:
+        fragment1 = "r === `machine:${caller.machineId}`) return true;\n        if (act"
+        fragment2 = "ey = `root-run:${slotStartUtc}`;\n      const existing = this.sql."
+        command = [
+            "node",
+            "-e",
+            fragment1,
+            "--extra",
+            fragment2,
+        ]
+        cmd = build_systemd_run_argv(
+            unit_name="agent-task-ts.service",
+            command_argv=command,
+            memory_mb=512,
+            tmpdir="/repo/.local/tmp/ts",
+        )
+        # Ensure --expand-environment=no is enabled for systemd-run
+        self.assertIn("--expand-environment=no", cmd)
+        # Ensure command arguments remain completely unchanged in argv after --
+        sep = cmd.index("--")
+        payload_args = cmd[sep + 1 :]
+        self.assertIn(fragment1, payload_args)
+        self.assertIn(fragment2, payload_args)
+
+    def test_build_systemd_run_argv_preserves_sentinels_and_special_characters(self):
+        # Benign fixed sentinels, known environment names, quotes, backticks, multiline, unicode
+        sentinel_dollar = "${BENIGN_SENTINEL_TOKEN_123}"
+        known_env_expr = "$USER:$HOME:${PATH}:${TMPDIR}"
+        complex_quoted = '`template ${var}` and "double" and \'single\''
+        multiline_str = "first line\nsecond line with ${VAR}\nthird line"
+        unicode_str = "λ x → x + 1 // 🌟 🚀 unicode"
+
+        test_args = [
+            "python3",
+            "eval_script.py",
+            sentinel_dollar,
+            known_env_expr,
+            complex_quoted,
+            multiline_str,
+            unicode_str,
+        ]
+
+        cmd = build_systemd_run_argv(
+            unit_name="agent-task-sentinel.service",
+            command_argv=test_args,
+            memory_mb=768,
+            tmpdir="/repo/.local/tmp/sentinel",
+        )
+
+        self.assertIn("--expand-environment=no", cmd)
+        sep = cmd.index("--")
+        after_sep = cmd[sep + 1 :]
+        # All passed arguments are preserved verbatim
+        for arg in test_args:
+            self.assertIn(arg, after_sep)
+
+    def test_expansion_hazard_regression_contrast(self):
+        """Simulate and document systemd-run expansion behavior:
+        Without --expand-environment=no, systemd expands ${var} references against unit env,
+        collapsing undefined variables (e.g. ${caller.machineId}) to empty string.
+        With --expand-environment=no, systemd disables this expansion and passes args literally.
+        """
+        def simulate_systemd_arg_processing(argv: List[str], env: Dict[str, str]) -> List[str]:
+            sep = argv.index("--")
+            options = argv[:sep]
+            payload = argv[sep + 1 :]
+
+            if "--expand-environment=no" in options:
+                # Literal mode: no variable expansion
+                return list(payload)
+
+            # Default systemd-run mode (--expand-environment=yes):
+            expanded = []
+            for arg in payload:
+                # systemd expands ${NAME} to env[NAME] or "" if unset
+                import re
+                def repl(m):
+                    var_name = m.group(1)
+                    return env.get(var_name, "")
+                expanded_arg = re.sub(r"\$\{([a-zA-Z0-9_\.]+)\}", repl, arg)
+                expanded.append(expanded_arg)
+            return expanded
+
+        sample_arg = "r === `machine:${caller.machineId}`"
+        mock_env = {"USER": "testuser"}
+
+        # 1. Unrepaired command (hazard): lacks --expand-environment=no
+        unrepaired_cmd = [
+            "systemd-run", "--user", "--unit=bad.service", "--collect", "--",
+            "node", "-e", sample_arg
+        ]
+        hazard_result = simulate_systemd_arg_processing(unrepaired_cmd, mock_env)
+        # Without flag, ${caller.machineId} is expanded away, reproducing review-transport-dollar-mismatch:
+        self.assertEqual(hazard_result[-1], "r === `machine:`")
+        self.assertNotEqual(hazard_result[-1], sample_arg)
+
+        # 2. Repaired command: includes --expand-environment=no
+        repaired_cmd = build_systemd_run_argv(
+            unit_name="agent-task-fixed.service",
+            command_argv=["node", "-e", sample_arg],
+            memory_mb=512,
+            tmpdir="/repo/.local/tmp/fixed",
+        )
+        self.assertIn("--expand-environment=no", repaired_cmd)
+        fixed_result = simulate_systemd_arg_processing(repaired_cmd, mock_env)
+        # With flag, sample_arg is preserved verbatim
+        self.assertEqual(fixed_result[-1], sample_arg)
+
+    def test_controls_and_invariants_unchanged(self):
+        """Verify that adding --expand-environment=no does not alter any existing gates/controls."""
+        cmd_wait = build_systemd_run_argv(
+            unit_name="agent-task-ctrl.service",
+            command_argv=["python3", "task.py"],
+            memory_mb=1024,
+            tmpdir="/repo/.local/tmp/ctrl",
+            wait=True,
+            protect_system="strict",
+            read_only_paths=["/repo"],
+            read_write_paths=["/repo/.local/tmp"],
+        )
+        self.assertNotIn("--scope", cmd_wait)
+        self.assertIn("--expand-environment=no", cmd_wait)
+        self.assertIn("--wait", cmd_wait)
+        self.assertNotIn("--pipe", cmd_wait)
+        self.assertIn("-p", cmd_wait)
+        self.assertTrue(any("MemoryMax=1024M" in x for x in cmd_wait))
+        self.assertTrue(any("TasksMax=100" in x for x in cmd_wait))
+        self.assertTrue(any("ProtectSystem=strict" in x for x in cmd_wait))
+        self.assertTrue(any("ReadOnlyPaths=/repo" in x for x in cmd_wait))
+        self.assertTrue(any("ReadWritePaths=/repo/.local/tmp" in x for x in cmd_wait))
+
+        cmd_pipe = build_systemd_run_argv(
+            unit_name="agent-task-pipe.service",
+            command_argv=["python3", "task.py"],
+            memory_mb=512,
+            tmpdir="/repo/.local/tmp/ctrl",
+            wait=False,
+        )
+        self.assertIn("--pipe", cmd_pipe)
+        self.assertNotIn("--wait", cmd_pipe)
+        self.assertIn("--expand-environment=no", cmd_pipe)
 class TestCGroupDissolutionAndCleanup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

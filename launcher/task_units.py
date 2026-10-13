@@ -276,6 +276,7 @@ def build_systemd_run_argv(
         "--user",
         f"--unit={unit_name}",
         f"--slice={slice_name}",
+        "--expand-environment=no",
         "--collect",
     ]
     if wait:
