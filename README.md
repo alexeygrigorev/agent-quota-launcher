@@ -65,6 +65,8 @@ python3 -m launcher --config-dir .local/launcher-config fail --id task-123 \
 | `antigravity` | `env -u GEMINI_API_KEY -u GOOGLE_API_KEY agy --model gemini-3.1-pro-high --effort high --dangerously-skip-permissions -p --print-timeout 0 --output-format text <goal>` |
 | `zai` | `/home/alexey/.local/bin/zcodex exec --model glm-5.3-flash --dangerously-bypass-approvals-and-sandbox -c check_for_update_on_startup=false --json <goal>` with `ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs` |
 
+**GLM routing rule (2026-10-14):** Z.ai / GLM work routes only to `zai` (zcodex). OpenCode must never run a GLM model; it is pinned to Muse Spark 1.3 (`opencode-go/muse-spark-1.3-contributor`). `build_adapter_argv` refuses a GLM model on any other route.
+
 Codex is explicitly unsupported in v0.1 (the protected `scripts/launch-codex.sh` wrapper is not configured here); `codex-cli -p` and `zai -p` never appear. Admission fails closed on: non-finite quota percentages (NaN/Inf), missing or timezone-naive `reset_at` (no fabricated urgency), stale evidence, `limit_reached`, exhausted windows, Codex windows <=15% or unknown, and missing Grok entitlement evidence (`has_grok_code_access`). One malformed route never crashes admission of the others.
 
 ## Ranking

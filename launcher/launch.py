@@ -107,7 +107,22 @@ MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 7200
 
 
+# Routing rule (Alexey, 2026-10-14): GLM / Z.ai Coding Plan models run ONLY
+# through zcodex (the `zai` route). OpenCode never runs GLM; it is pinned to
+# Muse Spark 1.3 (OPENCODE_MODEL). Any GLM model on another route is refused.
+OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
+
+
+def _is_glm_model(model):
+    m = str(model or "").lower()
+    return "glm" in m or m.startswith("zai-coding-plan/") or m.startswith("zai/")
+
+
 def build_adapter_argv(provider, goal, model=None):
+    if model and _is_glm_model(model) and provider != "zai":
+        raise ValueError(
+            f"GLM model {model!r} is only allowed on the zai (zcodex) route, not {provider!r}"
+        )
     adapter = ADAPTERS.get(provider)
     if not adapter:
         if provider == "codex":
