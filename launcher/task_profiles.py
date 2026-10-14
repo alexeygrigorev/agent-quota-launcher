@@ -53,6 +53,11 @@ TASK_PROFILES: Dict[str, Dict[str, Any]] = {
         "memory_mb": 256,
         "description": "Generic deterministic cleanup alias",
     },
+    "root-run": {
+        "timeout": 1500.0,
+        "memory_mb": 1500,
+        "description": "Bounded root-run execution profile with mandatory trusted pre-action receiver guard and private EnvironmentFile transport",
+    },
     "default": {
         "timeout": DEFAULT_TIMEOUT_SEC,
         "memory_mb": DEFAULT_MEMORY_MB,
@@ -179,7 +184,14 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
             or any(k in cmd for k in ("zcodex", "agy", "codex", "zcode", "gemini", "glm-5", "grok", "antigravity", "openai", "anthropic"))
         )
 
-        if "review" in task_id or "review" in cmd:
+        if (
+            "root-run" in task_id
+            or payload.get("root_run")
+            or "root-run" in cmd
+            or payload.get("profile") == "root-run"
+        ):
+            profile_name = "root-run"
+        elif "review" in task_id or "review" in cmd:
             profile_name = "model-review"
         elif "cleanup" in task_id:
             profile_name = "model-cleanup" if is_model else "deterministic-cleanup"
@@ -196,8 +208,9 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         effective_timeout = float(profile["timeout"])
 
-    # Enforce safe bounds [60.0, 7200.0] on task-units backend (F3)
-    effective_timeout = max(60.0, min(7200.0, effective_timeout))
+    # Enforce safe bounds [60.0, 7200.0] on task-units backend (F3), clamped to 1500.0 for root-run
+    max_timeout = 1500.0 if profile_name == "root-run" else 7200.0
+    effective_timeout = max(60.0, min(max_timeout, effective_timeout))
 
     raw_mem = payload.get("memory_mb")
     if raw_mem is not None and int(raw_mem) > 0:

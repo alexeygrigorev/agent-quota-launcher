@@ -110,6 +110,10 @@ MAX_TIMEOUT_SECONDS = 7200
 def build_adapter_argv(provider, goal, model=None):
     adapter = ADAPTERS.get(provider)
     if not adapter:
+        if provider == "codex":
+            raise ValueError(
+                "Unsupported provider: codex (genuine protected wrapper scripts/launch-codex.sh not configured; raw routing denied)"
+            )
         raise ValueError(f"Unsupported provider: {provider}")
     if provider == "zai":
         node, cjs, zbin = validate_zai_runtime()
@@ -370,6 +374,54 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     if not payload.get("owner") or not payload.get("cwd") or not payload.get("timeout"):
         raise ValueError("Missing owner/cwd/timeout in payload")
     timeout_seconds = _bounded_timeout(payload)
+
+    # Pre-action receiver guard for root-run profile
+    from launcher.task_profiles import resolve_task_bounds
+    bounds = resolve_task_bounds(payload)
+    is_root = (
+        bounds.get("profile") == "root-run"
+        or payload.get("profile") == "root-run"
+        or payload.get("root_run")
+        or "root-run" in str(task_id)
+    )
+    if is_root:
+        from launcher.root_profile import (
+            check_root_pre_action,
+            RootProfileError,
+            generate_root_dependency_proof,
+        )
+        try:
+            check_root_pre_action(
+                payload,
+                task_id=task_id,
+                workspace=cwd,
+                allow_test_fixture=False,
+            )
+        except RootProfileError as e:
+            try:
+                proof = generate_root_dependency_proof(payload, reason=str(e))
+            except Exception:
+                proof = {
+                    "profile": "root-run",
+                    "admitted": False,
+                    "preclaim_hold": True,
+                    "operational_root_qualified": False,
+                    "unsupported_reason": str(e),
+                }
+            denied_record = {
+                "task_id": task_id,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "outcome": "root-execution-denied",
+                "reason": str(e),
+                "operational_root_qualified": False,
+                "dependency_proof": proof,
+            }
+            _write_launch_record(cwd, denied_record)
+            try:
+                store.transition_task(task_id, "blocked", ("queued",), reason=str(e))
+            except Exception:
+                pass
+            raise
 
     workspace = str(Path(cwd).resolve())
     tmpdir_resolved = str(Path(tmpdir).resolve())

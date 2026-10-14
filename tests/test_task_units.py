@@ -1478,5 +1478,190 @@ class TestTaskUnitsLifecycleTransitions(unittest.TestCase):
         self.assertEqual(self.store.get_task(task_id)["state"], "completed-awaiting-review")
 
 
+class TestTaskUnitsEnvironmentTransport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_build_systemd_run_argv_extra_env_creates_0600_file(self):
+        from launcher.task_units import build_systemd_run_argv
+        import stat
+
+        unit = "test-env.service"
+        extra = {"MY_SECRET_VAR": "secret12345", "DB_USER": "admin"}
+        argv = build_systemd_run_argv(
+            unit_name=unit,
+            command_argv=["python3", "script.py"],
+            memory_mb=512,
+            tmpdir=str(self.ws),
+            workspace=str(self.ws),
+            extra_env=extra,
+        )
+        env_file = self.ws / f"{unit}.env"
+        self.assertTrue(env_file.exists())
+        mode = stat.S_IMODE(env_file.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+        content = env_file.read_text()
+        self.assertIn("MY_SECRET_VAR=secret12345", content)
+        self.assertIn("DB_USER=admin", content)
+
+        # Check EnvironmentFile parameter in argv
+        self.assertIn(f"EnvironmentFile={env_file}", argv)
+        # Ensure secret itself is NOT passed in argv
+        self.assertNotIn("secret12345", " ".join(argv))
+
+    def test_build_systemd_run_argv_rejects_secret_leak_in_argv(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        unit = "test-leak.service"
+        extra = {"API_KEY": "leaked_secret_val"}
+        with self.assertRaises(TaskUnitAdmissionError) as cm:
+            build_systemd_run_argv(
+                unit_name=unit,
+                command_argv=["python3", "script.py", "--key", "leaked_secret_val"],
+                memory_mb=512,
+                tmpdir=str(self.ws),
+                workspace=str(self.ws),
+                extra_env=extra,
+            )
+        self.assertIn("Secret value for 'API_KEY' detected in command argv", str(cm.exception))
+
+    def test_build_systemd_run_argv_rejects_generic_secret_flags(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        unit = "test-flag.service"
+        with self.assertRaises(TaskUnitAdmissionError) as cm:
+            build_systemd_run_argv(
+                unit_name=unit,
+                command_argv=["python3", "script.py", "--token=xyz12345"],
+                memory_mb=512,
+                tmpdir=str(self.ws),
+                workspace=str(self.ws),
+                extra_env={"OTHER": "val"},
+            )
+        self.assertIn("Credential argument detected in command argv", str(cm.exception))
+        self.assertIn("<redacted>", str(cm.exception))
+        self.assertNotIn("xyz12345", str(cm.exception))
+
+    def test_f4_build_systemd_run_argv_scans_credentials_with_empty_or_none_extra_env(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        unit = "test-empty-extra.service"
+        for extra in (None, {}):
+            with self.assertRaises(TaskUnitAdmissionError) as cm:
+                build_systemd_run_argv(
+                    unit_name=unit,
+                    command_argv=["python3", "worker.py", "--token=supersecret12345"],
+                    memory_mb=512,
+                    tmpdir=str(self.ws),
+                    workspace=str(self.ws),
+                    extra_env=extra,
+                )
+            self.assertIn("<redacted>", str(cm.exception))
+            self.assertNotIn("supersecret12345", str(cm.exception))
+
+    def test_f4_build_systemd_run_argv_space_separated_and_hub_tokens_rejected(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        unit = "test-space.service"
+        with self.assertRaises(TaskUnitAdmissionError) as cm:
+            build_systemd_run_argv(
+                unit_name=unit,
+                command_argv=["python3", "worker.py", "--token", "hubt_supersecret999"],
+                memory_mb=512,
+                tmpdir=str(self.ws),
+                workspace=str(self.ws),
+                extra_env=None,
+            )
+        self.assertIn("<redacted>", str(cm.exception))
+        self.assertNotIn("hubt_supersecret999", str(cm.exception))
+
+    def test_f4_execute_transient_task_unit_cleans_up_env_file_in_finally(self):
+        import datetime
+        from unittest.mock import MagicMock, patch
+        from launcher.task_units import _raw_execute_transient_task_unit
+
+        tmpdir = self.ws / ".local" / "tmp" / "t-env-cleanup"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)).isoformat()
+        valid_quse = {"zai": {"status": "ok", "windows": {"7d": {"percent_remaining": 80.0, "reset_at": future}}}}
+        proc_inst = MagicMock(returncode=0)
+        proc_inst.communicate.return_value = (
+            "Running as unit: agent-task-t-env-clean.service; invocation ID: inv1\n",
+            "",
+        )
+        with patch("launcher.task_units.check_resources", return_value=True), \
+             patch("launcher.task_units.verify_task_unit_cleanup", return_value=(True, {})), \
+             patch("subprocess.Popen", return_value=proc_inst):
+            _raw_execute_transient_task_unit(
+                task_id="t-env-clean",
+                command_argv=["echo", "ok"],
+                memory_mb=512,
+                workspace=str(self.ws),
+                tmpdir=str(tmpdir),
+                quse_json=valid_quse,
+                extra_env={"HUB_JOB_TOKEN": "hubt_secret_must_be_deleted"},
+            )
+        env_file = tmpdir / "agent-task-t-env-clean.service.env"
+        # Verify env file was cleanly unlinked in finally:
+        self.assertFalse(env_file.exists())
+
+    def test_f3_run_task_units_non_controller_denies_root_before_spawning_ql_ctl(self):
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import MagicMock, patch
+        from launcher.store import Store
+        from launcher.cli import run_task_units
+
+        store = Store(str(self.ws / "state.db"))
+        store.submit_task(
+            "t-root-ctl-test",
+            "k-root-ctl-test",
+            {
+                "id": "t-root-ctl-test",
+                "profile": "root-run",
+                "goal": "root check",
+                "owner": "head",
+                "cwd": str(self.ws),
+                "timeout": 600,
+            },
+            [],
+        )
+        args_non_ctl = argparse.Namespace(
+            id="t-root-ctl-test",
+            cwd=str(self.ws),
+            tmpdir=None,
+            backend="task-units",
+            config_dir=str(self.ws),
+            as_controller=False,
+        )
+        mock_proc = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("launcher.cli.subprocess.run", return_value=mock_proc) as mock_sub_run:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = run_task_units(args_non_ctl)
+        # Denied with rc=1 and NO systemd-run controller spawned!
+        self.assertEqual(rc, 1)
+        self.assertFalse(mock_sub_run.called)
+        self.assertEqual(store.get_task("t-root-ctl-test")["state"], "blocked")
+
+    def test_f3_resolve_task_bounds_prioritizes_root_run_over_review_and_cleanup(self):
+        from launcher.task_profiles import resolve_task_bounds
+
+        payload = {
+            "id": "hub-job-1",
+            "root_run": True,
+            "goal": "You are root: review principal health and recover if needed",
+        }
+        bounds = resolve_task_bounds(payload)
+        self.assertEqual(bounds["profile"], "root-run")
+        self.assertEqual(bounds["timeout"], 1500.0)
+
+
 if __name__ == "__main__":
     unittest.main()

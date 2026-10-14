@@ -37,12 +37,17 @@ CODEX_NOT_APPLICABLE_WINDOWS = ("5h", "monthly")
 # kind (directly as model_requirements["kind"] or via its task profile) instead
 # of pinning a provider/model. Explicit provider/model pins stay exclusions.
 GENERAL_TASK_KINDS = ("coding", "implementation", "docs", "review")
+ROOT_TASK_KINDS = ("root-run",)
 PROVIDER_TASK_KINDS = {
-    "grok": GENERAL_TASK_KINDS,
-    "antigravity": GENERAL_TASK_KINDS,
-    "zai": GENERAL_TASK_KINDS,
+    "grok": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
+    "antigravity": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
+    "zai": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
 }
-PROFILE_TASK_KINDS = {"model-task": "implementation", "model-review": "review"}
+PROFILE_TASK_KINDS = {
+    "model-task": "implementation",
+    "model-review": "review",
+    "root-run": "root-run",
+}
 
 
 def task_requirements_for(payload):

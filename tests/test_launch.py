@@ -491,5 +491,95 @@ class TestDoRunWaitLoop(unittest.TestCase):
         task = self.store.get_task(self.task_id)
         self.assertEqual(task["state"], "failed")
 
+    def test_codex_adapter_unsupported_rejection(self):
+        with self.assertRaises(ValueError) as cm:
+            build_adapter_argv("codex", "write code")
+        self.assertIn("Unsupported provider: codex", str(cm.exception))
+        self.assertIn("genuine protected wrapper", str(cm.exception))
+
+    def test_do_run_root_run_pre_action_denied_before_claim(self):
+        from launcher.root_profile import RootExecutionDeniedError
+        from launcher.launch import do_run
+
+        root_task_id = "t-root-launch-denied"
+        root_payload = {
+            "id": root_task_id,
+            "goal": "system admin task",
+            "owner": "head-root",
+            "cwd": self.dir,
+            "timeout": 1200,
+            "profile": "root-run",
+            "host": "test-host",
+            "session_id": "sess-root-1",
+            "run_id": "run-root-1",
+            "lease_epoch": 1,
+        }
+        self.store.submit_task(root_task_id, "idem-root-1", root_payload, [])
+
+        with self.assertRaises(RootExecutionDeniedError) as cm:
+            do_run(str(self.db_path), root_task_id, self.dir, None, self.lock_path)
+
+        self.assertIn("Root execution denied", str(cm.exception))
+        task = self.store.get_task(root_task_id)
+        self.assertEqual(task["state"], "blocked")
+
+        # Verify launch record
+        record_path = Path(self.dir) / ".local" / f"launch-{root_task_id}.json"
+        self.assertTrue(record_path.exists())
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record["outcome"], "root-execution-denied")
+        self.assertFalse(record["operational_root_qualified"])
+        self.assertTrue(record["dependency_proof"]["preclaim_hold"])
+
+    def test_f3_do_run_detects_implicit_root_run_and_denies_before_claim(self):
+        from launcher.root_profile import RootExecutionDeniedError
+        from launcher.launch import do_run
+
+        implicit_task_id = "t-root-implicit-task"
+        payload = {
+            "id": implicit_task_id,
+            "goal": "You are root: review principal health and recover if needed",
+            "owner": "head-root",
+            "cwd": self.dir,
+            "timeout": 1200,
+            "root_run": True,
+            "host": "test-host",
+            "session_id": "sess-root-2",
+            "run_id": "run-root-2",
+            "lease_epoch": 1,
+        }
+        self.store.submit_task(implicit_task_id, "idem-root-imp", payload, [])
+
+        with self.assertRaises(RootExecutionDeniedError):
+            do_run(str(self.db_path), implicit_task_id, self.dir, None, self.lock_path)
+
+        task = self.store.get_task(implicit_task_id)
+        self.assertEqual(task["state"], "blocked")
+        record_path = Path(self.dir) / ".local" / f"launch-{implicit_task_id}.json"
+        self.assertTrue(record_path.exists())
+
+    def test_f3_do_run_exception_handler_transitions_blocked_and_writes_record_on_invalid_payload(self):
+        from launcher.root_profile import RootAdmissionError
+        from launcher.launch import do_run
+
+        invalid_task_id = "t-root-missing-sess"
+        payload = {
+            "profile": "root-run",
+            "goal": "root check",
+            "owner": "head-root",
+            "cwd": self.dir,
+            "timeout": 600,
+        }
+        self.store.submit_task(invalid_task_id, "idem-root-inv", payload, [])
+
+        with self.assertRaises(RootAdmissionError):
+            do_run(str(self.db_path), invalid_task_id, self.dir, None, self.lock_path)
+
+        task = self.store.get_task(invalid_task_id)
+        self.assertEqual(task["state"], "blocked")
+        record_path = Path(self.dir) / ".local" / f"launch-{invalid_task_id}.json"
+        self.assertTrue(record_path.exists())
+
+
 if __name__ == '__main__':
     unittest.main()

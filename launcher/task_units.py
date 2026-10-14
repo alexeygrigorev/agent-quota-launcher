@@ -311,14 +311,49 @@ def build_systemd_run_argv(
     if os.path.exists(zcode_cjs):
         argv.extend(["-E", f"ZCODE_CJS={zcode_cjs}"])
 
+    # Detect credential flags in command_argv regardless of extra_env presence
+    for arg in command_argv:
+        lower = str(arg).lower()
+        if any(pattern in lower for pattern in ("--password=", "--token=", "--api-key=", "--secret=", "bearer ")):
+            raise TaskUnitAdmissionError(
+                "Credential argument detected in command argv: <redacted>. Use EnvironmentFile transport instead."
+            )
+        if lower in ("--password", "--token", "--api-key", "--secret", "-token"):
+            raise TaskUnitAdmissionError(
+                "Credential argument detected in command argv: <redacted>. Use EnvironmentFile transport instead."
+            )
+        if str(arg).startswith("hubt_") or str(arg).startswith("hubr_"):
+            raise TaskUnitAdmissionError(
+                "Credential argument detected in command argv: <redacted>. Use EnvironmentFile transport instead."
+            )
+
     if extra_env:
-        # Securely pass extra_env via temporary EnvironmentFile (0600) to prevent cmdline secret leaks
+        # Prevent secret leakage in command argv: ensure no private env value appears in command_argv
+        joined_cmd = " ".join(str(c) for c in command_argv)
+        for k, v in extra_env.items():
+            if v and len(str(v)) >= 4 and str(v) in joined_cmd:
+                raise TaskUnitAdmissionError(
+                    f"Secret value for '{k}' detected in command argv: private credentials must be passed via EnvironmentFile only"
+                )
+
+        # Securely pass extra_env via temporary EnvironmentFile (atomic 0600) to prevent cmdline secret leaks
         tmp_p = Path(tmpdir)
         tmp_p.mkdir(parents=True, exist_ok=True)
         env_file_path = tmp_p / f"{unit_name}.env"
-        lines = [f"{k}={v}\n" for k, v in sorted(extra_env.items()) if k and v is not None]
-        env_file_path.write_text("".join(lines), encoding="utf-8")
-        env_file_path.chmod(0o600)
+        lines = []
+        for k, v in sorted(extra_env.items()):
+            if k and v is not None:
+                if "\n" in str(k) or "\r" in str(k):
+                    raise TaskUnitAdmissionError("Invalid newline in environment variable key: <redacted>")
+                safe_v = str(v).replace("\r", "").replace("\n", "\\n")
+                lines.append(f"{k}={safe_v}\n")
+        fd = os.open(str(env_file_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with open(fd, "w", encoding="utf-8", closefd=False) as f:
+                f.write("".join(lines))
+        finally:
+            os.close(fd)
         argv.extend(["-p", f"EnvironmentFile={env_file_path}"])
     if workspace:
         ws_path = Path(workspace).resolve()
@@ -558,6 +593,7 @@ def execute_transient_task_unit(
     protect_system: Optional[str] = None,
     read_only_paths: Optional[List[str]] = None,
     read_write_paths: Optional[List[str]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -635,6 +671,7 @@ def execute_transient_task_unit(
         protect_system=protect_system,
         read_only_paths=read_only_paths,
         read_write_paths=read_write_paths,
+        extra_env=extra_env,
     )
 
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -730,10 +767,16 @@ def execute_transient_task_unit(
         raise TaskUnitExecutionError(f"execution failed: {e}") from e
 
     finally:
-        # Remove prelude script
+        # Remove prelude script and environment file
         try:
             if prelude_script.exists():
                 prelude_script.unlink()
+        except Exception:
+            pass
+        try:
+            env_file = tmpdir_path / f"{unit_name}.env"
+            if env_file.exists():
+                env_file.unlink()
         except Exception:
             pass
 
@@ -814,6 +857,9 @@ def execute_transient_task_unit(
         "model_status": result_info.get("status") if result_info else None,
         "usage": result_info.get("usage") if result_info else None,
     }
+
+
+_raw_execute_transient_task_unit = execute_transient_task_unit
 
 
 def extract_telemetry_events(stdout_path: Path) -> List[Dict[str, Any]]:
@@ -942,6 +988,7 @@ def spawn_transient_task_unit(
     protect_system: Optional[str] = None,
     read_only_paths: Optional[List[str]] = None,
     read_write_paths: Optional[List[str]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -1015,6 +1062,7 @@ def spawn_transient_task_unit(
         protect_system=protect_system,
         read_only_paths=read_only_paths,
         read_write_paths=read_write_paths,
+        extra_env=extra_env,
     )
 
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()

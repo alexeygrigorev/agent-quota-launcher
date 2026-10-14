@@ -167,12 +167,6 @@ def spawn_ql_controller(args, return_dict=False):
 
 def run_task_units(args):
     """Public CLI path: launch.lock + Store lease + sibling systemd unit."""
-    if not getattr(args, "as_controller", False):
-        return spawn_ql_controller(args)
-    from launcher.admission import fetch_quse, validate_quse
-    from launcher.launch import build_adapter_argv
-    from launcher.task_units import execute_transient_task_unit
-
     config_dir = config_dir_for(args)
     store = get_store(args)
     task = store.get_task(args.id)
@@ -183,6 +177,46 @@ def run_task_units(args):
         print(json.dumps({"error": f"duplicate lease: task {args.id} state is {task['state']}"}))
         return 1
     payload = task["payload"]
+
+    from launcher.task_profiles import resolve_task_bounds
+    bounds = resolve_task_bounds(payload)
+    is_root = (
+        bounds.get("profile") == "root-run"
+        or payload.get("profile") == "root-run"
+        or payload.get("root_run")
+        or "root-run" in str(args.id)
+    )
+    if is_root:
+        from launcher.root_profile import check_root_pre_action, RootProfileError
+        lock_path = config_dir / "launch.lock"
+        try:
+            check_root_pre_action(
+                payload,
+                task_id=args.id,
+                workspace=payload.get("cwd") or str(config_dir),
+                allow_test_fixture=False,
+            )
+        except RootProfileError as e:
+            with launch_lock(str(lock_path)):
+                try:
+                    store.transition_task(args.id, "blocked", ("queued",), reason=str(e))
+                except Exception:
+                    pass
+            print(json.dumps({
+                "error": str(e),
+                "backend": "task-units",
+                "task_id": args.id,
+                "profile": "root-run",
+                "operational_root_qualified": False,
+            }))
+            return 1
+
+    if not getattr(args, "as_controller", False):
+        return spawn_ql_controller(args)
+    from launcher.admission import fetch_quse, validate_quse
+    from launcher.launch import build_adapter_argv
+    from launcher.task_units import execute_transient_task_unit
+
     goal = payload.get("goal") or payload.get("prompt") or ""
     if not goal:
         print(json.dumps({"error": "payload.goal required for task-units backend"}))
@@ -208,14 +242,13 @@ def run_task_units(args):
     allow_fallback = payload.get("allow_fallback", True)
 
     tmpdir = args.tmpdir
-    from launcher.task_profiles import resolve_task_bounds
-    bounds = resolve_task_bounds(payload)
     memory_mb = int(payload.get("memory_mb") or bounds["memory_mb"])
     timeout_sec = float(payload.get("timeout") or bounds["timeout"])
     protect_system = payload.get("protect_system")
     read_only_paths = payload.get("read_only_paths")
     read_write_paths = payload.get("read_write_paths")
     lock_path = config_dir / "launch.lock"
+
     # Concurrent sibling launches can collide on quse (observed rc=1). Retry
     # before leasing so a transient fetch failure leaves the task queued.
     quse = None
@@ -324,6 +357,7 @@ def run_task_units(args):
                 protect_system=protect_system,
                 read_only_paths=read_only_paths,
                 read_write_paths=read_write_paths,
+                extra_env=payload.get("private_env") or payload.get("extra_env"),
             )
     except Exception as e:
         with launch_lock(str(lock_path)):
@@ -412,6 +446,35 @@ def request(args):
             stripped = p.strip()
             if stripped:
                 normalized_paths.append(stripped)
+
+    is_root = (
+        bounds.get("profile") == "root-run"
+        or payload.get("profile") == "root-run"
+        or payload.get("root_run")
+        or "root-run" in str(task_id)
+    )
+    if is_root:
+        from launcher.root_profile import check_root_pre_action, RootProfileError
+        try:
+            check_root_pre_action(
+                payload,
+                task_id=task_id,
+                workspace=cwd,
+                allow_test_fixture=False,
+            )
+        except RootProfileError as e:
+            try:
+                store.submit_task(task_id, idem_key, payload, normalized_paths)
+                store.transition_task(task_id, "blocked", ("queued",), reason=str(e))
+            except Exception:
+                pass
+            print(json.dumps({
+                "error": str(e),
+                "task_id": task_id,
+                "profile": "root-run",
+                "operational_root_qualified": False,
+            }))
+            return 1
 
     # Submit task
     try:
