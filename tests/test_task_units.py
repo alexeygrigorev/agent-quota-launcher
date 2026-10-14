@@ -1,6 +1,8 @@
 """Unit and source tests for manager-spawned sibling systemd TASK units (C2438 / C2441)."""
 from __future__ import annotations
 
+import datetime
+import hashlib
 import argparse
 import json
 import os
@@ -1661,6 +1663,230 @@ class TestTaskUnitsEnvironmentTransport(unittest.TestCase):
         bounds = resolve_task_bounds(payload)
         self.assertEqual(bounds["profile"], "root-run")
         self.assertEqual(bounds["timeout"], 1500.0)
+
+
+class TestRootRunNamespaceAndEnvTransport(unittest.TestCase):
+    """Source-only guards for the root-only namespace policy and private env transport.
+
+    Offline only: systemd/subprocess mocked, no Root launch, no service, no provider.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        os.chmod(self.ws, 0o700)
+        self.script = self.ws / "headless-root-run.sh"
+        self.script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(self.script, 0o700)
+        self.script_sha = hashlib.sha256(self.script.read_bytes()).hexdigest()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _evidence(self, **overrides):
+        from launcher.task_units import TrustedRootJobEvidence
+
+        fields = {
+            "job_id": "hub-job-1",
+            "run_id": "run-1",
+            "lease_epoch": 2,
+            "host_id": "host-1",
+            "session_id": "session-1",
+            "script_path": str(self.script),
+            "script_sha256": self.script_sha,
+            "source_commit": "e" * 40,
+            "auth_role": "root",
+            "expires_at": (
+                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)
+            ).isoformat(),
+        }
+        fields.update(overrides)
+        return TrustedRootJobEvidence(**fields)
+
+    def _private_env(self, **overrides):
+        env = {"HR_RUN_ID": "run-1", "HR_HUB_JOB_ID": "hub-job-1", "HR_HUB_LEASE_EPOCH": "2"}
+        env.update(overrides)
+        return env
+
+    def _generic_argv(self):
+        from launcher.task_units import build_systemd_run_argv
+
+        return build_systemd_run_argv(
+            unit_name="agent-task-gen.service",
+            command_argv=["/bin/sh", str(self.script)],
+            memory_mb=512,
+            tmpdir=str(self.ws),
+            workspace=str(self.ws),
+            wait=True,
+        )
+
+    def test_generic_argv_keeps_masking_and_private_pid_namespace(self):
+        argv = self._generic_argv()
+        joined = " ".join(argv)
+        self.assertIn("InaccessiblePaths=", joined)
+        self.assertIn("-/run/user/%d/aplexer" % os.getuid(), joined)
+        self.assertIn("/usr/bin/unshare", argv)
+        self.assertIn("NoNewPrivileges=yes", joined)
+        self.assertIn("ProtectControlGroups=yes", joined)
+
+    def test_root_run_profile_without_evidence_produces_identical_generic_argv(self):
+        from launcher.task_units import build_systemd_run_argv
+
+        masked = build_systemd_run_argv(
+            unit_name="agent-task-gen.service",
+            command_argv=["/bin/sh", str(self.script)],
+            memory_mb=512,
+            tmpdir=str(self.ws),
+            workspace=str(self.ws),
+            wait=True,
+            profile="root-run",
+        )
+        self.assertEqual(masked, self._generic_argv())
+
+    def test_env_file_is_0600_and_removed_on_success(self):
+        import stat as stat_mod
+        from launcher.task_units import build_systemd_run_argv
+
+        argv = build_systemd_run_argv(
+            unit_name="agent-task-env.service",
+            command_argv=["/bin/sh", str(self.script)],
+            memory_mb=512,
+            tmpdir=str(self.ws),
+            workspace=str(self.ws),
+            wait=True,
+            extra_env={"SAFE_VAR": "value-1234"},
+        )
+        env_file = self.ws / "agent-task-env.service.env"
+        self.assertEqual(stat_mod.S_IMODE(env_file.stat().st_mode), 0o600)
+        self.assertIn("SAFE_VAR=value-1234", env_file.read_text(encoding="utf-8"))
+        self.assertIn(f"EnvironmentFile={env_file}", argv)
+        env_file.unlink()
+
+    def test_env_file_removed_on_failure_path(self):
+        from unittest.mock import MagicMock, patch
+        from launcher.task_units import _raw_execute_transient_task_unit
+
+        tmpdir = self.ws / ".local" / "tmp" / "t-fail-cleanup"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        proc_inst = MagicMock(returncode=0)
+        proc_inst.communicate.side_effect = RuntimeError("spawn blew up")
+        future = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+        ).isoformat()
+        valid_quse = {"zai": {"status": "ok", "windows": {"7d": {"percent_remaining": 80.0,
+                                                                  "reset_at": future}}}}
+        with patch("launcher.task_units.check_resources", return_value=True), patch(
+            "subprocess.Popen", return_value=proc_inst
+        ):
+            with self.assertRaises(Exception):
+                _raw_execute_transient_task_unit(
+                    task_id="t-fail-cleanup",
+                    command_argv=["echo", "ok"],
+                    memory_mb=512,
+                    workspace=str(self.ws),
+                    tmpdir=str(tmpdir),
+                    quse_json=valid_quse,
+                    extra_env={"SAFE_VAR": "value-1234"},
+                )
+        self.assertFalse((tmpdir / "agent-task-t-fail-cleanup.service.env").exists())
+
+    def test_reserved_key_injection_refused(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        for key in ("LD_PRELOAD", "BASH_ENV", "PYTHONPATH", "PATH"):
+            with self.subTest(key=key):
+                with self.assertRaises(TaskUnitAdmissionError):
+                    build_systemd_run_argv(
+                        unit_name="agent-task-inject.service",
+                        command_argv=["/bin/sh", str(self.script)],
+                        memory_mb=512,
+                        tmpdir=str(self.ws),
+                        workspace=str(self.ws),
+                        wait=True,
+                        extra_env={key: "/tmp/evil"},
+                    )
+
+    def test_newline_value_is_refused_not_silently_escaped(self):
+        from launcher.task_units import build_systemd_run_argv, TaskUnitAdmissionError
+
+        with self.assertRaises(TaskUnitAdmissionError) as cm:
+            build_systemd_run_argv(
+                unit_name="agent-task-nl.service",
+                command_argv=["/bin/sh", str(self.script)],
+                memory_mb=512,
+                tmpdir=str(self.ws),
+                workspace=str(self.ws),
+                wait=True,
+                extra_env={"SAFE_VAR": "a\nPATH=/evil"},
+            )
+        self.assertIn("Newline", str(cm.exception))
+        self.assertNotIn("/evil", str(cm.exception))
+
+    def test_trusted_root_env_requires_allowlist_and_own_identity(self):
+        # HELD (F2): self-minted evidence is refused before allowlist checks;
+        # the allowlist itself is still unit-tested via _validated_env_lines.
+        from launcher.task_units import (
+            build_systemd_run_argv,
+            TaskUnitAdmissionError,
+            _validated_env_lines,
+            ROOT_TRUSTED_NAMESPACE_POLICY,
+        )
+
+        with self.assertRaises(TaskUnitAdmissionError) as cm:
+            build_systemd_run_argv(
+                unit_name="agent-task-root-env.service",
+                command_argv=[str(self.script)],
+                memory_mb=1500,
+                tmpdir=str(self.ws),
+                workspace=str(self.ws),
+                wait=True,
+                profile="root-run",
+                trusted_root_evidence=self._evidence(),
+                extra_env=self._private_env(HR_BORROWED="1"),
+            )
+        self.assertIn("trusted root admission refused", str(cm.exception))
+        with self.assertRaises(TaskUnitAdmissionError) as cm2:
+            _validated_env_lines({"HR_BORROWED": "1"}, ROOT_TRUSTED_NAMESPACE_POLICY)
+        self.assertIn("allowlist", str(cm2.exception))
+
+    def test_trusted_root_expired_evidence_refused_without_spawning(self):
+        from unittest.mock import patch
+        from launcher.task_units import _raw_execute_transient_task_unit, TaskUnitAdmissionError
+
+        future = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+        ).isoformat()
+        valid_quse = {"zai": {"status": "ok", "windows": {"7d": {"percent_remaining": 80.0,
+                                                                  "reset_at": future}}}}
+        expired = self._evidence(expires_at="2020-01-01T00:00:00+00:00")
+        tmpdir = self.ws / ".local" / "tmp" / "t-root-expired"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        with patch("launcher.task_units.check_resources", return_value=True), patch(
+            "subprocess.Popen"
+        ) as mock_popen:
+            with self.assertRaises(TaskUnitAdmissionError) as cm:
+                _raw_execute_transient_task_unit(
+                    task_id="t-root-expired",
+                    command_argv=["/bin/sh", str(self.script)],
+                    memory_mb=1500,
+                    workspace=str(self.ws),
+                    tmpdir=str(tmpdir),
+                    quse_json=valid_quse,
+                    profile="root-run",
+                    trusted_root_evidence=expired,
+                    extra_env=self._private_env(),
+                )
+        self.assertIn("trusted root admission refused", str(cm.exception))
+        self.assertFalse(mock_popen.called)
+
+    def test_spawn_path_never_reaches_the_trusted_root_namespace(self):
+        from launcher.task_units import resolve_namespace_policy
+
+        policy = resolve_namespace_policy(
+            "root-run", trusted_root_evidence=self._evidence(), require_synchronous_wait=False
+        )
+        self.assertEqual(policy.policy, "root-trusted-masked")
+        self.assertTrue(policy.isolated_pid and policy.mask_native_services)
 
 
 if __name__ == "__main__":

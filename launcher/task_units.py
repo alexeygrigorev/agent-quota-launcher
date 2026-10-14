@@ -14,15 +14,30 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from launcher.admission import validate_quse
 from launcher.resources import check_resources
+from launcher.task_profiles import (
+    ENV_KEY_PATTERN,
+    MAX_ENV_FILE_BYTES,
+    ROOT_RUN_AUTH_ROLES,
+    ROOT_RUN_ENV_ALLOWLIST,
+    ROOT_RUN_IDENTITY_ENV_KEYS,
+    ROOT_RUN_PROFILE_NAME,
+    is_reserved_env_key,
+    is_root_run_env_key_allowed,
+    namespace_policy_for_profile,
+    require_full_sha,
+    require_full_sha256,
+)
 
 MAX_MEMORY_MB = 1500
 TASKS_MAX = 100
@@ -62,6 +77,200 @@ class TaskUnitTimeoutError(TaskUnitExecutionError):
     def __init__(self, message: str, identity: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.identity = identity or {}
+
+
+@dataclass(frozen=True)
+class TrustedRootJobEvidence:
+    """Immutable, typed trusted admission evidence for one Root-run job.
+
+    Every field is mandatory and there is no default. This object is a plain
+    Python dataclass: it CAN be constructed by any in-process code that fills
+    the fields (including tests, fixtures, and self-minted callers). Type,
+    fields, and hashes alone are NEVER authority.
+
+    No in-process Python check can enforce an issuer boundary: a module-level
+    dict or id() registry cannot distinguish a genuine out-of-process issuer
+    from same-process injection. The trusted unmask branch is therefore
+    REMOVED (default deny). Every Root job keeps full generic isolation until
+    a genuine out-of-process verified issuer exists. No code in this repo mints
+    production authority, and none must be added here.
+    """
+
+    job_id: str
+    run_id: str
+    lease_epoch: int
+    host_id: str
+    session_id: str
+    script_path: str
+    script_sha256: str
+    source_commit: str
+    auth_role: str
+    expires_at: str
+
+    def validate(self, now_utc: Optional[datetime.datetime] = None) -> Optional[str]:
+        """Return the first denial reason, or None when the evidence holds."""
+        for field_name in ("job_id", "run_id", "host_id", "session_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                return f"root-trusted-evidence-missing-{field_name}"
+
+        if isinstance(self.lease_epoch, bool) or not isinstance(self.lease_epoch, int):
+            return "root-trusted-evidence-invalid-lease-epoch"
+        if self.lease_epoch < 1:
+            return "root-trusted-evidence-stale-lease-epoch"
+
+        try:
+            require_full_sha256(self.script_sha256, "script_sha256")
+        except Exception:
+            return "root-trusted-evidence-invalid-script-digest"
+        try:
+            require_full_sha(self.source_commit, "source_commit")
+        except Exception:
+            return "root-trusted-evidence-invalid-source-commit"
+
+        if self.auth_role not in ROOT_RUN_AUTH_ROLES:
+            return "root-trusted-evidence-unsupported-auth-role"
+
+        script = Path(str(self.script_path))
+        if not script.is_absolute():
+            return "root-trusted-evidence-script-path-not-absolute"
+        try:
+            if script.is_symlink():
+                return "root-trusted-evidence-script-symlink-denied"
+            script_stat = script.stat()
+        except OSError:
+            return "root-trusted-evidence-script-unreadable"
+        if not stat.S_ISREG(script_stat.st_mode):
+            return "root-trusted-evidence-script-not-regular-file"
+        if not os.access(str(script), os.X_OK):
+            return "root-trusted-evidence-script-not-executable"
+        try:
+            actual_script_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+        except OSError:
+            return "root-trusted-evidence-script-unreadable"
+        if actual_script_sha != str(self.script_sha256).strip().lower():
+            return "root-trusted-evidence-script-sha-mismatch"
+
+        if not isinstance(self.expires_at, str) or not self.expires_at.strip():
+            return "root-trusted-evidence-missing-expiry"
+        try:
+            expiry = datetime.datetime.fromisoformat(self.expires_at.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return "root-trusted-evidence-invalid-expiry"
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+        now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        if expiry <= now:
+            return "root-trusted-evidence-expired"
+        try:
+            ttl = (expiry - now).total_seconds()
+        except Exception:
+            return "root-trusted-evidence-invalid-expiry"
+        if ttl > MAX_TRUSTED_EVIDENCE_TTL_SEC:
+            return "root-trusted-evidence-ttl-exceeds-maximum"
+
+        return None
+
+
+@dataclass(frozen=True)
+class NamespacePolicy:
+    """Process/service namespace policy bound to one task unit."""
+
+    policy: str
+    profile: str
+    isolated_pid: bool
+    mask_native_services: bool
+    reason: str
+
+
+GENERIC_NAMESPACE_POLICY = NamespacePolicy(
+    policy="generic-isolated",
+    profile="generic",
+    isolated_pid=True,
+    mask_native_services=True,
+    reason="generic-worker-isolation",
+)
+
+
+def _masked_namespace_policy(profile_name: Optional[str], reason: str) -> NamespacePolicy:
+    """Root profile that did not earn the trusted namespace: full masking kept."""
+    return NamespacePolicy(
+        policy="root-trusted-masked",
+        profile=str(profile_name or ""),
+        isolated_pid=True,
+        mask_native_services=True,
+        reason=reason,
+    )
+
+
+ROOT_TRUSTED_NAMESPACE_POLICY = NamespacePolicy(
+    policy="root-trusted-candidate",
+    profile=ROOT_RUN_PROFILE_NAME,
+    isolated_pid=False,
+    mask_native_services=False,
+    reason="root-trusted-admitted",
+)
+
+
+# F1/F2 trust-boundary hardening (source-only guard, runtime HELD).
+# The Root unmask branch is REMOVED (default deny) until a genuine
+# out-of-process verified issuer exists. ProductionRootReceiver (see
+# launcher/root_profile.py) is currently unqualified
+# (is_operationally_qualified() is False), so no positive issuer exists and
+# every constructed TrustedRootJobEvidence stays fully masked.
+# Type/fields/hash alone are NEVER authority. No in-process registry can
+# enforce an issuer boundary, so none is kept here.
+ROOT_TRUSTED_HELD_REASON = "root-trusted-held-no-qualified-receiver"
+
+# Maximum trusted-evidence lifetime: an expiry more than this far in the
+# future is rejected (F2: no 100-year self-minted leases).
+MAX_TRUSTED_EVIDENCE_TTL_SEC = 3600
+
+# HELD: the unmask branch was removed. resolve_namespace_policy() never
+# returns the candidate policy; build_systemd_run_argv() refuses every
+# trusted request. The constant below is retained only so existing imports
+# keep resolving; it is NEVER returned by any live code path.
+
+
+def resolve_namespace_policy(
+    profile_name: Optional[str],
+    trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
+    now_utc: Optional[datetime.datetime] = None,
+    require_synchronous_wait: bool = True,
+) -> NamespacePolicy:
+    """Decide the namespace policy for a task unit.
+
+    Fail closed. A non-root profile, an absent evidence object, a wrong-typed
+    object or an evidence object that fails any validation all yield MORE
+    isolation, never less.
+
+    HELD (R3): the trusted unmask branch is REMOVED. Even fully valid
+    constructed evidence stays masked with ROOT_TRUSTED_HELD_REASON until a
+    genuine out-of-process verified issuer exists. No in-process registry can
+    authorize unmasking. The synchronous-wait gate is still enforced first so
+    callers get the most specific denial reason.
+    """
+    declared = namespace_policy_for_profile(profile_name)
+    if declared != "root-trusted-candidate":
+        return GENERIC_NAMESPACE_POLICY
+
+    # Exact type identity: a subclass or duck-typed impostor is rejected.
+    if trusted_root_evidence is None:
+        return _masked_namespace_policy(profile_name, "root-trusted-evidence-absent")
+    if type(trusted_root_evidence) is not TrustedRootJobEvidence:
+        return _masked_namespace_policy(profile_name, "root-trusted-evidence-invalid-type")
+
+    denial = trusted_root_evidence.validate(now_utc)
+    if denial:
+        return _masked_namespace_policy(profile_name, denial)
+
+    if not require_synchronous_wait:
+        return _masked_namespace_policy(profile_name, "root-trusted-requires-synchronous-wait")
+
+    # Default deny: no positive issuer exists. Never unmask.
+    return _masked_namespace_policy(profile_name, ROOT_TRUSTED_HELD_REASON)
 
 
 def invocation_ids_match(expected: Optional[str], live: Optional[str]) -> bool:
@@ -247,6 +456,109 @@ def admit_task_unit(
     return True
 
 
+def _validated_env_lines(
+    extra_env: Dict[str, Any],
+    namespace_policy: NamespacePolicy,
+) -> List[str]:
+    """Validate and render private per-job environment lines.
+
+    Applies to both namespace policies (tightening, never loosening the base):
+    key charset, reserved-name rejection, NUL and CR/LF rejection in both key
+    and value, a hard 64 KiB size ceiling, and the root-trusted allowlist with
+    mandatory identity keys that must equal the trusted evidence identity.
+    """
+    lines: List[str] = []
+    trusted = namespace_policy.policy == "root-trusted-candidate"
+    for key, value in sorted(extra_env.items(), key=lambda kv: str(kv[0])):
+        if key is None or value is None:
+            continue
+        k = str(key)
+        # F5: strict fullmatch plus explicit NUL/CRLF rejection in keys.
+        # re.match with '$' would accept a trailing newline; fullmatch closes it.
+        if not re.fullmatch(ENV_KEY_PATTERN, k):
+            raise TaskUnitAdmissionError(
+                f"Invalid private environment key name '<redacted>': must match {ENV_KEY_PATTERN}"
+            )
+        if "\x00" in k or "\n" in k or "\r" in k:
+            raise TaskUnitAdmissionError(
+                "Invalid private environment key name '<redacted>': NUL/CR/LF forbidden"
+            )
+        if is_reserved_env_key(k):
+            raise TaskUnitAdmissionError(
+                f"Reserved private environment key '{k}' is forbidden (loader/interpreter injection)"
+            )
+        v = str(value)
+        if "\x00" in k or "\x00" in v:
+            raise TaskUnitAdmissionError(
+                f"NUL byte in private environment entry '{k}': <redacted>"
+            )
+        if "\n" in v or "\r" in v:
+            raise TaskUnitAdmissionError(
+                f"Newline in private environment value for '{k}': <redacted> (no silent escaping)"
+            )
+        # F5: a trailing backslash merges the next line via systemd line
+        # continuation, so refuse it instead of silently widening the value.
+        if v.endswith("\\"):
+            raise TaskUnitAdmissionError(
+                f"Invalid private environment value for '{k}': <redacted> (trailing backslash forbidden)"
+            )
+        # R4: systemd EnvironmentFile has no quoting/escaping facility here
+        # (values are written raw as KEY=VALUE). A quote character could
+        # merge or split entries under a systemd parser, so refuse both
+        # quote types instead of silently passing them through.
+        if '"' in v or "'" in v:
+            raise TaskUnitAdmissionError(
+                f"Invalid private environment value for '{k}': <redacted> (quote characters forbidden)"
+            )
+        if trusted:
+            if not is_root_run_env_key_allowed(k):
+                raise TaskUnitAdmissionError(
+                    f"Environment key '{k}' is not on the root-run allowlist"
+                )
+            lines.append(f"{k}={v}\n")
+            continue
+        lines.append(f"{k}={v}\n")
+
+    if trusted:
+        # Identity binding: no borrowed identity, no missing lease/session.
+        for identity_key in ROOT_RUN_IDENTITY_ENV_KEYS:
+            if identity_key not in extra_env:
+                raise TaskUnitAdmissionError(
+                    f"root-run trusted admission requires identity key {identity_key}"
+                )
+
+    rendered = "".join(lines)
+    if len(rendered.encode("utf-8")) > MAX_ENV_FILE_BYTES:
+        raise TaskUnitAdmissionError(
+            f"private environment file exceeds the {MAX_ENV_FILE_BYTES} byte ceiling"
+        )
+    return lines
+
+
+def _assert_private_env_dir(tmp_path: Path, strict_private: bool = False) -> None:
+    """The EnvironmentFile parent must be a real, non-symlinked directory.
+
+    Generic units keep the shared worktree tmpdir and rely on O_NOFOLLOW plus
+    the 0600 file mode. A trusted Root job also transports a job token, so it
+    additionally requires a directory that is not readable or writable by group
+    or other (fail closed on a shared/world-writable tmpdir).
+    """
+    if tmp_path.is_symlink():
+        raise TaskUnitAdmissionError(
+            f"EnvironmentFile directory must not be a symlink: {tmp_path}"
+        )
+    try:
+        mode = tmp_path.stat().st_mode
+    except OSError as e:
+        raise TaskUnitAdmissionError(f"EnvironmentFile directory is unusable: {e}") from e
+    if not stat.S_ISDIR(mode):
+        raise TaskUnitAdmissionError(f"EnvironmentFile parent is not a directory: {tmp_path}")
+    if strict_private and mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise TaskUnitAdmissionError(
+            f"EnvironmentFile directory {tmp_path} is not private (trusted job env requires 0700)"
+        )
+
+
 def build_systemd_run_argv(
     unit_name: str,
     command_argv: List[str],
@@ -261,15 +573,59 @@ def build_systemd_run_argv(
     protect_system: Optional[str] = None,
     read_only_paths: Optional[List[str]] = None,
     read_write_paths: Optional[List[str]] = None,
+    trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
+    profile: Optional[str] = None,
+    **_rejected_kwargs: Any,
 ) -> List[str]:
     """Construct systemd-run invocation for a detached transient service unit.
 
     Notice: Does NOT pass `--scope`. Runs as a standalone transient `.service`
     unit directly under the user manager, ensuring it does not inherit the
     head's 100-task or 1500M cgroup ceiling.
+
+    Namespace policy is fail closed and strictly derived inside this function
+    (F1: no public namespace_policy override exists; any legacy
+    ``namespace_policy=`` kwarg raises). The trusted host-PID form is REMOVED
+    (R3 default deny): every trusted request is refused loudly and the argv is
+    always the generic isolated form. No code in this repo mints production
+    authority.
     """
+    if _rejected_kwargs:
+        # F1: the public override was removed. Fail loudly so a caller that
+        # still passes namespace_policy=/ROOT_TRUSTED_*/duck-type cannot unmask.
+        bad = sorted(_rejected_kwargs.keys())
+        raise TaskUnitAdmissionError(
+            f"namespace_policy override was removed (F1 trust boundary); got unexpected kwarg(s): {bad}"
+        )
     if not unit_name.endswith(".service"):
         raise TaskUnitAdmissionError(f"transient unit must end with .service, got: {unit_name}")
+
+    # Fail-closed namespace resolution before any file or process effect.
+    # Strictly derived: caller booleans/duck-types cannot inject a policy.
+    policy = resolve_namespace_policy(
+        profile,
+        trusted_root_evidence=trusted_root_evidence,
+        require_synchronous_wait=wait,
+    )
+    if policy.policy not in ("generic-isolated", "root-trusted-masked"):
+        raise TaskUnitAdmissionError(
+            f"unrecognized namespace policy '{policy.policy}' (reason: {policy.reason})"
+        )
+    if trusted_root_evidence is not None:
+        # R3 HELD/REMOVED: the trusted unmask branch was deleted. Any trusted
+        # request is refused loudly instead of silently degrading a Root job
+        # to an isolated unit that cannot reach its own systemd/Bus.
+        # Known incompatibilities held with the removal (no positive issuer):
+        # (a) a symlinked token resolving to the script would exec a
+        # retargetable path; (b) validate->hash->exec-by-path is a TOCTOU
+        # window without fd/private-copy exec; (c) execute/spawn always wrap
+        # as [python, prelude, *command] so an exact single-token
+        # [evidence-script] binding can never be satisfied on the real call
+        # path. Default deny until a genuine out-of-process verified issuer
+        # exists.
+        raise TaskUnitAdmissionError(
+            f"trusted root admission refused: {policy.reason}"
+        )
 
     argv = [
         "systemd-run",
@@ -327,61 +683,117 @@ def build_systemd_run_argv(
                 "Credential argument detected in command argv: <redacted>. Use EnvironmentFile transport instead."
             )
 
-    if extra_env:
-        # Prevent secret leakage in command argv: ensure no private env value appears in command_argv
-        joined_cmd = " ".join(str(c) for c in command_argv)
-        for k, v in extra_env.items():
-            if v and len(str(v)) >= 4 and str(v) in joined_cmd:
-                raise TaskUnitAdmissionError(
-                    f"Secret value for '{k}' detected in command argv: private credentials must be passed via EnvironmentFile only"
-                )
-
-        # Securely pass extra_env via temporary EnvironmentFile (atomic 0600) to prevent cmdline secret leaks
-        tmp_p = Path(tmpdir)
-        tmp_p.mkdir(parents=True, exist_ok=True)
-        env_file_path = tmp_p / f"{unit_name}.env"
-        lines = []
-        for k, v in sorted(extra_env.items()):
-            if k and v is not None:
-                if "\n" in str(k) or "\r" in str(k):
-                    raise TaskUnitAdmissionError("Invalid newline in environment variable key: <redacted>")
-                safe_v = str(v).replace("\r", "").replace("\n", "\\n")
-                lines.append(f"{k}={safe_v}\n")
-        fd = os.open(str(env_file_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with open(fd, "w", encoding="utf-8", closefd=False) as f:
-                f.write("".join(lines))
-        finally:
-            os.close(fd)
-        argv.extend(["-p", f"EnvironmentFile={env_file_path}"])
+    # F4: validate the workspace BEFORE any file effect, so a bad workspace
+    # can never leave a token-bearing EnvironmentFile behind.
+    ws_path = None
     if workspace:
         ws_path = Path(workspace).resolve()
         if not ws_path.is_dir():
             raise TaskUnitAdmissionError(f"workspace path does not exist or is not a directory: {workspace}")
-        argv.extend(["-p", f"WorkingDirectory={ws_path}"])
-    if stdout_path:
-        argv.extend(["-p", f"StandardOutput=file:{stdout_path}"])
-    if stderr_path:
-        argv.extend(["-p", f"StandardError=file:{stderr_path}"])
-    if not stdout_path and not stderr_path and not wait:
-        argv.append("--pipe")
 
-    if protect_system:
-        argv.extend(["-p", f"ProtectSystem={protect_system}"])
-    if read_only_paths:
-        for p in read_only_paths:
-            argv.extend(["-p", f"ReadOnlyPaths={p}"])
-    if read_write_paths:
-        for p in read_write_paths:
-            argv.extend(["-p", f"ReadWritePaths={p}"])
+    # F4: every exception during argv build (including after the env file is
+    # written) and every execute/spawn start failure must remove the private
+    # env file. Track it here and unlink on any failure below.
+    env_file_path: Optional[Path] = None
+    try:
+        if extra_env:
+            # Prevent secret leakage in command argv: ensure no private env value appears in command_argv
+            joined_cmd = " ".join(str(c) for c in command_argv)
+            for k, v in extra_env.items():
+                if v and len(str(v)) >= 4 and str(v) in joined_cmd:
+                    raise TaskUnitAdmissionError(
+                        f"Secret value for '{k}' detected in command argv: private credentials must be passed via EnvironmentFile only"
+                    )
 
-    # Prototype repair: exact child containment, independent of provider PATH.
-    from launcher.pid_isolation import manager_properties, wrap_command
-    argv.extend(manager_properties())
-    argv.append("--")
-    argv.extend(wrap_command(command_argv, sys.executable))
-    return argv
+            if policy.policy == "root-trusted-candidate":
+                # Identity binding: the HR_* values must be this evidence's own
+                # identity, never a borrowed one from another job/lease/run.
+                expected_identity = {
+                    "HR_RUN_ID": str(trusted_root_evidence.run_id),
+                    "HR_HUB_JOB_ID": str(trusted_root_evidence.job_id),
+                    "HR_HUB_LEASE_EPOCH": str(trusted_root_evidence.lease_epoch),
+                }
+                for identity_key, expected_value in expected_identity.items():
+                    actual = extra_env.get(identity_key)
+                    if actual is None:
+                        raise TaskUnitAdmissionError(
+                            f"root-run trusted admission requires identity key {identity_key}"
+                        )
+                    if str(actual).strip() != expected_value:
+                        raise TaskUnitAdmissionError(
+                            f"borrowed identity refused: {identity_key} does not match the trusted evidence"
+                        )
+
+            # Validate before touching the filesystem, then write the private
+            # EnvironmentFile 0600 (O_NOFOLLOW denies a symlinked target).
+            lines = _validated_env_lines(extra_env, policy)
+
+            tmp_p = Path(tmpdir).resolve()
+            tmp_p.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _assert_private_env_dir(tmp_p, strict_private=policy.policy == "root-trusted-candidate")
+            env_file_path = tmp_p / f"{unit_name}.env"
+            if env_file_path.is_symlink():
+                raise TaskUnitAdmissionError("EnvironmentFile path must not be a symlink")
+            try:
+                env_file_path.parent.resolve().relative_to(tmp_p)
+            except ValueError as e:
+                raise TaskUnitAdmissionError("EnvironmentFile must live directly under tmpdir") from e
+            fd = os.open(
+                str(env_file_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                with open(fd, "w", encoding="utf-8", closefd=False) as f:
+                    f.write("".join(lines))
+            finally:
+                os.close(fd)
+            written_mode = stat.S_IMODE(os.stat(str(env_file_path)).st_mode)
+            if written_mode != 0o600:
+                raise TaskUnitAdmissionError(
+                    f"EnvironmentFile mode {oct(written_mode)} is not the required 0600"
+                )
+            argv.extend(["-p", f"EnvironmentFile={env_file_path}"])
+        if ws_path is not None:
+            argv.extend(["-p", f"WorkingDirectory={ws_path}"])
+        if stdout_path:
+            argv.extend(["-p", f"StandardOutput=file:{stdout_path}"])
+        if stderr_path:
+            argv.extend(["-p", f"StandardError=file:{stderr_path}"])
+        if not stdout_path and not stderr_path and not wait:
+            argv.append("--pipe")
+
+        if protect_system:
+            argv.extend(["-p", f"ProtectSystem={protect_system}"])
+        if read_only_paths:
+            for p in read_only_paths:
+                argv.extend(["-p", f"ReadOnlyPaths={p}"])
+        if read_write_paths:
+            for p in read_write_paths:
+                argv.extend(["-p", f"ReadWritePaths={p}"])
+
+        # Namespace application (R3: unmask removed, default deny). Every unit
+        # stays in a private PID namespace with aplexer/systemd/Bus masked.
+        from launcher.pid_isolation import manager_properties
+        argv.extend(manager_properties())
+
+        argv.append("--")
+        from launcher.pid_isolation import wrap_command
+        argv.extend(wrap_command(command_argv, sys.executable))
+        return argv
+    except BaseException:
+        # R2/F4: remove the token-bearing file on any BaseException raised
+        # during argv construction (negatives: KI/SystemExit and
+        # wrap_command/manager_properties/fchmod failures leave no env
+        # file). Re-raise original.
+        if env_file_path is not None:
+            try:
+                if env_file_path.exists() and not env_file_path.is_symlink():
+                    env_file_path.unlink()
+            except BaseException:
+                pass
+        raise
 
 
 def generate_prelude_code(expected_unit_name: str, expected_workspace: Optional[str] = None) -> str:
@@ -594,11 +1006,16 @@ def execute_transient_task_unit(
     read_only_paths: Optional[List[str]] = None,
     read_write_paths: Optional[List[str]] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    profile: Optional[str] = None,
+    trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
     Returns an execution receipt detailing unit, cgroup, timing, and exit code.
     Fails closed if admission fails, unit fails to start, or lingering PIDs remain.
+
+    ``profile``/``trusted_root_evidence`` only select the namespace policy and
+    can never relax admission: admit_task_unit still runs first and unchanged.
     """
     # 0. Calculate loaded module digest BEFORE execution per C2469
     try:
@@ -657,28 +1074,52 @@ def execute_transient_task_unit(
     prelude_script.write_text(prelude_code, encoding="utf-8")
     prelude_script.chmod(0o700)
 
-    # 3. Construct systemd-run invocation with file redirection (0 pump threads) and explicit WorkingDirectory
+    # 3. Construct systemd-run invocation with file redirection (0 pump threads)
+    # and explicit WorkingDirectory. R2/F4: build_systemd_run_argv removes
+    # the EnvironmentFile on BaseException during argv construction, and
+    # validates the workspace before any file effect. R2/R5: this outer
+    # wrapper also unlinks the token env AND the non-secret prelude if the
+    # build raises (including KeyboardInterrupt/SystemExit, which never
+    # reach the Popen try below). S2: started_at/clean_env are computed
+    # inside this same try so a BaseException between a successful build
+    # and Popen startup still removes both files.
     wrapped_command = [sys.executable, str(prelude_script)] + list(command_argv)
-    systemd_cmd = build_systemd_run_argv(
-        unit_name=unit_name,
-        command_argv=wrapped_command,
-        memory_mb=memory_mb,
-        tmpdir=str(tmpdir_path),
-        workspace=str(repo_dir),
-        stdout_path=str(stdout_log),
-        stderr_path=str(stderr_log),
-        wait=True,
-        protect_system=protect_system,
-        read_only_paths=read_only_paths,
-        read_write_paths=read_write_paths,
-        extra_env=extra_env,
-    )
-
-    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    clean_env = dict(os.environ)
-    clean_env["TMPDIR"] = str(tmpdir_path)
-    clean_env["TEMP"] = str(tmpdir_path)
-    clean_env["TMP"] = str(tmpdir_path)
+    try:
+        systemd_cmd = build_systemd_run_argv(
+            unit_name=unit_name,
+            command_argv=wrapped_command,
+            memory_mb=memory_mb,
+            tmpdir=str(tmpdir_path),
+            workspace=str(repo_dir),
+            stdout_path=str(stdout_log),
+            stderr_path=str(stderr_log),
+            wait=True,
+            protect_system=protect_system,
+            read_only_paths=read_only_paths,
+            read_write_paths=read_write_paths,
+            extra_env=extra_env,
+            profile=profile,
+            trusted_root_evidence=trusted_root_evidence,
+        )
+        # S2: inside the build-failure wrapper (see above).
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        clean_env = dict(os.environ)
+        clean_env["TMPDIR"] = str(tmpdir_path)
+        clean_env["TEMP"] = str(tmpdir_path)
+        clean_env["TMP"] = str(tmpdir_path)
+    except BaseException:
+        try:
+            if prelude_script.exists():
+                prelude_script.unlink()
+        except BaseException:
+            pass
+        try:
+            leaked = tmpdir_path / f"{unit_name}.env"
+            if leaked.exists() and not leaked.is_symlink():
+                leaked.unlink()
+        except BaseException:
+            pass
+        raise
 
     assigned_inv_id = None
     proc = None
@@ -757,27 +1198,36 @@ def execute_transient_task_unit(
 
     except TaskUnitTimeoutError:
         raise
-    except Exception as e:
-        signal_owned_unit(unit_name, assigned_inv_id, "stop")
-        verify_task_unit_cleanup(
-            unit_name,
-            timeout_sec=2.0,
-            expected_invocation_id=assigned_inv_id,
-        )
-        raise TaskUnitExecutionError(f"execution failed: {e}") from e
+    except BaseException as e:
+        # R2/S1: after startup begins, stop the owned unit, then re-raise
+        # the original. Only plain Exceptions are wrapped as
+        # TaskUnitExecutionError; BaseExceptions (KeyboardInterrupt/
+        # SystemExit) propagate unwrapped after cleanup.
+        try:
+            signal_owned_unit(unit_name, assigned_inv_id, "stop")
+            verify_task_unit_cleanup(
+                unit_name,
+                timeout_sec=2.0,
+                expected_invocation_id=assigned_inv_id,
+            )
+        except BaseException:
+            pass
+        if isinstance(e, Exception):
+            raise TaskUnitExecutionError(f"execution failed: {e}") from e
+        raise
 
     finally:
-        # Remove prelude script and environment file
+        # Remove prelude script and environment file (R5: prelude too).
         try:
             if prelude_script.exists():
                 prelude_script.unlink()
-        except Exception:
+        except BaseException:
             pass
         try:
             env_file = tmpdir_path / f"{unit_name}.env"
             if env_file.exists():
                 env_file.unlink()
-        except Exception:
+        except BaseException:
             pass
 
     # 4. Verify post-stop cleanup & cgroup dissolution
@@ -989,11 +1439,16 @@ def spawn_transient_task_unit(
     read_only_paths: Optional[List[str]] = None,
     read_write_paths: Optional[List[str]] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    profile: Optional[str] = None,
+    trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
     Returns immediately with unit details and invocation ID.
     0 PIDs and 0 threads remain in the calling controller process during execution.
+
+    The trusted Root namespace is unavailable here: this path has wait=False and
+    therefore no owner that removes the private EnvironmentFile afterwards.
     """
     try:
         module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -1049,38 +1504,74 @@ def spawn_transient_task_unit(
     prelude_script.write_text(prelude_code, encoding="utf-8")
     prelude_script.chmod(0o700)
 
-    wrapped_command = [sys.executable, str(prelude_script)] + list(command_argv)
-    systemd_cmd = build_systemd_run_argv(
-        unit_name=unit_name,
-        command_argv=wrapped_command,
-        memory_mb=memory_mb,
-        tmpdir=str(tmpdir_path),
-        workspace=str(repo_dir),
-        stdout_path=str(stdout_log),
-        stderr_path=str(stderr_log),
-        wait=False,
-        protect_system=protect_system,
-        read_only_paths=read_only_paths,
-        read_write_paths=read_write_paths,
-        extra_env=extra_env,
-    )
+    try:
+        wrapped_command = [sys.executable, str(prelude_script)] + list(command_argv)
+        systemd_cmd = build_systemd_run_argv(
+            unit_name=unit_name,
+            command_argv=wrapped_command,
+            memory_mb=memory_mb,
+            tmpdir=str(tmpdir_path),
+            workspace=str(repo_dir),
+            stdout_path=str(stdout_log),
+            stderr_path=str(stderr_log),
+            wait=False,
+            protect_system=protect_system,
+            read_only_paths=read_only_paths,
+            read_write_paths=read_write_paths,
+            extra_env=extra_env,
+            profile=profile,
+            trusted_root_evidence=trusted_root_evidence,
+        )
+        # S2: inside the build-failure wrapper so a BaseException between
+        # a successful build and subprocess.run startup still removes the
+        # token env and the prelude (see except below).
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        clean_env = dict(os.environ)
+        clean_env["TMPDIR"] = str(tmpdir_path)
+        clean_env["TEMP"] = str(tmpdir_path)
+        clean_env["TMP"] = str(tmpdir_path)
+    except BaseException:
+        # R2/F4+R5: build failure must not leave the token-bearing env file
+        # nor the non-secret prelude behind. Re-raise original (including KI).
+        try:
+            if prelude_script.exists():
+                prelude_script.unlink()
+        except BaseException:
+            pass
+        try:
+            leaked = tmpdir_path / f"{unit_name}.env"
+            if leaked.exists() and not leaked.is_symlink():
+                leaked.unlink()
+        except BaseException:
+            pass
+        raise
 
-    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    clean_env = dict(os.environ)
-    clean_env["TMPDIR"] = str(tmpdir_path)
-    clean_env["TEMP"] = str(tmpdir_path)
-    clean_env["TMP"] = str(tmpdir_path)
-
-    res = subprocess.run(
-        systemd_cmd,
-        cwd=str(repo_dir),
-        env=clean_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    try:
+        res = subprocess.run(
+            systemd_cmd,
+            cwd=str(repo_dir),
+            env=clean_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except BaseException:
+        # R2/F4: spawn-start failure must not leak the private env file.
+        try:
+            leaked = tmpdir_path / f"{unit_name}.env"
+            if leaked.exists() and not leaked.is_symlink():
+                leaked.unlink()
+        except BaseException:
+            pass
+        raise
     if res.returncode != 0:
+        try:
+            leaked = tmpdir_path / f"{unit_name}.env"
+            if leaked.exists() and not leaked.is_symlink():
+                leaked.unlink()
+        except BaseException:
+            pass
         raise TaskUnitExecutionError(
             f"failed to spawn unit {unit_name}: rc={res.returncode}, stderr={res.stderr}"
         )

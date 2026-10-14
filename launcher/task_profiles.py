@@ -16,6 +16,80 @@ from typing import Dict, Any, Optional
 DEFAULT_TIMEOUT_SEC: float = 300.0
 DEFAULT_MEMORY_MB: int = 768
 
+ROOT_RUN_PROFILE_NAME = "root-run"
+
+# Environment keys a root-trusted job may carry through the private 0600
+# EnvironmentFile. HR_* are the CAG script hooks (validated HR_RUN_ID maps to
+# HUB_EXPECTED_RUN_ID, HR_HUB_JOB_ID to HUB_JOB_ID, HR_HUB_LEASE_EPOCH to
+# HUB_LEASE_EPOCH); HUB_* are the agreed Hub job_env fields. Nothing else may be
+# transported, so an arbitrary command/profile/env cannot widen the surface.
+ROOT_RUN_ENV_ALLOWLIST: tuple[str, ...] = (
+    "HR_RUN_ID",
+    "HR_HUB_JOB_ID",
+    "HR_HUB_LEASE_EPOCH",
+    "HUB_JOB_ID",
+    "HUB_URL",
+    "HUB_LEASE_EPOCH",
+    "HUB_JOB_TOKEN",
+    "HUB_LAUNCHER_TASK_ID",
+    "HUB_EXPECTED_RUN_ID",
+    "HUB_FIRST_ACTION_FILE",
+    "HUB_START_ACK_FILE",
+    "HUB_HOST_ID",
+    "HUB_LAUNCHER_UNIT",
+)
+
+# Root-trusted identity keys that must be present and must equal the trusted
+# evidence identity: a borrowed or mismatched identity is denied.
+ROOT_RUN_IDENTITY_ENV_KEYS: tuple[str, ...] = (
+    "HR_RUN_ID",
+    "HR_HUB_JOB_ID",
+    "HR_HUB_LEASE_EPOCH",
+)
+
+# Names a private env may never carry: they would subvert the prelude wrapper,
+# the interpreter start-up path, or the unit's own isolation. R4 adds the
+# PYTHON prefix (PYTHONUSERBASE, PYTHONBREAKPOINT, PYTHONPATH, etc. would
+# alter sys.executable start-up under the prelude wrapper).
+RESERVED_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONBREAKPOINT",
+        "BASH_ENV",
+        "ENV",
+        "IFS",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "SYSTEMD_EXEC_PID",
+        "NOTIFY_SOCKET",
+    }
+)
+RESERVED_ENV_PREFIXES: tuple[str, ...] = ("LD_", "SYSTEMD_", "PYTHON")
+
+ENV_KEY_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
+
+# Roles allowed to present trusted root-job admission evidence.
+ROOT_RUN_AUTH_ROLES: tuple[str, ...] = ("root", "hub-root-host")
+
+# Namespace policies: generic workers keep a private PID namespace and masked
+# aplexer/systemd/Bus; only an explicitly trusted root-run admission may ask for
+# the host PID namespace and its own systemd/Bus.
+NAMESPACE_POLICY_GENERIC = "generic-isolated"
+NAMESPACE_POLICY_ROOT_TRUSTED = "root-trusted-candidate"
+
+MAX_ENV_FILE_BYTES = 64 * 1024
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_FULL_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 class SourceValidationError(ValueError):
     """Raised when a declared git source commit or repository state cannot be validated."""
@@ -82,6 +156,76 @@ def get_profile(name: Optional[str]) -> Dict[str, Any]:
     return TASK_PROFILES[name]
 
 
+def require_full_sha(value: Any, field_name: str = "sha") -> str:
+    """Normalize a claimed digest to a full 40-character lowercase hex SHA.
+
+    Fail closed: a truncated, uppercase-padded, non-hex or empty claim is
+    rejected instead of being silently ignored. An exact script or source
+    digest is only evidence when the whole SHA is present.
+    """
+    if not isinstance(value, str):
+        raise SourceValidationError(
+            f"{field_name} must be a 40-character lowercase hex SHA string, got {type(value).__name__}"
+        )
+    candidate = value.strip().lower()
+    if not _FULL_SHA_RE.match(candidate):
+        raise SourceValidationError(
+            f"{field_name} must be exactly 40 lowercase hex characters (full SHA), got "
+            f"{len(candidate)} character(s)"
+        )
+    return candidate
+
+
+def require_full_sha256(value: Any, field_name: str = "sha256") -> str:
+    """Normalize a claimed content digest to a full 64-character lowercase hex SHA-256.
+
+    Same fail-closed rule as require_full_sha: an exact script digest is only
+    evidence when the whole digest is present.
+    """
+    if not isinstance(value, str):
+        raise SourceValidationError(
+            f"{field_name} must be a 64-character lowercase hex SHA-256 string, got {type(value).__name__}"
+        )
+    candidate = value.strip().lower()
+    if not _FULL_SHA256_RE.match(candidate):
+        raise SourceValidationError(
+            f"{field_name} must be exactly 64 lowercase hex characters (full SHA-256), got "
+            f"{len(candidate)} character(s)"
+        )
+    return candidate
+
+
+def is_reserved_env_key(key: Any) -> bool:
+    """True when a private env key is never allowed to be transported."""
+    if not isinstance(key, str) or not key:
+        return True
+    if key in RESERVED_ENV_KEYS:
+        return True
+    return any(key.startswith(prefix) for prefix in RESERVED_ENV_PREFIXES)
+
+
+def is_root_run_env_key_allowed(key: Any) -> bool:
+    """True only for keys on the agreed root-run private-env allowlist."""
+    return isinstance(key, str) and key in ROOT_RUN_ENV_ALLOWLIST
+
+
+def namespace_policy_for_profile(profile_name: Optional[str]) -> str:
+    """Declare the namespace policy implied by a task profile.
+
+    Unknown or absent profiles fail closed to the generic isolated policy.
+    """
+    name = (profile_name or "").strip()
+    if not name:
+        return NAMESPACE_POLICY_GENERIC
+    if name not in TASK_PROFILES:
+        raise ValueError(
+            f"Unknown task profile '{profile_name}'. Valid profiles: {sorted(list(TASK_PROFILES.keys()))}"
+        )
+    if name == ROOT_RUN_PROFILE_NAME:
+        return NAMESPACE_POLICY_ROOT_TRUSTED
+    return NAMESPACE_POLICY_GENERIC
+
+
 def validate_source_commit(
     repo_path: str | Path,
     commit_ref: str,
@@ -92,7 +236,9 @@ def validate_source_commit(
     
     Guarantees:
     1. Commit ref resolves to a valid 40-character SHA commit object.
-    2. If expected_full_sha is provided, verifies exact 40-char match (rejects truncated or mismatched SHAs).
+    2. If expected_full_sha is provided, it must itself be a full 40-character
+       hex SHA and must match exactly (truncated or malformed claims raise
+       instead of silently skipping the comparison).
     3. If require_clean is True, verifies git worktree has no uncommitted changes.
     4. Returns an immutable source receipt record.
     """
@@ -122,9 +268,14 @@ def validate_source_commit(
             f"rev-parse produced invalid commit SHA '{resolved_sha}' for ref '{ref}'"
         )
 
-    if expected_full_sha:
-        expected = str(expected_full_sha).strip().lower()
-        if len(expected) == 40 and resolved_sha != expected:
+    # F6: compare every non-None value, including falsy ''/0/list/empty.
+    # Only None means "no expectation". A falsy non-None claim is malformed
+    # and must raise, never skip silently.
+    if expected_full_sha is not None:
+        # Fail closed: a malformed or truncated expected SHA is a broken claim,
+        # never a reason to skip the exact-match comparison.
+        expected = require_full_sha(expected_full_sha, "expected_full_sha")
+        if resolved_sha != expected:
             raise SourceValidationError(
                 f"Source commit SHA mismatch: resolved {resolved_sha}, expected {expected}"
             )
