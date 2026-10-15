@@ -1867,7 +1867,9 @@ class TestRootRunNamespaceAndEnvTransport(unittest.TestCase):
             with self.assertRaises(TaskUnitAdmissionError) as cm:
                 _raw_execute_transient_task_unit(
                     task_id="t-root-expired",
-                    command_argv=["/bin/sh", str(self.script)],
+                    # A harmless probe isolates the expired Root-evidence gate.
+                    # Opaque shell wrappers now fail argv admission earlier.
+                    command_argv=["echo", "root-expiry-probe"],
                     memory_mb=1500,
                     workspace=str(self.ws),
                     tmpdir=str(tmpdir),
@@ -1887,6 +1889,209 @@ class TestRootRunNamespaceAndEnvTransport(unittest.TestCase):
         )
         self.assertEqual(policy.policy, "root-trusted-masked")
         self.assertTrue(policy.isolated_pid and policy.mask_native_services)
+
+
+class TestActualTaskUnitProviderBinding(unittest.TestCase):
+    """Exercise both launch paths without starting any service/model."""
+
+    def setUp(self):
+        from tests.test_provider_admission import NOW
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        self.when = patch("launcher.provider_admission._now", return_value=NOW)
+        self.when.start()
+        self.addCleanup(self.when.stop)
+        self.which = patch("launcher.provider_admission.shutil.which",
+                           side_effect=lambda name, **kwargs: "/usr/bin/" + name)
+        self.which.start()
+        self.addCleanup(self.which.stop)
+
+    def command(self, provider):
+        from launcher.provider_admission import GO_MODEL
+        if provider == "claude":
+            return ["/usr/bin/env", "-u", "APLEXER_SESSION_ID", "/usr/bin/claude",
+                    "-p", "--model", "sonnet", "review prompt"]
+        return ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL,
+                "--format", "json", "review prompt"]
+
+    def packet(self, provider, percent=45):
+        from tests.test_provider_admission import quota
+        data = quota(provider, percent)
+        data.update({"gemini": {"status": "ok", "details": {"limit_reached": True}},
+                     "zai": {"status": "ok", "details": {"limit_reached": True}},
+                     "grok": quota("grok", 5)["grok"]})
+        return data
+
+    def test_execute_and_spawn_hold_actual_healthy_provider_before_effects(self):
+        from tests.test_provider_admission import acquired
+        from launcher.provider_admission import QUOTA_LIFECYCLE_HOLD
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                receipt = acquired(self.packet(provider), provider, self.command(provider))
+                with self.subTest(launch=launch.__name__, provider=provider), patch(
+                    "launcher.task_units.check_resources", return_value=True
+                ) as resources, patch("launcher.capacity.check_provider_capacity", return_value=(True, None, {})) as capacity, patch(
+                    "launcher.task_units.build_systemd_run_argv"
+                ) as build, patch("launcher.task_units.subprocess.Popen") as start, patch("launcher.task_units.subprocess.run") as run:
+                    with self.assertRaisesRegex(TaskUnitAdmissionError, QUOTA_LIFECYCLE_HOLD):
+                        launch("r7-held", self.command(provider), 512, str(self.repo), quse_json=receipt, check_capacity=True)
+                    capacity.assert_called_once_with(provider, config_dir=None)
+                    resources.assert_called_once(); build.assert_not_called(); start.assert_not_called(); run.assert_not_called()
+                    self.assertFalse((self.repo / ".local").exists())
+
+
+    def test_both_paths_refuse_exhausted_actual_before_launch(self):
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                data = self.packet(provider, 0)
+                data["zai"] = {"status": "ok", "windows": {"7d": {
+                    "percent_remaining": 90, "reset_at": "2099-01-01T00:00:00Z"}}}
+                from tests.test_provider_admission import acquired
+                receipt_quota = acquired(data, provider, self.command(provider))
+                with self.subTest(launch=launch.__name__, provider=provider), patch(
+                    "launcher.task_units.subprocess.Popen"
+                ) as popen, patch("launcher.task_units.subprocess.run") as run:
+                    with self.assertRaises(TaskUnitAdmissionError):
+                        launch("refused", self.command(provider), 512, str(self.repo),
+                               quse_json=receipt_quota, check_capacity=True)
+                    popen.assert_not_called(); run.assert_not_called()
+                    self.assertFalse((self.repo / ".local").exists())
+
+    def test_both_paths_refuse_mismatched_and_opaque_commands(self):
+        from tests.test_provider_admission import acquired
+        receipt_quota = acquired(self.packet("claude"), "claude", self.command("claude"))
+        bad = [(["/bin/sh", "-c", "claude -p --model sonnet prompt"], None, None),
+               (self.command("claude"), "zai", None),
+               (self.command("claude"), "claude", "opus")]
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for cmd, provider, model in bad:
+                with self.subTest(launch=launch.__name__, cmd=cmd), patch(
+                    "launcher.task_units.subprocess.Popen"
+                ) as popen, patch("launcher.task_units.subprocess.run") as run:
+                    with self.assertRaises(TaskUnitAdmissionError):
+                        launch("refused", cmd, 512, str(self.repo), quse_json=receipt_quota,
+                               provider=provider, model=model, check_capacity=True)
+                    popen.assert_not_called(); run.assert_not_called()
+
+    def test_actual_provider_keeps_capacity_resource_memory_and_tmp_gates(self):
+        from tests.test_provider_admission import acquired
+        receipt_quota = acquired(self.packet("claude"), "claude", self.command("claude"))
+        kwargs = dict(task_id="actual-resource", memory_mb=512, workspace=str(self.repo),
+                      command_argv=self.command("claude"), quse_json=receipt_quota,
+                      check_capacity=True)
+        with patch("launcher.capacity.check_provider_capacity", return_value=(False, "busy", {})):
+            with self.assertRaisesRegex(TaskUnitAdmissionError, "capacity"):
+                admit_task_unit(**kwargs)
+        with patch("launcher.capacity.check_provider_capacity", return_value=(True, None, {})):
+            for reason in ("memory floor", "disk floor"):
+                with patch("launcher.task_units.check_resources", side_effect=ValueError(reason)):
+                    with self.assertRaisesRegex(TaskUnitAdmissionError, reason):
+                        admit_task_unit(**kwargs)
+            for memory in (0, -1, 1501):
+                with self.assertRaises(TaskUnitAdmissionError):
+                    admit_task_unit(**dict(kwargs, memory_mb=memory))
+            with self.assertRaisesRegex(TaskUnitAdmissionError, "must be located under"):
+                admit_task_unit(**dict(kwargs, tmpdir="/tmp/forbidden"))
+
+    def test_both_paths_deny_missing_and_stale_acquisition_before_launch(self):
+        from tests.test_provider_admission import acquired, NOW
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                packet = self.packet(provider)
+                packet["claude" if provider == "claude" else "go"]["details"].pop("observed_at", None)
+                receipt = acquired(packet, provider, self.command(provider))
+                for evidence, when in ((packet, NOW), (receipt, NOW + datetime.timedelta(seconds=301))):
+                    with self.subTest(launch=launch.__name__, provider=provider, raw=isinstance(evidence, dict)), patch(
+                        "launcher.provider_admission._now", return_value=when
+                    ), patch("launcher.task_units.subprocess.Popen") as popen, patch(
+                        "launcher.task_units.subprocess.run"
+                    ) as run:
+                        with self.assertRaisesRegex(TaskUnitAdmissionError, "acquisition"):
+                            launch("r2-refused", self.command(provider), 512, str(self.repo),
+                                   quse_json=evidence, check_capacity=True)
+                        popen.assert_not_called(); run.assert_not_called()
+                        self.assertFalse((self.repo / ".local").exists())
+
+    def test_both_paths_deny_home_config_and_executable_drift_before_launch(self):
+        from tests.test_provider_admission import acquired
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                receipt = acquired(self.packet(provider), provider, self.command(provider))
+                for environment in ({"HOME": "/tmp/unverified-account"}, {"XDG_DATA_HOME": "/tmp/unverified-config"}):
+                    with self.subTest(launch=launch.__name__, provider=provider, environment=environment), patch.dict(
+                        os.environ, environment
+                    ), patch("launcher.task_units.subprocess.Popen") as popen, patch(
+                        "launcher.task_units.subprocess.run"
+                    ) as run:
+                        with self.assertRaises(TaskUnitAdmissionError):
+                            launch("r2-refused", self.command(provider), 512, str(self.repo),
+                                   quse_json=receipt, check_capacity=True)
+                        popen.assert_not_called(); run.assert_not_called()
+                bare = self.command(provider)
+                if provider == "claude": bare[3] = "claude"
+                else: bare[0] = "opencode"
+                with patch("launcher.task_units.subprocess.Popen") as popen, patch(
+                    "launcher.task_units.subprocess.run"
+                ) as run, self.assertRaises(TaskUnitAdmissionError):
+                    launch("r2-refused", bare, 512, str(self.repo), quse_json=receipt, check_capacity=True)
+                popen.assert_not_called(); run.assert_not_called()
+                self.assertFalse((self.repo / ".local").exists())
+
+    def test_unit_builder_holds_receipt_before_file_or_process_effects(self):
+        from tests.test_provider_admission import acquired
+        from launcher.provider_admission import QUOTA_LIFECYCLE_HOLD
+        for provider in ("claude", "opencode"):
+            command = self.command(provider)
+            receipt = acquired(self.packet(provider), provider, command)
+            with patch("launcher.task_units._validated_env_lines") as env, patch("launcher.task_units.subprocess.Popen") as start:
+                with self.assertRaisesRegex(TaskUnitAdmissionError, QUOTA_LIFECYCLE_HOLD):
+                    build_systemd_run_argv("agent-task-r7.service", command, 512,
+                                          str(self.repo / ".local/tmp/r7"), workspace=str(self.repo),
+                                          quota_acquisition=receipt)
+                env.assert_not_called(); start.assert_not_called()
+                self.assertFalse((self.repo / ".local").exists())
+
+
+    def test_model_builder_without_receipt_is_also_held(self):
+        from launcher.provider_admission import QUOTA_LIFECYCLE_HOLD
+        for provider in ("claude", "opencode"):
+            with self.subTest(provider=provider), self.assertRaisesRegex(TaskUnitAdmissionError, QUOTA_LIFECYCLE_HOLD):
+                build_systemd_run_argv("agent-task-r7.service", self.command(provider), 512,
+                                      str(self.repo / ".local/tmp/r7"), workspace=str(self.repo))
+            self.assertFalse((self.repo / ".local").exists())
+
+    def test_caller_model_flags_cannot_enable_held_launch(self):
+        from tests.test_provider_admission import acquired
+        from launcher.provider_admission import QUOTA_LIFECYCLE_HOLD
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                receipt = acquired(self.packet(provider), provider, self.command(provider))
+                with patch("launcher.task_units.check_resources", return_value=True), patch(
+                    "launcher.task_units.build_systemd_run_argv"
+                ) as build, self.assertRaisesRegex(TaskUnitAdmissionError, QUOTA_LIFECYCLE_HOLD):
+                    launch("r7-declared", self.command(provider), 512, str(self.repo), quse_json=receipt,
+                           provider=provider, model=receipt.identity.model, check_capacity=False)
+                build.assert_not_called()
+
+
+    def test_both_paths_deny_quota_source_selectors_before_process_start(self):
+        from tests.test_provider_admission import acquired
+        for launch in (execute_transient_task_unit, spawn_transient_task_unit):
+            for provider in ("claude", "opencode"):
+                receipt = acquired(self.packet(provider), provider, self.command(provider))
+                for selector in ("QUSE_CACHE_DIR", "QUSE_CLAUDE_CACHE_TTL", "GROK_HOME", "AGY_BIN"):
+                    with self.subTest(launch=launch.__name__, provider=provider, selector=selector), patch.dict(
+                        os.environ, {selector: "/tmp/unverified-source"}
+                    ), patch("launcher.task_units.subprocess.Popen") as popen, patch(
+                        "launcher.task_units.subprocess.run"
+                    ) as run:
+                        with self.assertRaisesRegex(TaskUnitAdmissionError, "configuration override"):
+                            launch("r3-refused", self.command(provider), 512, str(self.repo),
+                                   quse_json=receipt, check_capacity=True)
+                        popen.assert_not_called(); run.assert_not_called()
+                        self.assertFalse((self.repo / ".local").exists())
 
 
 if __name__ == "__main__":

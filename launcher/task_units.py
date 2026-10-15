@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from launcher.admission import validate_quse
+from launcher.provider_admission import (
+    QuotaAcquisition, identify_command,
+    validate_command_environment, validate_provider_quota, require_quota_lifecycle,
+)
 from launcher.resources import check_resources
 from launcher.task_profiles import (
     ENV_KEY_PATTERN,
@@ -384,14 +388,24 @@ def admit_task_unit(
     memory_mb: int,
     workspace: str,
     tmpdir: Optional[str] = None,
-    quse_json: Optional[Dict[str, Any]] = None,
+    quse_json: Optional[Union[Dict[str, Any], QuotaAcquisition]] = None,
     provider: Optional[str] = None,
     active_mem_mb: int = 0,
     active_disk_mb: int = 0,
     check_capacity: bool = False,
     config_dir: Optional[Path] = None,
+    command_argv: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> bool:
-    """Pre-execution admission check enforcing memory, floors, and quota."""
+    """Enforce floors and actual-command quota.
+
+    No argv is a legacy quota/resource preflight only, never launch authority.
+    Both execution entry points always supply argv; opaque commands are denied.
+    Model commands are HELD until a qualified atomic process cohort backend
+    exists, even with eligible bound quota. Raw dictionaries remain legacy
+    non-model preflight evidence only; no model launch authority is granted.
+    """
     if int(memory_mb) > MAX_MEMORY_MB:
         raise TaskUnitAdmissionError(
             f"worker memory {memory_mb}M exceeds maximum allowed ceiling of {MAX_MEMORY_MB}M"
@@ -405,21 +419,31 @@ def admit_task_unit(
             "fresh quse_json evidence is required for task unit admission (fail closed)"
         )
     try:
-        valid_routes, rejections = validate_quse(
-            quse_json, check_capacity=check_capacity, config_dir=config_dir
-        )
-        if not valid_routes:
-            raise TaskUnitAdmissionError(f"no valid quota route available: {rejections}")
-        if provider:
-            matching = [
-                r for r in valid_routes
-                if r.get("provider") == provider or r.get("name") == provider
-            ]
-            if not matching:
-                reason = rejections.get(provider, "provider route not accepted or exhausted")
-                raise TaskUnitAdmissionError(
-                    f"requested provider '{provider}' quota rejected: {reason}"
-                )
+        identity = identify_command(command_argv, provider, model) if command_argv is not None else None
+        if identity is not None and identity.provider is not None:
+            validate_command_environment(identity, extra_env)
+            validate_provider_quota(
+                quse_json, identity, check_capacity=check_capacity, config_dir=config_dir,
+                command_argv=command_argv, extra_env=extra_env,
+            )
+        else:
+            # Legacy preflight and explicit harmless non-model utilities retain
+            # the old adapter quota gate. No unknown model command gets here.
+            valid_routes, rejections = validate_quse(
+                quse_json, check_capacity=check_capacity, config_dir=config_dir
+            )
+            if not valid_routes:
+                raise TaskUnitAdmissionError(f"no valid quota route available: {rejections}")
+            if provider:
+                matching = [
+                    r for r in valid_routes
+                    if r.get("provider") == provider or r.get("name") == provider
+                ]
+                if not matching:
+                    reason = rejections.get(provider, "provider route not accepted or exhausted")
+                    raise TaskUnitAdmissionError(
+                        f"requested provider '{provider}' quota rejected: {reason}"
+                    )
     except TaskUnitAdmissionError:
         raise
     except Exception as e:
@@ -452,6 +476,12 @@ def admit_task_unit(
     # Deny /data destination explicitly (18.9 GiB free, below 50 GiB floor)
     if str(tmp_path).startswith("/data") or str(repo_path).startswith("/data"):
         raise TaskUnitAdmissionError("destination under /data is denied due to floor deficit")
+
+    if identity is not None and identity.provider is not None:
+        try:
+            require_quota_lifecycle()
+        except ValueError as exc:
+            raise TaskUnitAdmissionError(str(exc)) from exc
 
     return True
 
@@ -575,6 +605,7 @@ def build_systemd_run_argv(
     read_write_paths: Optional[List[str]] = None,
     trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
     profile: Optional[str] = None,
+    quota_acquisition: Optional[QuotaAcquisition] = None,
     **_rejected_kwargs: Any,
 ) -> List[str]:
     """Construct systemd-run invocation for a detached transient service unit.
@@ -627,6 +658,18 @@ def build_systemd_run_argv(
             f"trusted root admission refused: {policy.reason}"
         )
 
+    # This builder alone grants no execution authority for opaque/legacy argv.
+    # Refuse identifiable model commands even if the caller omits the receipt.
+    try:
+        build_identity = identify_command(command_argv)
+    except ValueError:
+        build_identity = None
+    if quota_acquisition is not None or (build_identity is not None and build_identity.provider is not None):
+        try:
+            require_quota_lifecycle()
+        except ValueError as exc:
+            raise TaskUnitAdmissionError(str(exc)) from exc
+
     argv = [
         "systemd-run",
         "--user",
@@ -645,6 +688,10 @@ def build_systemd_run_argv(
         "-E", f"TMP={tmpdir}",
     ])
 
+    # Model-unit construction is held above. Legacy generic build-only paths
+    # preserve their existing environment transport and are not launch authority.
+    account_env = None
+
     # Propagate strict whitelisted execution PATH, HOME, USER to transient unit
     path_entries = [
         str(Path.home() / ".local" / "bin"),
@@ -654,12 +701,12 @@ def build_systemd_run_argv(
         "/bin",
     ]
     valid_paths = [p for p in path_entries if os.path.isdir(p)]
-    unit_path = ":".join(valid_paths)
+    unit_path = account_env["PATH"] if account_env else ":".join(valid_paths)
 
     argv.extend([
         "-E", f"PATH={unit_path}",
-        "-E", f"HOME={os.environ.get('HOME', str(Path.home()))}",
-        "-E", f"USER={os.environ.get('USER', 'alexey')}",
+        "-E", f"HOME={account_env['HOME'] if account_env else os.environ.get('HOME', str(Path.home()))}",
+        "-E", f"USER={account_env['USER'] if account_env else os.environ.get('USER', 'alexey')}",
     ])
 
     # Propagate ZCode runtime environment if present
@@ -997,7 +1044,7 @@ def execute_transient_task_unit(
     workspace: str,
     tmpdir: Optional[str] = None,
     timeout_sec: float = 1200.0,
-    quse_json: Optional[Dict[str, Any]] = None,
+    quse_json: Optional[Union[Dict[str, Any], QuotaAcquisition]] = None,
     provider: Optional[str] = None,
     log_dir: Optional[str] = None,
     check_capacity: bool = False,
@@ -1008,6 +1055,7 @@ def execute_transient_task_unit(
     extra_env: Optional[Dict[str, str]] = None,
     profile: Optional[str] = None,
     trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -1015,9 +1063,10 @@ def execute_transient_task_unit(
     Fails closed if admission fails, unit fails to start, or lingering PIDs remain.
 
     ``profile``/``trusted_root_evidence`` only select the namespace policy and
-    can never relax admission: admit_task_unit still runs first and unchanged.
+    can never relax admission: actual-command quota admission runs before launch.
     """
     # 0. Calculate loaded module digest BEFORE execution per C2469
+    command_argv = list(command_argv)
     try:
         module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except Exception:
@@ -1033,7 +1082,13 @@ def execute_transient_task_unit(
         provider=provider,
         check_capacity=check_capacity,
         config_dir=config_dir,
+        command_argv=command_argv,
+        model=model,
+        extra_env=extra_env,
     )
+    command_identity = identify_command(command_argv, provider, model)
+    provider = command_identity.provider
+    model = command_identity.model
     unit_name = sanitize_unit_name(task_id)
 
     repo_dir = Path(workspace).resolve()
@@ -1100,6 +1155,7 @@ def execute_transient_task_unit(
             extra_env=extra_env,
             profile=profile,
             trusted_root_evidence=trusted_root_evidence,
+            quota_acquisition=quse_json if isinstance(quse_json, QuotaAcquisition) else None,
         )
         # S2: inside the build-failure wrapper (see above).
         started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1291,6 +1347,8 @@ def execute_transient_task_unit(
         "read_write_paths": read_write_paths,
         "module_sha256": module_sha256,
         "provider": provider,
+        "model": model,
+        "model_identity_source": "command-argv",
         "timeout_sec": timeout_sec,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -1430,7 +1488,7 @@ def spawn_transient_task_unit(
     memory_mb: int,
     workspace: str,
     tmpdir: Optional[str] = None,
-    quse_json: Optional[Dict[str, Any]] = None,
+    quse_json: Optional[Union[Dict[str, Any], QuotaAcquisition]] = None,
     provider: Optional[str] = None,
     log_dir: Optional[str] = None,
     check_capacity: bool = False,
@@ -1441,6 +1499,7 @@ def spawn_transient_task_unit(
     extra_env: Optional[Dict[str, str]] = None,
     profile: Optional[str] = None,
     trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -1450,6 +1509,7 @@ def spawn_transient_task_unit(
     The trusted Root namespace is unavailable here: this path has wait=False and
     therefore no owner that removes the private EnvironmentFile afterwards.
     """
+    command_argv = list(command_argv)
     try:
         module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except Exception:
@@ -1464,7 +1524,13 @@ def spawn_transient_task_unit(
         provider=provider,
         check_capacity=check_capacity,
         config_dir=config_dir,
+        command_argv=command_argv,
+        model=model,
+        extra_env=extra_env,
     )
+    command_identity = identify_command(command_argv, provider, model)
+    provider = command_identity.provider
+    model = command_identity.model
     unit_name = sanitize_unit_name(task_id)
 
     repo_dir = Path(workspace).resolve()
@@ -1521,6 +1587,7 @@ def spawn_transient_task_unit(
             extra_env=extra_env,
             profile=profile,
             trusted_root_evidence=trusted_root_evidence,
+            quota_acquisition=quse_json if isinstance(quse_json, QuotaAcquisition) else None,
         )
         # S2: inside the build-failure wrapper so a BaseException between
         # a successful build and subprocess.run startup still removes the
@@ -1591,6 +1658,8 @@ def spawn_transient_task_unit(
         "read_write_paths": read_write_paths,
         "module_sha256": module_sha256,
         "provider": provider,
+        "model": model,
+        "model_identity_source": "command-argv",
         "started_at": started_at,
         "memory_max_mb": memory_mb,
         "tasks_max": TASKS_MAX,
