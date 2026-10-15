@@ -1,3 +1,6 @@
+> **Deprecated: superseded by [Agent Hub](https://github.com/alexeygrigorev/agent-hub).**
+> Use Agent Hub for fleet start/spawn commands and account-aware placement. This repository remains the maintained execution/admission backend during migration; deprecation of its standalone orchestration entry points does not authorize bypassing quota or resource gates. See the [migration guide](https://github.com/alexeygrigorev/agent-hub/blob/main/docs/GENERIC-HUB.md).
+
 # Agent Quota Launcher
 
 A bounded, stdlib-only Python CLI for launching agent processes reliably: quota-aware admission, filesystem/resource gates, durable SQLite lifecycle, and honest evidence. Providers are strict-argv adapters over native `aplexer` sessions.
