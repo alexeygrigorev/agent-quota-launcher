@@ -46,7 +46,10 @@ def submit(args):
             if stripped:
                 normalized_paths.append(stripped)
     task_id = store.submit_task(args.id, args.key, payload, normalized_paths)
-    print(f"submitted: {task_id}")
+    if getattr(args, 'json', False):
+        print(json.dumps({"task_id": task_id, "state": store.get_task(task_id)["state"]}))
+    else:
+        print(f"submitted: {task_id}")
     return 0
 
 
@@ -889,6 +892,7 @@ def main():
     parser_submit.add_argument("--key", required=True)
     parser_submit.add_argument("--payload", required=True)
     parser_submit.add_argument("--paths", action="append", default=[])
+    parser_submit.add_argument("--json", action="store_true", help="Emit the machine-readable task receipt")
     parser_submit.set_defaults(func=submit)
 
     parser_plan = subparsers.add_parser("plan", help="dry-run admission/ranking, no launch")
