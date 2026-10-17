@@ -204,7 +204,118 @@ class TestOpencodeDoRunWiring(unittest.TestCase):
             self.assertEqual(tail[:6],
                              [OPENCODE_BIN, "run", "--pure", "--auto",
                               "--model", OPENCODE_MODEL])
-            self.assertEqual(tail[6], "wire engine")
+            # Arbitrary brief stays verbatim at the head; the first-action
+            # instruction (with the exact artifact path) is appended so the
+            # native worker can prove liveness.
+            self.assertTrue(tail[6].startswith("wire engine"))
+            self.assertIn("aplexer whoami --json", tail[6])
+            self.assertIn("first-action-task-opencode-wiring.json", tail[6])
+            self.assertEqual(len(tail), 7)
+
+    def test_do_run_appends_first_action_instruction_verbatim(self):
+        import tempfile
+        from pathlib import Path
+        from launcher.store import Store
+        from launcher import launch as launch_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.db")
+            store = Store(db)
+            task_id = "task-opencode-brief"
+            brief = 'arbitrary brief $(keep) "quoted"'
+            payload = {"owner": "me", "cwd": tmp, "timeout": 60,
+                       "goal": brief,
+                       "model_requirements": {"providers": ["opencode"],
+                                              "models": [OPENCODE_MODEL]}}
+            store.submit_task(task_id, "k1", payload, [])
+            lock = str(Path(tmp) / "launch.lock")
+            seen = {}
+
+            class Proc:
+                returncode = 0
+                def communicate(self, timeout=None):
+                    return ('{"id":"x"}', "")
+
+            def fake_popen(cmd, **kw):
+                seen["cmd"] = list(cmd)
+                return Proc()
+
+            with patch.object(launch_mod, "fetch_quse", return_value={"ok": True}), \
+                  patch.object(launch_mod, "validate_quse",
+                               return_value=([{"provider": "opencode",
+                                               "model": OPENCODE_MODEL}], [])), \
+                  patch.object(launch_mod, "select_candidate",
+                               return_value=({"provider": "opencode",
+                                              "model": OPENCODE_MODEL}, {})), \
+                  patch.object(launch_mod, "check_resources", return_value=None), \
+                  patch.object(launch_mod, "subprocess") as mock_sp, \
+                  patch.object(launch_mod, "native_status",
+                               return_value=("dead", "fixture dead")), \
+                  patch.object(launch_mod, "validate_first_action",
+                               return_value=False), \
+                  patch.object(launch_mod, "validate_opencode_runtime",
+                               return_value=OPENCODE_BIN):
+                mock_sp.Popen.side_effect = fake_popen
+                try:
+                    launch_mod.do_run(db, task_id, tmp, None, lock)
+                except Exception:
+                    pass
+            tail = seen["cmd"][seen["cmd"].index("--") + 1:]
+            sent_goal = tail[-1]
+            self.assertTrue(sent_goal.startswith(brief))
+            self.assertIn(str(Path(tmp) / ".local"
+                              / "first-action-task-opencode-brief.json"),
+                          sent_goal)
+            self.assertIn("aplexer whoami --json", sent_goal)
+
+    def test_do_run_other_providers_keep_brief_untouched(self):
+        # The first-action instruction is opencode-scoped; other providers
+        # preserve exact existing goal semantics.
+        import tempfile
+        from pathlib import Path
+        from launcher.store import Store
+        from launcher import launch as launch_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.db")
+            store = Store(db)
+            task_id = "task-grok-brief"
+            payload = {"owner": "me", "cwd": tmp, "timeout": 60,
+                       "goal": "wire engine"}
+            store.submit_task(task_id, "k1", payload, [])
+            lock = str(Path(tmp) / "launch.lock")
+            seen = {}
+
+            class Proc:
+                returncode = 0
+                def communicate(self, timeout=None):
+                    return ('{"id":"x"}', "")
+
+            def fake_popen(cmd, **kw):
+                seen["cmd"] = list(cmd)
+                return Proc()
+
+            with patch.object(launch_mod, "fetch_quse", return_value={"ok": True}), \
+                  patch.object(launch_mod, "validate_quse",
+                               return_value=([{"provider": "grok",
+                                               "model": "grok-4.6"}], [])), \
+                  patch.object(launch_mod, "select_candidate",
+                               return_value=({"provider": "grok",
+                                              "model": "grok-4.6"}, {})), \
+                  patch.object(launch_mod, "check_resources", return_value=None), \
+                  patch.object(launch_mod, "subprocess") as mock_sp, \
+                  patch.object(launch_mod, "native_status",
+                               return_value=("dead", "fixture dead")), \
+                  patch.object(launch_mod, "validate_first_action",
+                               return_value=False):
+                mock_sp.Popen.side_effect = fake_popen
+                try:
+                    launch_mod.do_run(db, task_id, tmp, None, lock)
+                except Exception:
+                    pass
+            tail = seen["cmd"][seen["cmd"].index("--") + 1:]
+            self.assertEqual(tail[-1], "wire engine")
+            self.assertNotIn("--engine", seen["cmd"])
 
 
 class TestOpencodeCliReceipt(unittest.TestCase):
@@ -267,6 +378,51 @@ class TestOpencodeCliReceipt(unittest.TestCase):
                 rc = cli_mod.run(args)
             self.assertEqual(rc, 0)
             self.assertEqual(out.getvalue().strip(), "")
+
+    def test_aplexer_backend_stdout_is_exactly_one_json_document(self):
+        # The Hub fleet run_json caller parses stdout as exactly one JSON
+        # receipt: no log noise, no second line, native ID live while the
+        # worker runs, mirroring the genuine start record.
+        import io
+        import json as jsonlib
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from launcher import cli as cli_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "cfg"
+            cfg.mkdir()
+            (cfg / "state.db").touch()
+            cwd = Path(tmp) / "work"
+            (cwd / ".local").mkdir(parents=True)
+            start = {"id": "native-uuid-456", "tag": "task-hub-offer1",
+                     "workspace": str(cwd), "engine": "opencode",
+                     "phase": "running"}
+            record = {"outcome": "running",
+                      "first_action_validated_at": "2026-10-17T15:00:00Z",
+                      "session_id": "native-uuid-456"}
+            (cwd / ".local" / "launch-t2-start.json").write_text(
+                jsonlib.dumps(start))
+            (cwd / ".local" / "launch-t2.json").write_text(
+                jsonlib.dumps(record))
+            args = SimpleNamespace(config_dir=str(cfg), backend="aplexer",
+                                   id="t2", cwd=str(cwd), tmpdir=None,
+                                   as_controller=False)
+            with patch.object(cli_mod, "do_run", return_value=0), \
+                  patch("sys.stdout", new_callable=io.StringIO) as out:
+                rc = cli_mod.run(args)
+            self.assertEqual(rc, 0)
+            lines = out.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1)
+            doc = jsonlib.loads(lines[0])
+            self.assertEqual(doc["receipt"]["session_id"], "native-uuid-456")
+            self.assertEqual(doc["receipt"]["tag"], "task-hub-offer1")
+            self.assertEqual(doc["receipt"]["workspace"], str(cwd))
+            self.assertEqual(doc["receipt"]["engine"], "opencode")
+            self.assertEqual(doc["receipt"]["phase"], "running")
+            self.assertEqual(doc["receipt"]["state"], "running")
+            self.assertTrue(doc["receipt"]["first_action_verified"])
 
     def test_aplexer_backend_failure_prints_nothing(self):
         import io

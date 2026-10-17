@@ -148,6 +148,19 @@ FIRST_ACTION_TIME_FIELDS = ("timestamp", "created_at_ms", "updated_at_ms")
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 7200
 
+# Appended to the arbitrary brief for opencode aplexer-backend runs only.
+# The first-action wait below can only succeed when the native worker knows
+# the exact artifact path; without this instruction the child never learns
+# it and every run stalls. The brief stays verbatim at the head (separate
+# argv element downstream, never shell-interpolated); other providers keep
+# existing semantics.
+FIRST_ACTION_INSTRUCTION = (
+    "\n\nFirst action (required before any other work): prove this worker "
+    "is live by running `aplexer whoami --json` and writing its complete "
+    "stdout to {path} (overwrite that file, nothing else). "
+    "Then continue the brief."
+)
+
 
 # Routing rule (Alexey, 2026-10-14): GLM / Z.ai Coding Plan models run ONLY
 # through zcodex (the `zai` route). OpenCode never runs GLM; it is pinned to
@@ -538,6 +551,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
 
+    # First-action artifact path (also recorded below): the opencode child
+    # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
+    fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
+    goal = payload.get("goal", "")
+    if provider == "opencode":
+        goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
+
     cmd = [
         "aplexer", "start",
         "--json",
@@ -565,7 +585,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
-    cmd.extend(build_adapter_argv(provider, payload.get("goal", ""), model=payload.get("model")))
+    cmd.extend(build_adapter_argv(provider, goal, model=payload.get("model")))
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
 
     deadline = time.monotonic() + timeout_seconds
@@ -623,7 +643,6 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     record["observed_tag"] = sess_tag
 
     # --- first-action wait happens OUTSIDE the launch lock ---
-    fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     record["first_action_path"] = str(fa_path)
     
     alive, detail = "unknown", "wait started"
