@@ -375,7 +375,9 @@ class Store:
         """Durably persist compact exact native binding evidence in task store.
 
         Validates native UUID, task tag, workspace, engine, and incarnation.
-        Never fabricates whoami, borrowed UUID, or caller PID.
+        Enforces one UUID per task and immutable identity: no rebinding to different UUID/incarnation.
+        Matches submitted task id/run_tag_for(task), cwd, and expected engine where known.
+        Compact details only, no raw env/argv/prompt/start_json.
         """
         validated = validate_native_binding(
             task_id=task_id,
@@ -386,32 +388,110 @@ class Store:
             incarnation=incarnation,
             details=details,
         )
-        details_str = json.dumps(validated["details"], sort_keys=True)
+
+        task = self.get_task(task_id)
+        if task:
+            expected_tag = run_tag_for(task_id)
+            if validated["tag"] != expected_tag:
+                raise ValueError(
+                    f"Binding tag {validated['tag']!r} does not match expected task tag {expected_tag!r}"
+                )
+            payload = task.get("payload", {})
+            if isinstance(payload, dict):
+                expected_cwd = payload.get("cwd")
+                if expected_cwd:
+                    if not os.path.isabs(expected_cwd):
+                        raise ValueError(f"Task payload cwd {expected_cwd!r} is not absolute")
+                    if validated["workspace"] != str(Path(expected_cwd).resolve()):
+                        raise ValueError(
+                            f"Binding workspace {validated['workspace']!r} does not match task cwd {str(Path(expected_cwd).resolve())!r}"
+                        )
+                expected_engine = payload.get("engine")
+                if not expected_engine:
+                    prov = payload.get("provider")
+                    if prov == "antigravity":
+                        expected_engine = "gemini"
+                    elif prov == "opencode":
+                        expected_engine = "opencode"
+                if expected_engine and validated["engine"] != expected_engine:
+                    raise ValueError(
+                        f"Binding engine {validated['engine']!r} does not match expected engine {expected_engine!r}"
+                    )
+
         with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO task_native_bindings (
-                    task_id, native_id, tag, workspace, engine, incarnation, details, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    native_id = excluded.native_id,
-                    tag = excluded.tag,
-                    workspace = excluded.workspace,
-                    engine = excluded.engine,
-                    incarnation = excluded.incarnation,
-                    details = excluded.details,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    validated["task_id"],
-                    validated["native_id"],
-                    validated["tag"],
-                    validated["workspace"],
-                    validated["engine"],
-                    validated["incarnation"],
-                    details_str,
-                ),
+            # Check 1: One UUID per task across all tasks
+            cursor = conn.execute(
+                "SELECT task_id FROM task_native_bindings WHERE native_id = ? AND task_id != ?",
+                (validated["native_id"], task_id),
             )
+            row = cursor.fetchone()
+            if row:
+                raise ValueError(
+                    f"Native session {validated['native_id']} is already bound to task {row[0]}; one UUID per task"
+                )
+
+            # Check 2: Immutable identity per task (no rebinding to different UUID or incarnation)
+            cursor = conn.execute(
+                """
+                SELECT native_id, tag, workspace, engine, incarnation, details
+                FROM task_native_bindings WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                existing_id, existing_tag, existing_ws, existing_engine, existing_inc, existing_det = row
+                if existing_id.lower() != validated["native_id"].lower():
+                    raise ValueError(
+                        f"Task {task_id} has immutable binding to {existing_id}; cannot rebind to {validated['native_id']}"
+                    )
+                if int(existing_inc) != int(validated["incarnation"]):
+                    raise ValueError(
+                        f"Task {task_id} has immutable incarnation {existing_inc}; cannot rebind to {validated['incarnation']}"
+                    )
+                if existing_tag != validated["tag"]:
+                    raise ValueError(
+                        f"Task {task_id} has immutable tag {existing_tag}; cannot change to {validated['tag']}"
+                    )
+                if existing_ws != validated["workspace"]:
+                    raise ValueError(
+                        f"Task {task_id} has immutable workspace {existing_ws}; cannot change to {validated['workspace']}"
+                    )
+                if existing_engine != validated["engine"]:
+                    raise ValueError(
+                        f"Task {task_id} has immutable engine {existing_engine}; cannot change to {validated['engine']}"
+                    )
+
+                # Merge details compactly
+                merged_det = {}
+                if existing_det:
+                    try:
+                        merged_det = json.loads(existing_det)
+                    except Exception:
+                        pass
+                merged_det.update(validated["details"])
+                conn.execute(
+                    "UPDATE task_native_bindings SET details = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+                    (json.dumps(merged_det, sort_keys=True), task_id),
+                )
+                validated["details"] = merged_det
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO task_native_bindings (
+                        task_id, native_id, tag, workspace, engine, incarnation, details, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        validated["task_id"],
+                        validated["native_id"],
+                        validated["tag"],
+                        validated["workspace"],
+                        validated["engine"],
+                        validated["incarnation"],
+                        json.dumps(validated["details"], sort_keys=True),
+                    ),
+                )
         return validated
 
     def get_native_binding(self, task_id):
@@ -479,7 +559,9 @@ class Store:
     def recover_binding_from_artifacts(self, task_id, payload=None):
         """Best-effort recovery of genuine native binding from local launch artifacts.
 
-        Reuses existing genuine launch receipt / first action records without fabricating.
+        Full observed start identity only. Does not fallback to engine gemini/provider,
+        cwd/workspace, or caller timestamps as observed facts.
+        Checks files within bounded expected path only; no history scan.
         """
         if payload is None:
             task = self.get_task(task_id)
@@ -488,35 +570,50 @@ class Store:
         if not payload or not isinstance(payload, dict):
             return None
         cwd = payload.get("cwd")
-        if not cwd:
+        if not cwd or not isinstance(cwd, str) or not os.path.isabs(cwd):
             return None
         cwd_p = Path(cwd).resolve()
         start_p = cwd_p / ".local" / f"launch-{task_id}-start.json"
         record_p = cwd_p / ".local" / f"launch-{task_id}.json"
+
+        from launcher.native_lifecycle import read_bounded_json_file
+
         data = None
+        recovered_from = None
         for p in (start_p, record_p):
             try:
-                if p.is_file():
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        break
+                # Ensure bounded expected path within cwd_p / ".local"
+                if not p.resolve().is_relative_to(cwd_p / ".local"):
+                    continue
             except Exception:
                 continue
+            doc = read_bounded_json_file(p, max_bytes=1048576)
+            if isinstance(doc, dict):
+                data = doc
+                recovered_from = p.name
+                break
         if not isinstance(data, dict):
             return None
 
         # Prefer start record or wrapper_start_json if present
         start_doc = data.get("wrapper_start_json") if isinstance(data.get("wrapper_start_json"), dict) else data
-        native_id = start_doc.get("id") or data.get("session_id")
-        tag = start_doc.get("tag") or data.get("observed_tag") or data.get("tag")
-        workspace = start_doc.get("workspace") or cwd
-        engine = start_doc.get("engine") or data.get("provider") or "gemini"
-        incarnation = start_doc.get("created_at_ms") or (
-            int(data["started_at_ts"] * 1000) if data.get("started_at_ts") else None
-        )
 
-        if not native_id or not tag or not workspace or not incarnation:
+        # Full observed start identity only: NO fallbacks to provider, cwd, or caller timestamps
+        native_id = start_doc.get("id")
+        tag = start_doc.get("tag")
+        workspace = start_doc.get("workspace")
+        engine = start_doc.get("engine")
+        incarnation = start_doc.get("created_at_ms")
+
+        if not native_id or not tag or not workspace or not engine or incarnation is None:
             return None
+
+        if not isinstance(workspace, str) or not os.path.isabs(workspace.strip()):
+            return None
+
+        if isinstance(incarnation, bool) or not isinstance(incarnation, (int, float)) or incarnation <= 0:
+            return None
+
         try:
             return self.record_native_binding(
                 task_id=task_id,
@@ -524,8 +621,8 @@ class Store:
                 tag=tag,
                 workspace=workspace,
                 engine=engine,
-                incarnation=incarnation,
-                details={"recovered_from": str(p)},
+                incarnation=int(incarnation),
+                details={"recovered_from": recovered_from},
             )
         except Exception:
             return None
@@ -539,6 +636,8 @@ class Store:
         workspace, creation ordering, and cause finished). Proven exit
         releases process RAM/disk reservation without inventing task success/
         review/acceptance. Unknown/missing/transport error remains conservative.
+        Materializes SQL rows and closes read connection BEFORE recovery writes
+        or probes to prevent SQLite deadlocks.
         """
         total_mem = 0
         total_disk = 0
@@ -555,35 +654,38 @@ class Store:
                 query += " AND t.id != ?"
                 params.append(exclude_task_id)
             cursor = conn.execute(query, params)
-            for row in cursor.fetchall():
-                task_id, mem, disk, raw_payload, state = row
-                if state == "queued":
-                    total_mem += (mem or 0)
-                    total_disk += (disk or 0)
+            rows = cursor.fetchall()
+
+        # Connection is CLOSED before performing recovery writes or probes
+        for row in rows:
+            task_id, mem, disk, raw_payload, state = row
+            if state == "queued":
+                total_mem += (mem or 0)
+                total_disk += (disk or 0)
+                continue
+
+            binding = self.get_native_binding(task_id)
+            if not binding and raw_payload:
+                try:
+                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                    binding = self.recover_binding_from_artifacts(task_id, payload)
+                except Exception:
+                    binding = None
+
+            if binding:
+                status, detail = probe_native_lifecycle(binding)
+                if status in ("dead", "retired-finished"):
+                    # Proven exit releases process RAM/disk reservation
                     continue
-
-                binding = self.get_native_binding(task_id)
-                if not binding and raw_payload:
-                    try:
-                        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
-                        binding = self.recover_binding_from_artifacts(task_id, payload)
-                    except Exception:
-                        binding = None
-
-                if binding:
-                    status, detail = probe_native_lifecycle(binding)
-                    if status in ("dead", "retired-finished"):
-                        # Proven exit releases process RAM/disk reservation
-                        continue
-                    else:
-                        # Alive or unknown remains conservative
-                        total_mem += (mem or 0)
-                        total_disk += (disk or 0)
                 else:
-                    # Legacy or task-units without native binding:
-                    # Stays conservative under actual ownership proof
+                    # Alive or unknown remains conservative
                     total_mem += (mem or 0)
                     total_disk += (disk or 0)
+            else:
+                # Legacy or task-units without native binding:
+                # Stays conservative under actual ownership proof
+                total_mem += (mem or 0)
+                total_disk += (disk or 0)
 
         return total_mem, total_disk
 

@@ -388,11 +388,13 @@ def native_status(tag, timeout=15):
         return "unknown", f"unparsable status JSON: {e}"
         
     phase = info.get("phase")
+    c_empty = info.get("containment_empty")
     if phase in ("running", "starting", "working", "launching"):
-        alive = not info.get("containment_empty", False)
-        return ("alive" if alive else "dead"), f"phase={phase} containment_empty={info.get('containment_empty')}"
+        return "alive", f"phase={phase} containment_empty={c_empty}"
     if phase in ("exited", "dead", "failed", "completed", "finished"):
-        return "dead", f"phase={phase}"
+        if c_empty is True:
+            return "dead", f"phase={phase} containment_empty=True"
+        return "unknown", f"terminal phase={phase} but containment_empty is not explicitly True (got {c_empty!r})"
     return "unknown", f"phase={phase!r}"
 
 
@@ -643,23 +645,41 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     sess_id = start_json.get("id")
     sess_tag = start_json.get("tag")
     sess_ws = start_json.get("workspace")
+    sess_engine = start_json.get("engine")
+    sess_created_at_ms = start_json.get("created_at_ms")
+
     record["session_id"] = sess_id
     record["observed_tag"] = sess_tag
 
     # Durably persist compact native binding in store at real successful native start
-    created_at_ms = start_json.get("created_at_ms") or int(record["started_at_ts"] * 1000)
-    try:
-        store.record_native_binding(
-            task_id=task_id,
-            native_id=sess_id,
-            tag=sess_tag or run_tag,
-            workspace=sess_ws or workspace,
-            engine=start_json.get("engine") or native_engine or provider,
-            incarnation=created_at_ms,
-            details={"start_json": start_json},
-        )
-    except Exception as e:
-        record["native_binding_error"] = str(e)
+    # Do NOT invent created_at_ms from started_at_ts or tag/ws/engine from request fallback.
+    from launcher.native_lifecycle import UUID_RE
+    has_full_observed_identity = (
+        isinstance(sess_id, str) and bool(UUID_RE.match(sess_id.strip()))
+        and isinstance(sess_tag, str) and bool(sess_tag.strip())
+        and isinstance(sess_ws, str) and bool(sess_ws.strip()) and os.path.isabs(sess_ws.strip())
+        and isinstance(sess_engine, str) and bool(sess_engine.strip())
+        and isinstance(sess_created_at_ms, (int, float)) and not isinstance(sess_created_at_ms, bool) and sess_created_at_ms > 0
+    )
+
+    if has_full_observed_identity:
+        try:
+            store.record_native_binding(
+                task_id=task_id,
+                native_id=sess_id,
+                tag=sess_tag,
+                workspace=sess_ws,
+                engine=sess_engine,
+                incarnation=int(sess_created_at_ms),
+                details={
+                    "start_phase": start_json.get("phase"),
+                    "worker_pid": start_json.get("worker_pid"),
+                },
+            )
+        except Exception as e:
+            record["native_binding_error"] = str(e)
+    else:
+        record["native_binding_unbound_reason"] = "missing or invalid required observed start fields"
 
     # --- first-action wait happens OUTSIDE the launch lock ---
     record["first_action_path"] = str(fa_path)
@@ -675,21 +695,23 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                 pass
             record["outcome"] = "running"
             record["first_action_validated_at"] = datetime.now(timezone.utc).isoformat()
-            try:
-                store.record_native_binding(
-                    task_id=task_id,
-                    native_id=sess_id,
-                    tag=sess_tag or run_tag,
-                    workspace=sess_ws or workspace,
-                    engine=start_json.get("engine") or native_engine or provider,
-                    incarnation=created_at_ms,
-                    details={
-                        "start_json": start_json,
-                        "first_action_validated_at": record["first_action_validated_at"],
-                    },
-                )
-            except Exception:
-                pass
+            if has_full_observed_identity:
+                try:
+                    store.record_native_binding(
+                        task_id=task_id,
+                        native_id=sess_id,
+                        tag=sess_tag,
+                        workspace=sess_ws,
+                        engine=sess_engine,
+                        incarnation=int(sess_created_at_ms),
+                        details={
+                            "first_action_validated_at": record["first_action_validated_at"],
+                            "start_phase": start_json.get("phase"),
+                            "worker_pid": start_json.get("worker_pid"),
+                        },
+                    )
+                except Exception:
+                    pass
             _write_launch_record(cwd, record)
             return 0
             
