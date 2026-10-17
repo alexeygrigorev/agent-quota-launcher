@@ -148,7 +148,7 @@ FIRST_ACTION_TIME_FIELDS = ("timestamp", "created_at_ms", "updated_at_ms")
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 7200
 
-# Appended to the arbitrary brief for opencode aplexer-backend runs only.
+# Appended to native OpenCode and Antigravity worker briefs.
 # The first-action wait below can only succeed when the native worker knows
 # the exact artifact path; without this instruction the child never learns
 # it and every run stalls. The brief stays verbatim at the head (separate
@@ -555,7 +555,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     goal = payload.get("goal", "")
-    if provider == "opencode":
+    if provider in {"opencode", "antigravity"}:
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
     cmd = [
@@ -568,13 +568,12 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         "--cwd", str(Path(payload["cwd"]).resolve()),
         "--tag", run_tag,
     ]
+    # Record the real model engine, rather than the generic shell default.
+    # Antigravity is the installed Gemini CLI; argv below remains its adapter.
+    native_engine = {"opencode": "opencode", "antigravity": "gemini"}.get(provider)
+    if native_engine:
+        cmd.extend(["--engine", native_engine])
     if provider == "opencode":
-        # Genuine native identity: the aplexer session must report
-        # engine=opencode (installed opencode --model muse-spark-1.3). The
-        # exact `opencode run --pure --auto --model ... <goal>` argv still
-        # follows `--` as the workload command; aplexer records the requested
-        # engine label in the start receipt for first-action validation.
-        cmd.extend(["--engine", "opencode"])
         validate_opencode_runtime()
     child_env = dict(ADAPTERS[provider]["env"])
     if provider == "zai":
@@ -585,7 +584,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
-    cmd.extend(build_adapter_argv(provider, goal, model=payload.get("model")))
+    cmd.extend(build_adapter_argv(provider, goal, model=chosen.get("model")))
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
 
     deadline = time.monotonic() + timeout_seconds

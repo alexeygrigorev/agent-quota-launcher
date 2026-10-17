@@ -491,6 +491,28 @@ class TestDoRunWaitLoop(unittest.TestCase):
         task = self.store.get_task(self.task_id)
         self.assertEqual(task["state"], "failed")
 
+    @patch("launcher.launch.fetch_quse")
+    @patch("launcher.launch.validate_quse")
+    @patch("launcher.launch.select_candidate")
+    @patch("launcher.launch.check_resources")
+    @patch("launcher.launch.subprocess.Popen")
+    @patch("launcher.launch.validate_first_action", return_value=True)
+    def test_antigravity_native_identity_and_selected_model(self, fa, popen, resources, select, validate, fetch):
+        validate.return_value = (["antigravity"], [])
+        select.return_value = ({"provider": "antigravity", "model": "gemini-3.8-flash-high"}, {})
+        proc = popen.return_value
+        proc.returncode = 0
+        proc.communicate.return_value = (json.dumps({"id": "real-native", "tag": "task-t1", "workspace": self.dir}), "")
+        from launcher.launch import do_run
+        self.assertEqual(do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path), 0)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--engine") + 1], "gemini")
+        adapter = argv[argv.index("--") + 1:]
+        self.assertEqual(adapter[adapter.index("--model") + 1], "gemini-3.8-flash-high")
+        self.assertIn("first-action-" + self.task_id + ".json", adapter[-1])
+        self.assertIn("aplexer whoami --json", adapter[-1])
+        self.assertTrue(fa.called)
+
     def test_codex_adapter_unsupported_rejection(self):
         with self.assertRaises(ValueError) as cm:
             build_adapter_argv("codex", "write code")
