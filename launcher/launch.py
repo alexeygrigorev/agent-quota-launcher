@@ -366,15 +366,15 @@ def native_status(tag, timeout=15):
     out_err_lower = out_err.lower()
     
     if "stale" in out_err_lower and "socket" in out_err_lower:
-        return "dead", f"aplexer status (stale socket): {out_err.strip()[:200]}"
+        return "unknown", "aplexer status stale socket; reconcile native identity"
     if "transport" in out_err_lower:
-        return "dead", f"aplexer status (transport error): {out_err.strip()[:200]}"
+        return "unknown", "aplexer status transport failure; reconcile native identity"
 
     if res.returncode != 0:
         err = (res.stderr or res.stdout or "").strip()
         err_lower = err.lower()
         if "no session tagged" in err_lower or "has ever existed" in err_lower:
-            return "dead", f"aplexer status rc={res.returncode}: {err[:200]}"
+            return "unknown", f"aplexer status identity unavailable rc={res.returncode}; no exit proof"
         return "unknown", f"aplexer status error rc={res.returncode}: {err[:200]}"
         
     try:
@@ -659,7 +659,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
             _write_launch_record(cwd, record)
             return 0
             
-        alive, detail = native_status(sess_tag or run_tag)
+        # The CLI runs in the launcher checkout, while the child belongs to
+        # payload.cwd. A bare tag would query the wrong workspace.
+        alive, detail = native_status(sess_id or f"{sess_ws}:{sess_tag or run_tag}")
         if alive == "dead":
             break
             
@@ -667,7 +669,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
 
     # Deadline reached or early native death without first action.
     if alive != "dead":
-        alive, detail = native_status(sess_tag or run_tag)
+        alive, detail = native_status(sess_id or f"{sess_ws}:{sess_tag or run_tag}")
         
     record["native_status_at_deadline"] = detail
     if alive == "alive":
