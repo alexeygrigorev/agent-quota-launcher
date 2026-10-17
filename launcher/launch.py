@@ -659,7 +659,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         and isinstance(sess_tag, str) and bool(sess_tag.strip())
         and isinstance(sess_ws, str) and bool(sess_ws.strip()) and os.path.isabs(sess_ws.strip())
         and isinstance(sess_engine, str) and bool(sess_engine.strip())
-        and isinstance(sess_created_at_ms, (int, float)) and not isinstance(sess_created_at_ms, bool) and sess_created_at_ms > 0
+        and type(sess_created_at_ms) is int and sess_created_at_ms > 0
     )
 
     if has_full_observed_identity:

@@ -390,6 +390,8 @@ class Store:
         )
 
         task = self.get_task(task_id)
+        if task is None:
+            raise ValueError("Native binding requires an existing submitted task")
         if task:
             expected_tag = run_tag_for(task_id)
             if validated["tag"] != expected_tag:
@@ -611,7 +613,7 @@ class Store:
         if not isinstance(workspace, str) or not os.path.isabs(workspace.strip()):
             return None
 
-        if isinstance(incarnation, bool) or not isinstance(incarnation, (int, float)) or incarnation <= 0:
+        if type(incarnation) is not int or incarnation <= 0:
             return None
 
         try:

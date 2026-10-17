@@ -82,7 +82,7 @@ class NativeLifecycleValidationTests(unittest.TestCase):
         self.assertNotIn("env", binding["details"])
 
     def test_validate_native_binding_rejects_missing_or_bad_incarnation(self):
-        for bad_inc in (0, -100, "bad", None, False, True):
+        for bad_inc in (0, -100, "bad", None, False, True, 1.5, 1792260000000.0, float("nan"), float("inf")):
             with self.subTest(bad_inc=bad_inc), self.assertRaises(ValueError):
                 validate_native_binding(
                     task_id="t-1",
@@ -105,6 +105,29 @@ class NativeLifecycleValidationTests(unittest.TestCase):
                     incarnation=1792260000000,
                 )
 
+    def test_bounded_reader_closes_descriptor_on_changed_file_rejection(self):
+        from launcher.native_lifecycle import MAX_TOMBSTONE_BYTES
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text("{}")
+            opened = []
+            real_fstat = os.fstat
+            def changed(fd):
+                opened.append(fd)
+                return SimpleNamespace(st_mode=real_fstat(fd).st_mode,
+                                       st_size=MAX_TOMBSTONE_BYTES + 1)
+            with patch("launcher.native_lifecycle.os.fstat", side_effect=changed):
+                self.assertIsNone(read_bounded_json_file(path))
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError):
+                real_fstat(opened[0])
+
+    def test_fractional_finished_timestamp_is_not_terminal_proof(self):
+        tombstone = {"id": VALID_UUID, "tag": "task-t-1", "workspace": "/tmp/ws",
+                     "cause": "finished", "finished_at_ms": 1792260000001.5}
+        ok, _ = verify_tombstone(tombstone, VALID_UUID, "task-t-1", "/tmp/ws", 1792260000000)
+        self.assertFalse(ok)
+
 
 class NativeStoreBindingTests(unittest.TestCase):
     def setUp(self):
@@ -121,6 +144,11 @@ class NativeStoreBindingTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
+
+    def test_native_binding_requires_submitted_task(self):
+        with self.assertRaisesRegex(ValueError, "submitted task"):
+            self.store.record_native_binding("unsubmitted", VALID_UUID,
+                run_tag_for("unsubmitted"), "/tmp/ws", "gemini", 1792260000000)
 
     def test_record_and_get_native_binding(self):
         self.store.record_native_binding(

@@ -105,7 +105,7 @@ def validate_native_binding(
     if not isinstance(engine, str) or not engine.strip():
         raise ValueError("engine must be a non-empty string")
 
-    if isinstance(incarnation, bool) or not isinstance(incarnation, (int, float)) or incarnation <= 0:
+    if type(incarnation) is not int or incarnation <= 0:
         raise ValueError(f"incarnation must be a positive timestamp (epoch ms), got {incarnation!r}")
     incarnation_int = int(incarnation)
 
@@ -149,7 +149,8 @@ def read_bounded_json_file(file_path: Path | str, max_bytes: int = 65536) -> dic
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
         return None
 
-    flags = os.O_RDONLY
+    # A file swapped to a FIFO after lstat must not block the reader.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
@@ -161,10 +162,10 @@ def read_bounded_json_file(file_path: Path | str, max_bytes: int = 65536) -> dic
         return None
 
     try:
-        fst = os.fstat(fd)
-        if not stat.S_ISREG(fst.st_mode) or fst.st_size > max_bytes:
-            return None
         with os.fdopen(fd, "rb") as f:
+            fst = os.fstat(f.fileno())
+            if not stat.S_ISREG(fst.st_mode) or fst.st_size > max_bytes:
+                return None
             raw = f.read(max_bytes + 1)
             if len(raw) > max_bytes:
                 return None
@@ -235,10 +236,10 @@ def verify_tombstone(
 
     # 5. Creation ordering: finished_at_ms >= incarnation
     if expected_incarnation is not None:
-        if isinstance(expected_incarnation, bool) or not isinstance(expected_incarnation, (int, float)) or expected_incarnation <= 0:
+        if type(expected_incarnation) is not int or expected_incarnation <= 0:
             return False, f"invalid expected_incarnation: {expected_incarnation!r}"
         finished_at = tombstone.get("finished_at_ms")
-        if isinstance(finished_at, bool) or not isinstance(finished_at, (int, float)) or finished_at <= 0:
+        if type(finished_at) is not int or finished_at <= 0:
             return False, f"invalid or missing finished_at_ms in tombstone: {finished_at!r}"
         if int(finished_at) < int(expected_incarnation):
             return False, f"stale incarnation: finished_at_ms ({finished_at}) < expected_incarnation ({expected_incarnation})"
@@ -273,7 +274,7 @@ def probe_native_lifecycle(
         return "unknown", "binding missing workspace"
     if not expected_engine:
         return "unknown", "binding missing engine"
-    if isinstance(expected_incarnation, bool) or not isinstance(expected_incarnation, (int, float)) or expected_incarnation <= 0:
+    if type(expected_incarnation) is not int or expected_incarnation <= 0:
         return "unknown", "binding missing or invalid incarnation"
 
     # Step 1: Probe live aplexer session by global UUID
@@ -337,7 +338,7 @@ def probe_native_lifecycle(
 
             # 5. Exact incarnation match (created_at_ms)
             info_created = info.get("created_at_ms")
-            if isinstance(info_created, bool) or not isinstance(info_created, (int, float)) or int(info_created) != int(expected_incarnation):
+            if type(info_created) is not int or info_created != expected_incarnation:
                 return "unknown", f"aplexer status returned mismatched created_at_ms: {info_created!r} != {expected_incarnation!r}"
 
             # Full identity verified! Check phase and containment
