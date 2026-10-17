@@ -13,9 +13,14 @@ launch lifecycle. Provider argv sets are exactly:
                -s workspace-write -c
                check_for_update_on_startup=false --json <goal>
                with ZCODE_NODE and ZCODE_CJS runtime pins propagated via argv and env
+- opencode:    /home/alexey/.nvm/versions/node/v24.13.1/bin/opencode run
+               --pure --auto --model opencode-go/muse-spark-1.3-contributor
+               <goal>  (installed 1.18.31; quse key go maps here; prompt is a
+               separate argv element, never shell-interpolated; engine opencode)
 
 Codex is unsupported in v0.1 (protected wrapper scripts/launch-codex.sh not
 configured in this repo); `codex-cli -p` and `zai -p` never appear here.
+GLM models run ONLY via zai (zcodex); build_adapter_argv refuses them elsewhere.
 """
 import json
 import os
@@ -34,6 +39,8 @@ from launcher.tags import run_tag_for
 ZCODE_NODE = "/home/alexey/.nvm/versions/node/v24.13.1/bin/node"
 ZCODE_CJS = "/opt/ZCode/resources/glm/zcode.cjs"
 ZCODEX_BIN = "/home/alexey/.local/bin/zcodex"
+OPENCODE_BIN = "/home/alexey/.nvm/versions/node/v24.13.1/bin/opencode"
+OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
 
 
 class ZaiRuntimeError(RuntimeError, ValueError, OSError):
@@ -75,6 +82,36 @@ def validate_zai_runtime(node=None, cjs=None, zbin=None):
     return node_path, cjs_path, zbin_path
 
 
+class OpencodeRuntimeError(RuntimeError, ValueError, OSError):
+    """Raised when OpenCode runtime requirements are missing or unexecutable."""
+    pass
+
+
+class OpencodeRuntimeMissingError(OpencodeRuntimeError, FileNotFoundError):
+    """Raised when the pinned OpenCode binary is missing."""
+    pass
+
+
+class OpencodeRuntimeUnexecutableError(OpencodeRuntimeError, PermissionError):
+    """Raised when the pinned OpenCode binary lacks execution permission."""
+    pass
+
+
+def validate_opencode_runtime(opencode_bin=None):
+    """Validate the pinned OpenCode binary exists and is executable.
+
+    Model subscription itself is proven by `opencode models` containing
+    OPENCODE_MODEL plus fresh quse go windows at admission; this check only
+    refuses a missing/unexecutable binary (fail closed, no fallback model).
+    """
+    bin_path = opencode_bin if opencode_bin is not None else OPENCODE_BIN
+    if not os.path.exists(bin_path) or not os.path.isfile(bin_path):
+        raise OpencodeRuntimeMissingError(f"OpenCode binary missing: {bin_path}")
+    if not os.access(bin_path, os.X_OK):
+        raise OpencodeRuntimeUnexecutableError(f"OpenCode binary not executable: {bin_path}")
+    return bin_path
+
+
 ADAPTERS = {
     "grok": {
         "argv": ["/home/alexey/.local/bin/grok", "--model", "grok-4.6",
@@ -95,6 +132,11 @@ ADAPTERS = {
                  "-c", "check_for_update_on_startup=false", "--json"],
         "env": {"ZCODE_CJS": ZCODE_CJS, "ZCODE_NODE": ZCODE_NODE},
     },
+    "opencode": {
+        "argv": [OPENCODE_BIN, "run", "--pure", "--auto", "--model",
+                 OPENCODE_MODEL],
+        "env": {},
+    },
 }
 
 # The native whoami is RICH (id, tag, workspace, engine, command, phase,
@@ -110,7 +152,6 @@ MAX_TIMEOUT_SECONDS = 7200
 # Routing rule (Alexey, 2026-10-14): GLM / Z.ai Coding Plan models run ONLY
 # through zcodex (the `zai` route). OpenCode never runs GLM; it is pinned to
 # Muse Spark 1.3 (OPENCODE_MODEL). Any GLM model on another route is refused.
-OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
 
 
 def _is_glm_model(model):
@@ -123,6 +164,15 @@ def build_adapter_argv(provider, goal, model=None):
         raise ValueError(
             f"GLM model {model!r} is only allowed on the zai (zcodex) route, not {provider!r}"
         )
+    if provider == "opencode":
+        # Exact installed subscription model only; no fallback to paid/free
+        # alternatives and no GLM via OpenCode (refused above). None means the
+        # pinned default; any other value is refused (fail closed).
+        if model is not None and str(model) != OPENCODE_MODEL:
+            raise ValueError(
+                f"Unsupported OpenCode model {model!r}; only {OPENCODE_MODEL!r} is supported"
+            )
+        validate_opencode_runtime()
     adapter = ADAPTERS.get(provider)
     if not adapter:
         if provider == "codex":
@@ -498,6 +548,14 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         "--cwd", str(Path(payload["cwd"]).resolve()),
         "--tag", run_tag,
     ]
+    if provider == "opencode":
+        # Genuine native identity: the aplexer session must report
+        # engine=opencode (installed opencode --model muse-spark-1.3). The
+        # exact `opencode run --pure --auto --model ... <goal>` argv still
+        # follows `--` as the workload command; aplexer records the requested
+        # engine label in the start receipt for first-action validation.
+        cmd.extend(["--engine", "opencode"])
+        validate_opencode_runtime()
     child_env = dict(ADAPTERS[provider]["env"])
     if provider == "zai":
         node, cjs, _ = validate_zai_runtime()

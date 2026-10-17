@@ -124,11 +124,10 @@ class TestAdmission(unittest.TestCase):
             "claude": route({"5h": {"percent_remaining": 90, "reset_at": self.future1}}),
             "copilot": route({"monthly": {"percent_remaining": 100,
                                           "reset_at": self.future1}}),
-            "go": route({"5h": {"percent_remaining": 100, "reset_at": self.future1}}),
         }
         valid, rej = validate_quse(data)
         self.assertEqual(len(valid), 0)
-        for name in ("claude", "copilot", "go"):
+        for name in ("claude", "copilot"):
             self.assertIn("Unsupported route", rej.get(name, ""))
 
     def test_grok_entitlement_required(self):

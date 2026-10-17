@@ -105,8 +105,45 @@ def run(args):
         print(json.dumps({"error": f"unknown backend {backend}"}))
         return 1
     lock_path = config_dir / 'launch.lock'
-    return do_run(str(config_dir / 'state.db'), args.id, args.cwd, args.tmpdir,
-                  str(lock_path))
+    rc = do_run(str(config_dir / 'state.db'), args.id, args.cwd, args.tmpdir,
+                str(lock_path))
+    if rc != 0 or backend != "aplexer":
+        return rc
+    # Narrow native receipt for the maintained aplexer backend (Hub fleet
+    # binding): on success (first-action validated, session running) emit a
+    # JSON receipt with the genuine native UUID so run_json callers can bind
+    # without faking. Files are the do_run-written evidence; missing/invalid
+    # evidence prints nothing (caller treats empty stdout as uncertain, never
+    # as a fake receipt). Exit code and launch-record semantics preserved.
+    try:
+        cwd_path = Path(args.cwd).resolve()
+        start_doc = json.loads(
+            (cwd_path / ".local" / f"launch-{args.id}-start.json").read_text(
+                encoding="utf-8"))
+        record_doc = json.loads(
+            (cwd_path / ".local" / f"launch-{args.id}.json").read_text(
+                encoding="utf-8"))
+        session_id = start_doc.get("id") or record_doc.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return rc
+        if record_doc.get("outcome") != "running":
+            return rc
+        if not record_doc.get("first_action_validated_at"):
+            return rc
+        receipt = {
+            "session_id": session_id,
+            "state": "running",
+            "first_action_verified": True,
+            "tag": start_doc.get("tag"),
+            "workspace": start_doc.get("workspace"),
+            "engine": start_doc.get("engine"),
+            "phase": start_doc.get("phase"),
+        }
+        print(json.dumps({"backend": "aplexer", "task_id": args.id,
+                          "receipt": receipt}))
+    except Exception:
+        pass
+    return rc
 
 
 def controller_unit_name(task_id: str) -> str:

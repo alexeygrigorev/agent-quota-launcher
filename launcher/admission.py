@@ -1,10 +1,14 @@
 """Quota admission: fetch and validate fresh quse evidence, fail closed.
 
-Adapter-backed routes for v0.1 are grok, antigravity and zai (ordinary paid
-allowance). Codex requires the protected wrapper scripts/launch-codex.sh, which
-this repo does not ship, so codex is explicitly unsupported here; its window
-gate is still evaluated and recorded so the <=15%/unknown fail-closed rule is
-testable and visible in rejection reasons.
+Adapter-backed routes for v0.1 are grok, antigravity, zai (ordinary paid
+allowance) and opencode (Go remaining via quse key go, exact subscription
+model opencode-go/muse-spark-1.3-contributor). Codex requires the protected
+wrapper scripts/launch-codex.sh, which this repo does not ship, so codex is
+explicitly unsupported here; its window gate is still evaluated and recorded
+so the <=15%/unknown fail-closed rule is testable and visible in rejection
+reasons. Free OpenCode provider ids (opencode/*-free) are not mapped; Go
+remaining does not prove those routes. GLM models never route to opencode
+(enforced in launcher.launch.build_adapter_argv).
 """
 import json
 import math
@@ -12,16 +16,18 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-ADAPTER_ROUTES = ("grok", "antigravity", "zai")
+ADAPTER_ROUTES = ("grok", "antigravity", "zai", "opencode")
 ADAPTER_MODELS = {
     "grok": "grok-4.6",
     "antigravity": "gemini-3.8-flash-high",
     "zai": "glm-5.3-flash",
+    "opencode": "opencode-go/muse-spark-1.3-contributor",
 }
 ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
     "antigravity": ("gemini-3.8-flash-high", "gemini-4-argon-high"),
     "zai": ("glm-5.3-flash",),
+    "opencode": ("opencode-go/muse-spark-1.3-contributor",),
 }
 CODEX_MIN_REMAINING = 15.0
 
@@ -42,6 +48,7 @@ PROVIDER_TASK_KINDS = {
     "grok": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "antigravity": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "zai": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
+    "opencode": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
 }
 PROFILE_TASK_KINDS = {
     "model-task": "implementation",
@@ -164,7 +171,12 @@ def codex_gate_reason(route, now):
 
 def _validate_route(name, route, now, task_requirements, check_capacity=False, config_dir=None):
     """Validate one route. Returns (candidate|None, rejection_reason|None)."""
-    provider = "antigravity" if name == "gemini" else name
+    if name == "gemini":
+        provider = "antigravity"
+    elif name in ("go", "opencode", "opencode-go"):
+        provider = "opencode"
+    else:
+        provider = name
 
     if provider == "codex":
         gate = codex_gate_reason(route, now)
