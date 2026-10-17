@@ -576,8 +576,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         "--tag", run_tag,
     ]
     # Record the real model engine, rather than the generic shell default.
-    # Antigravity is the installed Gemini CLI; argv below remains its adapter.
-    native_engine = {"opencode": "opencode", "antigravity": "gemini"}.get(provider)
+    # Antigravity has its own native lifecycle policy; Gemini is a distinct
+    # engine even when the model name begins with gemini. Existing bindings
+    # retain the engine recorded at their original birth.
+    native_engine = {"opencode": "opencode", "antigravity": "antigravity"}.get(provider)
     if native_engine:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode":

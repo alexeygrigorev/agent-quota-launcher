@@ -506,7 +506,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         from launcher.launch import do_run
         self.assertEqual(do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path), 0)
         argv = popen.call_args.args[0]
-        self.assertEqual(argv[argv.index("--engine") + 1], "gemini")
+        self.assertEqual(argv[argv.index("--engine") + 1], "antigravity")
         adapter = argv[argv.index("--") + 1:]
         self.assertEqual(adapter[adapter.index("--model") + 1], "gemini-3.8-flash-high")
         self.assertIn("first-action-" + self.task_id + ".json", adapter[-1])
