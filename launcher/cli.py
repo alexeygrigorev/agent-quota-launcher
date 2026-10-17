@@ -558,8 +558,12 @@ def request(args):
 def status(args):
     store = get_store(args)
     if getattr(args, 'id', None):
-        task = store.get_task(args.id)
+        task_id = store.resolve_task_id(args.id) or args.id
+        task = store.get_task(task_id)
         if task:
+            binding = store.get_native_binding(task_id)
+            if binding:
+                task["native_binding"] = binding
             print(json.dumps(task, indent=2))
         else:
             print(json.dumps({"error": f"unknown task {args.id}"}))
@@ -571,33 +575,47 @@ def status(args):
 
 def complete(args):
     store = get_store(args)
-    task = store.get_task(args.id)
+    task_id = store.resolve_task_id(args.id) or args.id
+    task = store.get_task(task_id)
     if not task:
         print(f"error: unknown task {args.id}")
         return 1
     if task["state"] != "running":
-        print(f"error: task {args.id} is {task['state']}, complete requires running")
+        print(f"error: task {task_id} is {task['state']}, complete requires running")
         return 1
-    alive, detail = native_status(run_tag_for(args.id))
-    if alive != "dead":
-        print(f"error: native death not confirmed (status: {alive}; {detail}). "
+
+    binding = store.get_native_binding(task_id)
+    if not binding:
+        binding = store.recover_binding_from_artifacts(task_id, task.get("payload"))
+
+    if binding:
+        from launcher.native_lifecycle import probe_native_lifecycle
+        status, detail = probe_native_lifecycle(binding)
+        is_dead = status in ("dead", "retired-finished")
+    else:
+        alive, detail = native_status(run_tag_for(task_id))
+        is_dead = (alive == "dead")
+        status = alive
+
+    if not is_dead:
+        print(f"error: native death not confirmed (status: {status}; {detail}). "
               f"An unknown status is not evidence; retry after `watch` reconciles, "
               f"or use `fail` only once death is confirmed.")
         return 1
-    evidence = _result_evidence(store, args.id)
+    evidence = _result_evidence(store, task_id)
     if not evidence:
         print(f"error: no result evidence: no owned path holds a non-empty artifact. "
               f"Native death alone is not success; close with `fail --reason ...` "
               f"instead of completing.")
         return 1
     try:
-        store.complete_task(args.id, args.reviewer,
+        store.complete_task(task_id, args.reviewer,
                             reason=f"head marked complete; native death confirmed "
                                    f"({detail}); result evidence: {', '.join(evidence)}")
     except StateTransitionError as e:
         print(f"error: {e}")
         return 1
-    print(f"completed-awaiting-review: {args.id} (reviewer {args.reviewer}; "
+    print(f"completed-awaiting-review: {task_id} (reviewer {args.reviewer}; "
           f"native: {detail}; evidence: {len(evidence)} artifact(s))")
     return 0
 
@@ -617,26 +635,134 @@ def _result_evidence(store, task_id):
 
 def fail(args):
     store = get_store(args)
-    task = store.get_task(args.id)
+    task_id = store.resolve_task_id(args.id) or args.id
+    task = store.get_task(task_id)
     if not task:
         print(f"error: unknown task {args.id}")
         return 1
     if task["state"] != "running":
-        print(f"error: task {args.id} is {task['state']}, fail requires running")
+        print(f"error: task {task_id} is {task['state']}, fail requires running")
         return 1
-    alive, detail = native_status(run_tag_for(args.id))
-    if alive != "dead":
-        print(f"error: native death not confirmed (status: {alive}; {detail}); "
+
+    binding = store.get_native_binding(task_id)
+    if not binding:
+        binding = store.recover_binding_from_artifacts(task_id, task.get("payload"))
+
+    if binding:
+        from launcher.native_lifecycle import probe_native_lifecycle
+        status, detail = probe_native_lifecycle(binding)
+        is_dead = status in ("dead", "retired-finished")
+    else:
+        alive, detail = native_status(run_tag_for(task_id))
+        is_dead = (alive == "dead")
+        status = alive
+
+    if not is_dead:
+        print(f"error: native death not confirmed (status: {status}; {detail}); "
               f"refusing to fail a possibly-live worker")
         return 1
     try:
-        store.fail_task(args.id, args.reviewer,
+        store.fail_task(task_id, args.reviewer,
                         reason=f"failed by {args.reviewer}: {args.reason}; "
                                f"native death confirmed ({detail})")
     except StateTransitionError as e:
         print(f"error: {e}")
         return 1
-    print(f"failed: {args.id} (reviewer {args.reviewer}; native: {detail})")
+    print(f"failed: {task_id} (reviewer {args.reviewer}; native: {detail})")
+    return 0
+
+
+def reconcile(args):
+    """Targeted reconciliation of a specific task or session without dispatching queued work."""
+    store = get_store(args)
+    task_id = store.resolve_task_id(args.id) or args.id
+    task = store.get_task(task_id)
+    if not task:
+        err = f"error: unknown task {args.id}"
+        if getattr(args, "json", False):
+            print(json.dumps({"error": err, "id": args.id}))
+        else:
+            print(err)
+        return 1
+
+    state = task["state"]
+    payload = task.get("payload") or {}
+    binding = store.get_native_binding(task_id)
+    if not binding:
+        binding = store.recover_binding_from_artifacts(task_id, payload)
+
+    status, detail = "unknown", "no native binding"
+    if binding:
+        from launcher.native_lifecycle import probe_native_lifecycle
+        status, detail = probe_native_lifecycle(binding)
+    else:
+        alive, act_detail = native_status(run_tag_for(task_id))
+        if alive == "dead":
+            status, detail = "dead", act_detail
+        elif alive == "alive":
+            status, detail = "alive", act_detail
+        else:
+            status, detail = "unknown", act_detail
+
+    evidence = _result_evidence(store, task_id)
+    reconciled_action = None
+
+    if status in ("dead", "retired-finished"):
+        if evidence:
+            if state in ("running", "starting", "stalled", "launch-uncertain"):
+                try:
+                    store.transition_task(
+                        task_id,
+                        "completed-awaiting-review",
+                        (state,),
+                        reason=f"reconciled: native exit confirmed ({detail}); result evidence: {', '.join(evidence)}",
+                        reviewer=getattr(args, "reviewer", "reconcile"),
+                    )
+                    reconciled_action = "completed-awaiting-review"
+                    state = "completed-awaiting-review"
+                except StateTransitionError:
+                    pass
+        elif state in ("starting", "stalled", "launch-uncertain"):
+            try:
+                store.transition_task(
+                    task_id,
+                    "failed",
+                    (state,),
+                    reason=f"reconciled: native exit confirmed ({detail}); no result evidence",
+                    reviewer=getattr(args, "reviewer", "reconcile"),
+                )
+                reconciled_action = "failed"
+                state = "failed"
+            except StateTransitionError:
+                pass
+
+    resources_held = (
+        state in ("queued", "starting", "launch-uncertain", "stalled", "running")
+        and status not in ("dead", "retired-finished")
+    )
+
+    res_doc = {
+        "task_id": task_id,
+        "input_id": args.id,
+        "state": state,
+        "native_status": status,
+        "native_detail": detail,
+        "reconciled_action": reconciled_action,
+        "result_evidence_count": len(evidence),
+        "resources_reserved": resources_held,
+    }
+    if binding:
+        res_doc["native_id"] = binding.get("native_id")
+        res_doc["workspace"] = binding.get("workspace")
+        res_doc["tag"] = binding.get("tag")
+
+    if getattr(args, "json", False):
+        print(json.dumps(res_doc, indent=2))
+    else:
+        msg = f"reconciled: {task_id} (state: {state}, native: {status}, detail: {detail})"
+        if reconciled_action:
+            msg += f" -> transitioned to {reconciled_action}"
+        print(msg)
     return 0
 
 
@@ -962,6 +1088,15 @@ def main():
     parser_fail.add_argument("--reviewer", required=True)
     parser_fail.add_argument("--reason", required=True)
     parser_fail.set_defaults(func=fail)
+
+    parser_reconcile = subparsers.add_parser(
+        "reconcile",
+        help="targeted reconciliation of task or session without dispatching queued work",
+    )
+    parser_reconcile.add_argument("--id", required=True, help="task id or native session UUID to reconcile")
+    parser_reconcile.add_argument("--reviewer", default="reconcile", help="reviewer recording transition")
+    parser_reconcile.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    parser_reconcile.set_defaults(func=reconcile)
 
     parser_report = subparsers.add_parser("report", help="bounded JSON/JSONL dashboard projection")
     parser_report.add_argument("--jsonl", action="store_true")

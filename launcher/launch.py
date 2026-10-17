@@ -373,7 +373,12 @@ def native_status(tag, timeout=15):
     if res.returncode != 0:
         err = (res.stderr or res.stdout or "").strip()
         err_lower = err.lower()
-        if "no session tagged" in err_lower or "has ever existed" in err_lower:
+        if "no session tagged" in err_lower or "has ever existed" in err_lower or "no matching session" in err_lower:
+            from launcher.native_lifecycle import read_tombstone, UUID_RE
+            if isinstance(tag, str) and UUID_RE.match(tag.strip()):
+                tombstone = read_tombstone(tag.strip())
+                if tombstone and tombstone.get("cause") == "finished":
+                    return "dead", f"phase=finished (retired tombstone cause={tombstone.get('cause')})"
             return "unknown", f"aplexer status identity unavailable rc={res.returncode}; no exit proof"
         return "unknown", f"aplexer status error rc={res.returncode}: {err[:200]}"
         
@@ -641,6 +646,21 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     record["session_id"] = sess_id
     record["observed_tag"] = sess_tag
 
+    # Durably persist compact native binding in store at real successful native start
+    created_at_ms = start_json.get("created_at_ms") or int(record["started_at_ts"] * 1000)
+    try:
+        store.record_native_binding(
+            task_id=task_id,
+            native_id=sess_id,
+            tag=sess_tag or run_tag,
+            workspace=sess_ws or workspace,
+            engine=start_json.get("engine") or native_engine or provider,
+            incarnation=created_at_ms,
+            details={"start_json": start_json},
+        )
+    except Exception as e:
+        record["native_binding_error"] = str(e)
+
     # --- first-action wait happens OUTSIDE the launch lock ---
     record["first_action_path"] = str(fa_path)
     
@@ -655,6 +675,21 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                 pass
             record["outcome"] = "running"
             record["first_action_validated_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                store.record_native_binding(
+                    task_id=task_id,
+                    native_id=sess_id,
+                    tag=sess_tag or run_tag,
+                    workspace=sess_ws or workspace,
+                    engine=start_json.get("engine") or native_engine or provider,
+                    incarnation=created_at_ms,
+                    details={
+                        "start_json": start_json,
+                        "first_action_validated_at": record["first_action_validated_at"],
+                    },
+                )
+            except Exception:
+                pass
             _write_launch_record(cwd, record)
             return 0
             

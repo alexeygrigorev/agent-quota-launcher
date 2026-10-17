@@ -9,6 +9,7 @@ import re
 
 from launcher.tags import run_tag_for
 from launcher.review_receipt import ReviewValidationError
+from launcher.native_lifecycle import validate_native_binding, probe_native_lifecycle
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -32,6 +33,20 @@ CREATE TABLE IF NOT EXISTS task_resources (
     disk_mb INTEGER,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
+
+CREATE TABLE IF NOT EXISTS task_native_bindings (
+    task_id TEXT PRIMARY KEY,
+    native_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    incarnation INTEGER NOT NULL,
+    details TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_native_bindings_native_id ON task_native_bindings(native_id);
 
 CREATE TABLE IF NOT EXISTS review_receipts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,17 +371,181 @@ class Store:
                 return json.loads(match.group(1))
             raise
 
+    def record_native_binding(self, task_id, native_id, tag, workspace, engine, incarnation, details=None):
+        """Durably persist compact exact native binding evidence in task store.
+
+        Validates native UUID, task tag, workspace, engine, and incarnation.
+        Never fabricates whoami, borrowed UUID, or caller PID.
+        """
+        validated = validate_native_binding(
+            task_id=task_id,
+            native_id=native_id,
+            tag=tag,
+            workspace=workspace,
+            engine=engine,
+            incarnation=incarnation,
+            details=details,
+        )
+        details_str = json.dumps(validated["details"], sort_keys=True)
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_native_bindings (
+                    task_id, native_id, tag, workspace, engine, incarnation, details, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    native_id = excluded.native_id,
+                    tag = excluded.tag,
+                    workspace = excluded.workspace,
+                    engine = excluded.engine,
+                    incarnation = excluded.incarnation,
+                    details = excluded.details,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    validated["task_id"],
+                    validated["native_id"],
+                    validated["tag"],
+                    validated["workspace"],
+                    validated["engine"],
+                    validated["incarnation"],
+                    details_str,
+                ),
+            )
+        return validated
+
+    def get_native_binding(self, task_id):
+        """Retrieve exact native binding for a task, or None if unbound."""
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT task_id, native_id, tag, workspace, engine, incarnation, details, created_at, updated_at
+                FROM task_native_bindings
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            det = {}
+            if row[6]:
+                try:
+                    det = json.loads(row[6])
+                except Exception:
+                    det = {"raw": row[6]}
+            return {
+                "task_id": row[0],
+                "native_id": row[1],
+                "tag": row[2],
+                "workspace": row[3],
+                "engine": row[4],
+                "incarnation": row[5],
+                "details": det,
+                "created_at": row[7],
+                "updated_at": row[8],
+            }
+
+    def get_task_by_native_id(self, native_id):
+        """Look up task by global native session UUID across all workspaces."""
+        if not native_id or not isinstance(native_id, str):
+            return None
+        canon_id = native_id.strip().lower()
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT task_id FROM task_native_bindings WHERE native_id = ?",
+                (canon_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            task_id = row[0]
+            task = self.get_task(task_id)
+            binding = self.get_native_binding(task_id)
+            return {"task_id": task_id, "task": task, "binding": binding}
+
+    def resolve_task_id(self, id_or_uuid):
+        """Resolve either task_id or global native UUID to task_id."""
+        if not id_or_uuid or not isinstance(id_or_uuid, str):
+            return None
+        target = id_or_uuid.strip()
+        if self.get_task(target):
+            return target
+        by_native = self.get_task_by_native_id(target)
+        if by_native:
+            return by_native["task_id"]
+        return None
+
+    def recover_binding_from_artifacts(self, task_id, payload=None):
+        """Best-effort recovery of genuine native binding from local launch artifacts.
+
+        Reuses existing genuine launch receipt / first action records without fabricating.
+        """
+        if payload is None:
+            task = self.get_task(task_id)
+            if task:
+                payload = task.get("payload")
+        if not payload or not isinstance(payload, dict):
+            return None
+        cwd = payload.get("cwd")
+        if not cwd:
+            return None
+        cwd_p = Path(cwd).resolve()
+        start_p = cwd_p / ".local" / f"launch-{task_id}-start.json"
+        record_p = cwd_p / ".local" / f"launch-{task_id}.json"
+        data = None
+        for p in (start_p, record_p):
+            try:
+                if p.is_file():
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        break
+            except Exception:
+                continue
+        if not isinstance(data, dict):
+            return None
+
+        # Prefer start record or wrapper_start_json if present
+        start_doc = data.get("wrapper_start_json") if isinstance(data.get("wrapper_start_json"), dict) else data
+        native_id = start_doc.get("id") or data.get("session_id")
+        tag = start_doc.get("tag") or data.get("observed_tag") or data.get("tag")
+        workspace = start_doc.get("workspace") or cwd
+        engine = start_doc.get("engine") or data.get("provider") or "gemini"
+        incarnation = start_doc.get("created_at_ms") or (
+            int(data["started_at_ts"] * 1000) if data.get("started_at_ts") else None
+        )
+
+        if not native_id or not tag or not workspace or not incarnation:
+            return None
+        try:
+            return self.record_native_binding(
+                task_id=task_id,
+                native_id=native_id,
+                tag=tag,
+                workspace=workspace,
+                engine=engine,
+                incarnation=incarnation,
+                details={"recovered_from": str(p)},
+            )
+        except Exception:
+            return None
+
     def get_active_resources(self, exclude_task_id=None):
         """Sum live/uncertain reservations. exclude_task_id removes the task
-        being launched so its own reservation is not double-counted. RAM/disk
-        for completed-awaiting-review tasks is not held (process death is
-        confirmed before complete); their path leases stay."""
+        being launched so its own reservation is not double-counted.
+
+        Uses exact native identity and current authoritative live phase or
+        exact retired-sessions/<UUID>/tombstone.json (matching UUID, tag,
+        workspace, creation ordering, and cause finished). Proven exit
+        releases process RAM/disk reservation without inventing task success/
+        review/acceptance. Unknown/missing/transport error remains conservative.
+        """
         total_mem = 0
         total_disk = 0
         with self.get_conn() as conn:
             placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
             query = f"""
-                SELECT t.id, tr.memory_mb, tr.disk_mb
+                SELECT t.id, tr.memory_mb, tr.disk_mb, t.payload, t.state
                 FROM task_resources tr
                 JOIN tasks t ON t.id = tr.task_id
                 WHERE t.state IN ({placeholders})
@@ -377,23 +556,32 @@ class Store:
                 params.append(exclude_task_id)
             cursor = conn.execute(query, params)
             for row in cursor.fetchall():
-                task_id, mem, disk = row
-                try:
-                    res = subprocess.run(["aplexer", "status", run_tag_for(task_id), "--json"],
-                                         capture_output=True, text=True, timeout=15)
-                    if res.returncode == 0:
-                        try:
-                            info = self._extract_json(res.stdout)
-                            if info.get("phase") in ["running", "starting", "working", "launching"]:
-                                total_mem += (mem or 0)
-                                total_disk += (disk or 0)
-                        except Exception:
-                            total_mem += (mem or 0)
-                            total_disk += (disk or 0)
+                task_id, mem, disk, raw_payload, state = row
+                if state == "queued":
+                    total_mem += (mem or 0)
+                    total_disk += (disk or 0)
+                    continue
+
+                binding = self.get_native_binding(task_id)
+                if not binding and raw_payload:
+                    try:
+                        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                        binding = self.recover_binding_from_artifacts(task_id, payload)
+                    except Exception:
+                        binding = None
+
+                if binding:
+                    status, detail = probe_native_lifecycle(binding)
+                    if status in ("dead", "retired-finished"):
+                        # Proven exit releases process RAM/disk reservation
+                        continue
                     else:
+                        # Alive or unknown remains conservative
                         total_mem += (mem or 0)
                         total_disk += (disk or 0)
-                except FileNotFoundError:
+                else:
+                    # Legacy or task-units without native binding:
+                    # Stays conservative under actual ownership proof
                     total_mem += (mem or 0)
                     total_disk += (disk or 0)
 

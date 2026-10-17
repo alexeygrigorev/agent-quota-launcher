@@ -88,6 +88,26 @@ def _check_task_active(task_id: str, payload: dict = None, config_dir=None) -> t
             pass
 
     # 2. Inspect aplexer native status
+    if config_dir:
+        try:
+            db_p = Path(config_dir) / "state.db"
+            if db_p.is_file():
+                store = Store(str(db_p))
+                binding = store.get_native_binding(task_id)
+                if not binding and payload:
+                    binding = store.recover_binding_from_artifacts(task_id, payload)
+                if binding:
+                    from launcher.native_lifecycle import probe_native_lifecycle
+                    status, detail = probe_native_lifecycle(binding)
+                    if status == "alive":
+                        return True, f"aplexer session alive ({detail})"
+                    elif status in ("dead", "retired-finished"):
+                        pass  # proven exit! proceed to telemetry and late-success checks
+                    elif status == "unknown":
+                        return True, f"aplexer session unknown ({detail})"
+        except Exception:
+            pass
+
     try:
         alive, detail = native_status(run_tag_for(task_id))
         if alive == "alive":
