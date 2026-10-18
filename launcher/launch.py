@@ -562,7 +562,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     goal = payload.get("goal", "")
-    if provider in {"opencode", "antigravity"}:
+    if provider in {"opencode", "antigravity", "zai"}:
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
     cmd = [
@@ -579,7 +579,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # Antigravity has its own native lifecycle policy; Gemini is a distinct
     # engine even when the model name begins with gemini. Existing bindings
     # retain the engine recorded at their original birth.
-    native_engine = {"opencode": "opencode", "antigravity": "antigravity"}.get(provider)
+    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex"}.get(provider)
     if native_engine:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode":
