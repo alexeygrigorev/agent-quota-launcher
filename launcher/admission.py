@@ -251,6 +251,7 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR")}
     env.update(
         HOME=str(home),
+        GEMINI_CLI_HOME=str(home),
         USERPROFILE=str(home),
         APPDATA=str(home / "AppData" / "Roaming"),
         LOCALAPPDATA=str(home / "AppData" / "Local"),
