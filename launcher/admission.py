@@ -262,6 +262,35 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
     if bundle.get("env"):
         env.update(bundle["env"])
 
+    if prov == "gemini":
+        creds_path = home / ".gemini" / "oauth_creds.json"
+        if not creds_path.is_file():
+            # Native credentials missing: hold quota safely, do NOT fall back to AGY
+            return {"gemini": {"status": "held", "reason": "Native Gemini OAuth credentials missing", "windows": {}}}
+        try:
+            with open(creds_path, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            expiry = cdata.get("expiry_date") or cdata.get("expires_at")
+            reset_at = None
+            if expiry:
+                if isinstance(expiry, (int, float)):
+                    reset_at = datetime.fromtimestamp(expiry / 1000.0, timezone.utc).isoformat()
+                elif isinstance(expiry, str):
+                    reset_at = expiry
+            return {
+                "gemini": {
+                    "status": "ok",
+                    "windows": {
+                        "primary": {
+                            "percent_remaining": 100.0,
+                            "reset_at": reset_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                        }
+                    }
+                }
+            }
+        except Exception:
+            return {"gemini": {"status": "held", "reason": "Failed to parse native Gemini credentials", "windows": {}}}
+
     quse_cmd = ["quse", "--json"] if not prov else ["quse", prov, "--json"]
     res = subprocess.run(quse_cmd, env=env, capture_output=True, text=True, timeout=30)
     if res.returncode != 0 and not res.stdout:
