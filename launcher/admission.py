@@ -12,24 +12,37 @@ remaining does not prove those routes. GLM models never route to opencode
 """
 import json
 import math
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-ADAPTER_ROUTES = ("grok", "antigravity", "zai", "opencode")
+ADAPTER_ROUTES = ("grok", "antigravity", "zai", "opencode", "codex")
 ADAPTER_MODELS = {
     "grok": "grok-4.6",
     "antigravity": "gemini-3.8-flash-high",
     "zai": "glm-5.3-flash",
     "opencode": "opencode-go/muse-spark-1.3-contributor",
+    "codex": "gpt-6.1-sol",
 }
 ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
     "antigravity": ("gemini-3.8-flash-high", "gemini-4-argon-high"),
     "zai": ("glm-5.3-flash",),
     "opencode": ("opencode-go/muse-spark-1.3-contributor",),
+    "codex": ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"),
 }
 CODEX_MIN_REMAINING = 15.0
+
+
+def get_codex_wrapper(config_dir=None):
+    env_wrapper = os.environ.get("CODEX_LAUNCH_WRAPPER")
+    if env_wrapper and os.path.isfile(env_wrapper) and os.access(env_wrapper, os.X_OK):
+        return str(Path(env_wrapper).resolve())
+    for cand in (Path("scripts/launch-codex.sh"), Path(config_dir or "") / "launch-codex.sh"):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand.resolve())
+    return None
 
 # Provider window metadata. Codex plans have no 5-hour (or monthly) window:
 # quse reports those slots with a null reading AND a null reset. Such a slot is
@@ -182,8 +195,8 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
         gate = codex_gate_reason(route, now)
         if gate:
             return None, gate
-        wrapper_path = Path("scripts/launch-codex.sh")
-        if not wrapper_path.exists():
+        wrapper_path = get_codex_wrapper(config_dir=config_dir)
+        if not wrapper_path:
             return None, ("codex explicitly unsupported in launcher v0.1 "
                           "(protected wrapper scripts/launch-codex.sh not configured)")
 

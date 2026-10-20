@@ -629,5 +629,118 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.assertTrue(record_path.exists())
 
 
+    def test_build_managed_profile_argv(self):
+        from launcher.launch import build_managed_profile_argv
+        argv_zai = build_managed_profile_argv("zai", "do work", "acc-zai", "glm-5.3-flash")
+        self.assertIn("agent_hub_host.provisioning", argv_zai)
+        self.assertIn("execute", argv_zai)
+        self.assertIn("acc-zai", argv_zai)
+        self.assertIn("exec", argv_zai)
+        self.assertIn("glm-5.3-flash", argv_zai)
+
+        argv_codex = build_managed_profile_argv("codex", "do work", "acc-codex", "gpt-6.1-sol")
+        self.assertIn("agent_hub_host.provisioning", argv_codex)
+        self.assertIn("acc-codex", argv_codex)
+        self.assertIn("exec", argv_codex)
+        self.assertIn("gpt-6.1-sol", argv_codex)
+
+        argv_opencode = build_managed_profile_argv("opencode", "do work", "acc-go", "opencode-go/muse-spark-1.3-contributor")
+        self.assertIn("agent_hub_host.provisioning", argv_opencode)
+        self.assertIn("acc-go", argv_opencode)
+        self.assertIn("run", argv_opencode)
+
+    def test_do_run_passes_managed_profile_to_aplexer(self):
+        from launcher.launch import do_run
+        task_id = "t-managed-profile"
+        payload = {
+            "id": task_id,
+            "goal": "test managed goal",
+            "owner": "hub-fleet",
+            "cwd": self.dir,
+            "timeout": 60,
+            "account_label": "hubacc",
+            "account_profile": "hub-hubacc",
+            "model_requirements": {"providers": ["opencode"], "models": ["opencode-go/muse-spark-1.3-contributor"]},
+        }
+        self.store.submit_task(task_id, "idem-managed", payload, [])
+        fake_quse = {
+            "go": {
+                "status": "ok",
+                "windows": {
+                    "monthly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}
+                }
+            }
+        }
+        captured_cmd = []
+        test_dir = str(Path(self.dir).resolve())
+        class FakeProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return None
+            def communicate(self, timeout=None):
+                start_json = {
+                    "schema_version": 1,
+                    "id": "11111111-1111-4111-8111-111111111111",
+                    "tag": f"task-{task_id}",
+                    "workspace": test_dir,
+                    "engine": "opencode",
+                    "command": "python3",
+                    "phase": "running",
+                    "worker_pid": 12345,
+                    "created_at_ms": 1000000,
+                    "updated_at_ms": 1000500,
+                    "profile": "hub-hubacc",
+                }
+                return json.dumps(start_json), ""
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return FakeProc()
+
+        fa_path = Path(self.dir) / ".local" / f"first-action-{task_id}.json"
+        fa_path.parent.mkdir(parents=True, exist_ok=True)
+        fa_data = {
+            "schema_version": 1,
+            "id": "11111111-1111-4111-8111-111111111111",
+            "tag": f"task-{task_id}",
+            "workspace": str(Path(self.dir).resolve()),
+            "engine": "opencode",
+            "command": "python3",
+            "phase": "running",
+            "worker_pid": 12345,
+            "created_at_ms": 1000000,
+            "updated_at_ms": 1001000,
+            "profile": "hub-hubacc",
+            "timestamp": "2026-10-20T14:00:00+00:00",
+        }
+        fa_path.write_text(json.dumps(fa_data))
+
+        with patch("launcher.launch.fetch_quse", return_value=fake_quse), \
+             patch("launcher.launch.subprocess.Popen", side_effect=fake_popen), \
+             patch("launcher.launch.validate_first_action", return_value=True), \
+             patch("launcher.launch.validate_opencode_runtime", return_value="/bin/opencode"):
+            rc = do_run(str(self.db_path), task_id, self.dir, None, self.lock_path)
+
+        self.assertEqual(rc, 0)
+        self.assertIn("--profile", captured_cmd)
+        prof_idx = captured_cmd.index("--profile")
+        self.assertEqual(captured_cmd[prof_idx + 1], "hub-hubacc")
+        dash_idx = captured_cmd.index("--")
+        post_dash = captured_cmd[dash_idx + 1:]
+        self.assertIn("agent_hub_host.provisioning", " ".join(post_dash))
+        self.assertIn("hubacc", post_dash)
+
+        # Check recorded start record
+        rec_path = Path(self.dir) / ".local" / f"launch-{task_id}.json"
+        self.assertTrue(rec_path.exists())
+        rec = json.loads(rec_path.read_text())
+        self.assertEqual(rec.get("profile"), "hub-hubacc")
+        self.assertEqual(rec.get("account_label"), "hubacc")
+
+
 if __name__ == '__main__':
     unittest.main()

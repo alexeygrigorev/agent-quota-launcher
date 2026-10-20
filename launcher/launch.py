@@ -26,6 +26,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -172,6 +173,39 @@ def _is_glm_model(model):
     return "glm" in m or m.startswith("zai-coding-plan/") or m.startswith("zai/")
 
 
+def get_codex_wrapper():
+    env_wrapper = os.environ.get("CODEX_LAUNCH_WRAPPER")
+    if env_wrapper and os.path.isfile(env_wrapper) and os.access(env_wrapper, os.X_OK):
+        return str(Path(env_wrapper).resolve())
+    cand = Path("scripts/launch-codex.sh")
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return str(cand.resolve())
+    return None
+
+
+def build_managed_profile_argv(provider, goal, label, model=None):
+    cmd = [sys.executable, "-m", "agent_hub_host.provisioning", "execute", label]
+    if provider in ("codex", "openai"):
+        args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"]
+        if model:
+            args += ["--model", str(model)]
+        args.append(str(goal))
+        return cmd + args
+    elif provider in ("zai", "zcodex"):
+        m = model or "glm-5.3-flash"
+        return cmd + ["exec", "--model", str(m), "-s", "workspace-write", "-c", "check_for_update_on_startup=false", "--json", str(goal)]
+    elif provider in ("go", "opencode"):
+        m = model or "opencode-go/muse-spark-1.3-contributor"
+        return cmd + ["run", "--pure", "--auto", "--model", str(m), str(goal)]
+    elif provider in ("gemini", "antigravity"):
+        m = model or "gemini-3.8-flash-high"
+        return cmd + ["--model", str(m), "--effort", "high", "--dangerously-skip-permissions", "--print-timeout", "0", "--output-format", "stream-json", "-p", str(goal)]
+    elif provider == "claude":
+        m = model or "sonnet"
+        return cmd + ["--model", str(m), "-p", str(goal)]
+    return cmd + [str(goal)]
+
+
 def build_adapter_argv(provider, goal, model=None):
     if model and _is_glm_model(model) and provider != "zai":
         raise ValueError(
@@ -186,12 +220,17 @@ def build_adapter_argv(provider, goal, model=None):
                 f"Unsupported OpenCode model {model!r}; only {OPENCODE_MODEL!r} is supported"
             )
         validate_opencode_runtime()
-    adapter = ADAPTERS.get(provider)
-    if not adapter:
-        if provider == "codex":
+    if provider == "codex":
+        wrapper = get_codex_wrapper()
+        if not wrapper:
             raise ValueError(
                 "Unsupported provider: codex (genuine protected wrapper scripts/launch-codex.sh not configured; raw routing denied)"
             )
+        chosen_model = model or "gpt-6.1-sol"
+        return [wrapper, "exec", "--model", str(chosen_model),
+                "--dangerously-bypass-approvals-and-sandbox", "--json", str(goal)]
+    adapter = ADAPTERS.get(provider)
+    if not adapter:
         raise ValueError(f"Unsupported provider: {provider}")
     if provider == "zai":
         node, cjs, zbin = validate_zai_runtime()
@@ -575,16 +614,27 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
         "--cwd", str(Path(payload["cwd"]).resolve()),
         "--tag", run_tag,
     ]
+    account_profile = payload.get("account_profile") or payload.get("provider_profile")
+    if not account_profile and isinstance(payload.get("profile"), str) and payload["profile"].startswith("hub-"):
+        account_profile = payload["profile"]
+
+    if account_profile:
+        cmd.extend(["--profile", account_profile])
+        record["profile"] = account_profile
+    account_label = payload.get("account_label")
+    if account_label:
+        record["account_label"] = account_label
+
     # Record the real model engine, rather than the generic shell default.
     # Antigravity has its own native lifecycle policy; Gemini is a distinct
     # engine even when the model name begins with gemini. Existing bindings
     # retain the engine recorded at their original birth.
-    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex"}.get(provider)
-    if native_engine:
+    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex"}.get(provider)
+    if native_engine and not account_profile:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode":
         validate_opencode_runtime()
-    child_env = dict(ADAPTERS[provider]["env"])
+    child_env = dict(ADAPTERS.get(provider, {}).get("env", {}))
     if provider == "zai":
         node, cjs, _ = validate_zai_runtime()
         child_env["ZCODE_NODE"] = node
@@ -593,7 +643,11 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
-    cmd.extend(build_adapter_argv(provider, goal, model=chosen.get("model")))
+    if account_profile:
+        label = account_label or (account_profile[4:] if account_profile.startswith("hub-") else account_profile)
+        cmd.extend(build_managed_profile_argv(provider, goal, label, model=chosen.get("model")))
+    else:
+        cmd.extend(build_adapter_argv(provider, goal, model=chosen.get("model")))
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
 
     deadline = time.monotonic() + timeout_seconds
@@ -676,6 +730,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                 details={
                     "start_phase": start_json.get("phase"),
                     "worker_pid": start_json.get("worker_pid"),
+                    "profile": start_json.get("profile") or account_profile,
+                    "account_label": account_label,
                 },
             )
         except Exception as e:
@@ -710,6 +766,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                             "first_action_validated_at": record["first_action_validated_at"],
                             "start_phase": start_json.get("phase"),
                             "worker_pid": start_json.get("worker_pid"),
+                            "profile": start_json.get("profile") or account_profile,
+                            "account_label": account_label,
                         },
                     )
                 except Exception:
