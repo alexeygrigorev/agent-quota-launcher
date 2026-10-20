@@ -666,6 +666,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.assertIn("-p", argv_gemini)
         self.assertIn("-m", argv_gemini)
         self.assertIn("gemini-2.5-pro", argv_gemini)
+        self.assertIn("--skip-trust", argv_gemini)
         self.assertIn("--approval-mode", argv_gemini)
         self.assertIn("yolo", argv_gemini)
 

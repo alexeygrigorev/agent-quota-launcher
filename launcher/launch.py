@@ -235,7 +235,7 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
         return cmd + ["run", "--standalone", "--auto", "--model", str(m), str(goal)]
     elif provider in ("gemini", "google"):
         m = model or "gemini-2.5-pro"
-        return cmd + ["-m", str(m), "--approval-mode", "yolo", "-p", str(goal)]
+        return cmd + ["-m", str(m), "--skip-trust", "--approval-mode", "yolo", "-p", str(goal)]
     else:
         raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
