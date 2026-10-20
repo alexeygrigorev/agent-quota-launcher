@@ -37,6 +37,7 @@ from launcher.admission import (
     validate_quse,
     is_managed_profile_payload,
     task_requirements_for,
+    extract_requested_model,
     PROMO_MULTIPLIER,
     PROMO_CUTOFF_UTC,
 )
@@ -150,6 +151,10 @@ ADAPTERS = {
         "argv": ["/home/alexey/.local/bin/gemini", "-p"],
         "env": {},
     },
+    "claude": {
+        "argv": ["claude", "--dangerously-skip-permissions", "-p"],
+        "env": {},
+    },
 }
 
 # The native whoami is RICH (id, tag, workspace, engine, command, phase,
@@ -236,11 +241,16 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
     elif provider in ("gemini", "google"):
         m = model or "gemini-2.5-pro"
         return cmd + ["-m", str(m), "--skip-trust", "--approval-mode", "yolo", "-p", str(goal)]
+    elif provider == "claude":
+        m = model or "sonnet"
+        return cmd + ["--dangerously-skip-permissions", "--model", str(m), "-p", str(goal)]
     else:
         raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
 
 def build_adapter_argv(provider, goal, model=None):
+    if provider == "claude":
+        raise ValueError("Claude provider requires managed profile")
     if model and _is_glm_model(model) and provider != "zai":
         raise ValueError(
             f"GLM model {model!r} is only allowed on the zai (zcodex) route, not {provider!r}"
@@ -625,9 +635,16 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     is_managed = is_managed_profile_payload(payload)
     account_label = payload.get("account_label") if is_managed else None
     managed_dir = payload.get("managed_dir") if is_managed else None
-    quse_data = fetch_quse(account_label=account_label, config_dir=config_dir, managed_dir=managed_dir)
-    record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
     task_reqs = task_requirements_for(payload)
+    req_model = extract_requested_model(payload, provider=payload.get("provider") if is_managed else None)
+    quse_data = fetch_quse(
+        account_label=account_label,
+        provider=payload.get("provider") if is_managed else None,
+        requested_model=req_model,
+        config_dir=config_dir,
+        managed_dir=managed_dir,
+    )
+    record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
     valid_routes, rejections = validate_quse(
         quse_data, task_requirements=task_reqs, config_dir=config_dir)
     record["rejections"] = rejections
@@ -664,7 +681,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     goal = payload.get("goal", "")
-    if provider in {"opencode", "antigravity", "zai", "gemini"} or (provider == "codex" and is_managed):
+    if provider in {"opencode", "antigravity", "zai", "gemini", "claude"} or (provider == "codex" and is_managed):
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
     cmd = [
@@ -692,7 +709,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # Antigravity has its own native lifecycle policy; Gemini is a distinct
     # engine even when the model name begins with gemini. Existing bindings
     # retain the engine recorded at their original birth.
-    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex", "gemini": "gemini"}.get(provider)
+    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex", "gemini": "gemini", "claude": "claude"}.get(provider)
     if native_engine and not account_profile:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode":

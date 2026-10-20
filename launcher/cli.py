@@ -73,14 +73,21 @@ def plan(args):
         return 1
 
     try:
-        from launcher.admission import is_managed_profile_payload
+        from launcher.admission import is_managed_profile_payload, extract_requested_model
         is_managed = is_managed_profile_payload(payload)
         account_label = payload.get("account_label") if is_managed else None
         managed_dir = payload.get("managed_dir") if is_managed else None
-        quse_data = fetch_quse(account_label=account_label, managed_dir=managed_dir)
+        task_reqs = task_requirements_for(payload)
+        req_model = extract_requested_model(payload, provider=payload.get("provider") if is_managed else None)
+        quse_data = fetch_quse(
+            account_label=account_label,
+            provider=payload.get("provider") if is_managed else None,
+            requested_model=req_model,
+            managed_dir=managed_dir,
+        )
         config_dir = config_dir_for(args)
         valid_routes, rejections = validate_quse(
-            quse_data, task_requirements=task_requirements_for(payload),
+            quse_data, task_requirements=task_reqs,
             check_capacity=True, config_dir=config_dir)
         seed = 0  # deterministic dry-run projection
         chosen, provenance = select_candidate(valid_routes, seed=seed)

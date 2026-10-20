@@ -17,7 +17,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-ADAPTER_ROUTES = ("grok", "antigravity", "gemini", "zai", "opencode", "codex")
+ADAPTER_ROUTES = ("grok", "antigravity", "gemini", "zai", "opencode", "codex", "claude")
 ADAPTER_MODELS = {
     "grok": "grok-4.6",
     "antigravity": "gemini-3.8-flash-high",
@@ -25,6 +25,7 @@ ADAPTER_MODELS = {
     "zai": "glm-5.3-flash",
     "opencode": "opencode-go/muse-spark-1.3-contributor",
     "codex": "gpt-6.1-sol",
+    "claude": "claude-sonnet-4-6",
 }
 ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
@@ -38,6 +39,16 @@ ADAPTER_SUPPORTED_MODELS = {
     "zai": ("glm-5.3-flash",),
     "opencode": ("opencode-go/muse-spark-1.3-contributor",),
     "codex": ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"),
+    "claude": (
+        "claude-sonnet-5-5",
+        "claude-sonnet-4-6",
+        "claude-opus-5-5",
+        "claude-opus-4-8",
+        "claude-haiku-4-5",
+        "sonnet",
+        "opus",
+        "haiku",
+    ),
 }
 CODEX_MIN_REMAINING = 15.0
 
@@ -71,6 +82,7 @@ PROVIDER_TASK_KINDS = {
     "gemini": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "zai": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "opencode": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
+    "claude": GENERAL_TASK_KINDS,
 }
 PROFILE_TASK_KINDS = {
     "model-task": "implementation",
@@ -215,7 +227,38 @@ PROMO_CUTOFF_UTC = "2026-10-06T16:00:00+00:00"
 PROMO_WINDOW_UTC = (15, 1)
 
 
-def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_dir=None):
+def extract_requested_model(payload, provider=None):
+    """Extract single unambiguous requested model from payload or model/task_requirements.
+
+    Fails closed on ambiguity (multiple contradictory models).
+    Returns None if no requested model is declared.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("model") and isinstance(payload["model"], str) and not isinstance(payload["model"], bool):
+        return payload["model"].strip()
+
+    for field in ("model_requirements", "task_requirements"):
+        reqs = payload.get(field)
+        if isinstance(reqs, dict):
+            if reqs.get("model") and isinstance(reqs["model"], str) and not isinstance(reqs["model"], bool):
+                return reqs["model"].strip()
+            models = reqs.get("models")
+            if isinstance(models, (list, tuple)) and models:
+                valid_models = [m.strip() for m in models if isinstance(m, str) and not isinstance(m, bool) and m.strip()]
+                if len(valid_models) == 1:
+                    return valid_models[0]
+                elif len(valid_models) > 1:
+                    if provider:
+                        supported = ADAPTER_SUPPORTED_MODELS.get(provider, ())
+                        matched = [m for m in valid_models if m in supported]
+                        if len(matched) == 1:
+                            return matched[0]
+                    return None
+    return None
+
+
+def fetch_managed_quse(account_label, provider=None, requested_model=None, config_dir=None, managed_dir=None):
     """Fetch fresh quota context for a named centrally managed account."""
     if managed_dir:
         managed_dir = Path(managed_dir)
@@ -267,48 +310,16 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
     if prov == "gemini":
         try:
             from agent_hub_host import native_google_quota
-            return native_google_quota.probe(bundle, dest)
+            return native_google_quota.probe(bundle, dest, model=requested_model)
         except Exception:
-            pass
-        creds_path = home / ".gemini" / "oauth_creds.json"
-        if not creds_path.is_file():
-            # Native credentials missing: hold quota safely, do NOT fall back to AGY
-            return {"gemini": {"status": "held", "reason": "Native Gemini OAuth credentials missing", "windows": {}}}
+            return {"gemini": {"status": "held", "reason": "native_google_probe_failed", "windows": {}}}
+
+    if prov == "claude":
         try:
-            with open(creds_path, "r", encoding="utf-8") as f:
-                cdata = json.load(f)
-            expiry = cdata.get("expiry_date") or cdata.get("expires_at")
-            reset_at = None
-            if expiry:
-                if isinstance(expiry, (int, float)):
-                    reset_at = datetime.fromtimestamp(expiry / 1000.0, timezone.utc).isoformat()
-                elif isinstance(expiry, str):
-                    reset_at = expiry
-            args = bundle.get("args", [])
-            model = "gemini-2.5-pro"
-            for flag in ("--model", "-m"):
-                if flag in args:
-                    idx = args.index(flag)
-                    if idx + 1 < len(args):
-                        model = args[idx + 1]
-                    break
-            return {
-                "gemini": {
-                    "status": "ok",
-                    "details": {
-                        "source": "native_google_code_assist",
-                        "model": model,
-                    },
-                    "windows": {
-                        "google_bucket_0": {
-                            "percent_remaining": 100.0,
-                            "reset_at": reset_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-                        }
-                    }
-                }
-            }
+            from agent_hub_host import native_claude_quota
+            return native_claude_quota.probe(bundle, dest, requested_model=requested_model)
         except Exception:
-            return {"gemini": {"status": "held", "reason": "Failed to parse native Gemini credentials", "windows": {}}}
+            return {"claude": {"status": "held", "reason": "native_claude_probe_failed", "windows": {}}}
 
     quse_cmd = ["quse", "--json"] if not prov else ["quse", prov, "--json"]
     res = subprocess.run(quse_cmd, env=env, capture_output=True, text=True, timeout=30)
@@ -326,14 +337,14 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
     return obj
 
 
-def fetch_quse(account_label=None, provider=None, config_dir=None, managed_dir=None):
+def fetch_quse(account_label=None, provider=None, requested_model=None, config_dir=None, managed_dir=None):
     """Run quse --json and parse the first JSON document from stdout.
 
     When account_label is provided, probes quota strictly within that managed
     account's isolated credential environment. Never falls back to default operator quota.
     """
     if account_label:
-        return fetch_managed_quse(account_label, provider=provider, config_dir=config_dir, managed_dir=managed_dir)
+        return fetch_managed_quse(account_label, provider=provider, requested_model=requested_model, config_dir=config_dir, managed_dir=managed_dir)
     res = subprocess.run(["quse", "--json"], capture_output=True, text=True, timeout=120)
     if res.returncode != 0:
         raise ValueError(f"Failed to fetch quse (rc={res.returncode})")
@@ -462,12 +473,28 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
             details = route.get("details") if isinstance(route.get("details"), dict) else {}
             if details.get("source") != "native_google_code_assist":
                 return None, "Managed Gemini route requires native_google_code_assist observation source"
-            requested_model = (
-                (model_requirements or {}).get("model")
-                or (task_requirements or {}).get("model")
-            )
+            requested_model = (task_requirements or {}).get("model")
             if requested_model and details.get("model") and details.get("model") != requested_model:
                 return None, f"Managed Gemini model mismatch: observed {details.get('model')} != requested {requested_model}"
+
+    if provider == "claude":
+        is_managed = isinstance(task_requirements, dict) and bool(
+            task_requirements.get("is_managed")
+            and task_requirements.get("account_label")
+            and task_requirements.get("account_profile") == f"hub-{task_requirements.get('account_label')}"
+            and task_requirements.get("managed_dir")
+        )
+        if not is_managed:
+            return None, "Unsupported route: Claude route requires managed profile"
+        if not (req_prov == "claude" or "claude" in req_provs):
+            return None, "Claude route requires explicit provider request"
+        details = route.get("details") if isinstance(route.get("details"), dict) else {}
+        source = details.get("source")
+        if source not in ("native_claude_oauth_usage", "native_claude_unified_headers"):
+            return None, f"Untrusted or missing Claude quota source: {source!r}"
+        requested_model = (task_requirements or {}).get("model")
+        if requested_model and details.get("model") and details.get("model") != requested_model:
+            return None, f"Managed Claude model mismatch: observed {details.get('model')} != requested {requested_model}"
 
     if provider not in ADAPTER_ROUTES:
         return None, "Unsupported route explicitly blocked"

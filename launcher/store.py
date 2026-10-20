@@ -416,6 +416,8 @@ class Store:
                     valid_engines = ("antigravity",)
                 elif prov == "gemini":
                     valid_engines = ("gemini",)
+                elif prov == "claude":
+                    valid_engines = ("claude",)
                 elif prov == "opencode":
                     valid_engines = ("opencode",)
                 elif prov == "zai":

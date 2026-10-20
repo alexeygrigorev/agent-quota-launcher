@@ -256,6 +256,10 @@ class TestAdapters(unittest.TestCase):
         argv = build_adapter_argv("gemini", "goal text", model="gemini-2.5-flash")
         self.assertEqual(argv, ["/home/alexey/.local/bin/gemini", "-m", "gemini-2.5-flash", "-p", "goal text"])
 
+    def test_claude_adapter_argv_rejected_for_unmanaged(self):
+        with self.assertRaisesRegex(ValueError, "Claude provider requires managed profile"):
+            build_adapter_argv("claude", "goal text")
+
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/usr/bin/env")
@@ -676,8 +680,16 @@ class TestDoRunWaitLoop(unittest.TestCase):
             self.assertIn("agent_hub_host.provisioning", argv_codex_managed[2])
             self.assertEqual(argv_codex_managed[3], "acc-codex")
 
+        argv_claude = build_managed_profile_argv("claude", "do work", "acc-claude", "sonnet")
+        self.assertIn("agent_hub_host.provisioning", argv_claude[2])
+        self.assertEqual(argv_claude[3], "acc-claude")
+        self.assertIn("-p", argv_claude)
+        self.assertIn("--model", argv_claude)
+        self.assertIn("sonnet", argv_claude)
+        self.assertIn("--dangerously-skip-permissions", argv_claude)
+
         with self.assertRaises(ValueError):
-            build_managed_profile_argv("claude", "do work", "acc-claude")
+            build_managed_profile_argv("unsupported-provider", "do work", "acc-other")
 
     def test_managed_execution_receives_explicit_catalog(self):
         from launcher.launch import build_managed_profile_argv
@@ -916,7 +928,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.store.submit_task(legacy_task_id, "idem-l-1", legacy_payload, [])
 
         calls_plan = []
-        def fake_fetch_quse_plan(account_label=None, provider=None, config_dir=None, managed_dir=None):
+        def fake_fetch_quse_plan(account_label=None, provider=None, requested_model=None, config_dir=None, managed_dir=None, **kwargs):
             calls_plan.append(account_label)
             # 5% for ambient default (rejected), 80% for namedB (admitted)
             perc = 5.0 if account_label is None else 80.0
@@ -946,7 +958,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
 
         # Test do_run dispatch behavior with exact managed quota context
         calls_run = []
-        def fake_fetch_quse_run(account_label=None, provider=None, config_dir=None, managed_dir=None):
+        def fake_fetch_quse_run(account_label=None, provider=None, requested_model=None, config_dir=None, managed_dir=None, **kwargs):
             calls_run.append(account_label)
             perc = 0.0 if account_label is None else 80.0
             return {

@@ -666,6 +666,85 @@ class TestNativeGeminiAdmission(unittest.TestCase):
             self.assertEqual(valid[0]["task_fit"], 0.0)
 
 
+class TestNativeClaudeAdmission(unittest.TestCase):
+    def setUp(self):
+        self.future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.data = {"claude": route(
+            {"5h": {"percent_remaining": 80.0, "reset_at": self.future},
+             "7d": {"percent_remaining": 90.0, "reset_at": self.future}},
+            details={"source": "native_claude_oauth_usage", "managed": True},
+        )}
+        self.managed_reqs = {
+            "provider": "claude",
+            "is_managed": True,
+            "account_label": "my-claude",
+            "account_profile": "hub-my-claude",
+            "managed_dir": "/tmp/managed",
+        }
+
+    def test_unmanaged_claude_rejected(self):
+        valid, rejections = validate_quse(self.data, task_requirements={"provider": "claude"})
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Claude route requires managed profile", rejections.get("claude", ""))
+
+    def test_managed_claude_without_explicit_provider_rejected(self):
+        reqs = dict(self.managed_reqs)
+        del reqs["provider"]
+        valid, rejections = validate_quse(self.data, task_requirements=reqs)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Claude route requires explicit provider request", rejections.get("claude", ""))
+
+    def test_managed_claude_admitted_with_default_model(self):
+        valid, _ = validate_quse(self.data, task_requirements=self.managed_reqs)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "claude")
+        self.assertEqual(valid[0]["model"], "claude-sonnet-4-6")
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_managed_claude_supported_model_override(self):
+        for model in ("claude-sonnet-5-5", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5", "opus"):
+            reqs = dict(self.managed_reqs)
+            reqs["model"] = model
+            valid, _ = validate_quse(self.data, task_requirements=reqs)
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(valid[0]["provider"], "claude")
+            self.assertEqual(valid[0]["model"], model)
+            self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_hub_fleet_launch_model_requirements_shape_and_extraction(self):
+        from launcher.admission import extract_requested_model
+        # Exact Hub fleet_launch.py payload shape:
+        hub_payload = {
+            "account_label": "claude-prod",
+            "account_profile": "hub-claude-prod",
+            "managed_dir": "/managed",
+            "model_requirements": {
+                "models": ["claude-sonnet-4-6"],
+                "providers": ["claude"],
+            }
+        }
+        extracted = extract_requested_model(hub_payload, provider="claude")
+        self.assertEqual(extracted, "claude-sonnet-4-6")
+
+        # Ambiguous multiple models for same provider fails closed:
+        ambiguous_payload = {
+            "model_requirements": {
+                "models": ["claude-sonnet-4-6", "claude-opus-4-8"],
+                "providers": ["claude"],
+            }
+        }
+        self.assertIsNone(extract_requested_model(ambiguous_payload, provider="claude"))
+
+        # Multi-provider models list resolves to provider-specific match:
+        cross_payload = {
+            "model_requirements": {
+                "models": ["gemini-2.5-pro", "claude-sonnet-4-6"],
+                "providers": ["claude"],
+            }
+        }
+        self.assertEqual(extract_requested_model(cross_payload, provider="claude"), "claude-sonnet-4-6")
+
+
 class TestManagedProfileQualification(unittest.TestCase):
     def setUp(self):
         self.future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
@@ -765,5 +844,171 @@ class TestManagedProfileQualification(unittest.TestCase):
             valid, _ = validate_quse(self.data, task_requirements=reqs)
             codex_routes = [r for r in valid if r["provider"] == "codex"]
             self.assertEqual(len(codex_routes), 1)
+
+    def test_managed_claude_requires_trusted_source(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.admission import task_requirements_for, validate_quse
+        now = datetime.now(timezone.utc)
+        fut = (now + timedelta(days=2)).isoformat()
+
+        reqs = {
+            "is_managed": True,
+            "account_label": "claude-managed",
+            "account_profile": "hub-claude-managed",
+            "managed_dir": "/nonexistent",
+            "provider": "claude",
+        }
+
+        # Untrusted source rejected
+        untrusted_data = {
+            "claude": {
+                "status": "ok",
+                "details": {"source": "ambient_quse", "managed": True},
+                "windows": {"5h": {"percent_remaining": 80.0, "reset_at": fut}},
+            }
+        }
+        valid, rejections = validate_quse(untrusted_data, task_requirements=reqs)
+        self.assertEqual(len(valid), 0)
+        self.assertIn("Untrusted or missing Claude quota source", rejections.get("claude", ""))
+
+        # Trusted source native_claude_oauth_usage accepted
+        trusted_data = {
+            "claude": {
+                "status": "ok",
+                "details": {"source": "native_claude_oauth_usage", "managed": True},
+                "windows": {"5h": {"percent_remaining": 80.0, "reset_at": fut}},
+            }
+        }
+        valid2, _ = validate_quse(trusted_data, task_requirements=reqs)
+        self.assertEqual(len(valid2), 1)
+        self.assertEqual(valid2[0]["provider"], "claude")
+
+    def test_gemini_failure_never_fabricates_100_percent(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.admission import fetch_managed_quse
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            (tmp_p / "state.json").write_text(json.dumps([{"label": "g-fail", "revision": "rev1", "provider": "gemini"}]))
+            bundle_dir = tmp_p / "g-fail-rev1"
+            bundle_dir.mkdir()
+            (bundle_dir / "bundle.json").write_text(json.dumps({"label": "g-fail", "revision": "rev1", "provider": "gemini"}))
+
+            res = fetch_managed_quse("g-fail", provider="gemini", managed_dir=tmp_p)
+            self.assertIn("gemini", res)
+            self.assertEqual(res["gemini"]["status"], "held")
+            self.assertEqual(res["gemini"]["windows"], {})
+
+    def test_claude_model_task_profile_resolves_implementation_and_matches_provider_task_kinds(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.admission import task_requirements_for, validate_quse
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            (tmp_p / "state.json").write_text(json.dumps([{"label": "my-claude", "revision": "r1", "provider": "claude"}]))
+            b_dir = tmp_p / "my-claude-r1"
+            b_dir.mkdir()
+            (b_dir / "bundle.json").write_text(json.dumps({
+                "label": "my-claude",
+                "revision": "r1",
+                "provider": "claude",
+                "args": ["--model", "claude-sonnet-4-6"],
+            }))
+
+            payload = {
+                "account_label": "my-claude",
+                "account_profile": "hub-my-claude",
+                "managed_dir": str(tmp_p),
+                "profile": "model-task",
+                "model_requirements": {
+                    "models": ["claude-sonnet-4-6"],
+                    "providers": ["claude"],
+                },
+            }
+            reqs = task_requirements_for(payload)
+            self.assertEqual(reqs.get("kind"), "implementation")
+            self.assertIn("claude", reqs.get("providers", []))
+            self.assertTrue(reqs.get("is_managed"))
+
+            now = datetime.now(timezone.utc)
+            fut = (now + timedelta(days=2)).isoformat()
+            quse_data = {
+                "claude": {
+                    "status": "ok",
+                    "details": {
+                        "source": "native_claude_oauth_usage",
+                        "managed": True,
+                        "model": "claude-sonnet-4-6",
+                    },
+                    "windows": {
+                        "5h": {"percent_remaining": 100.0, "reset_at": None, "inactive": True},
+                        "7d": {"percent_remaining": 80.0, "reset_at": fut},
+                    },
+                }
+            }
+            valid, rejections = validate_quse(quse_data, task_requirements=reqs)
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(valid[0]["provider"], "claude")
+            self.assertEqual(valid[0]["model"], "claude-sonnet-4-6")
+            self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_hub_fleet_launch_plan_full_admission(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.cli import plan
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            (tmp_p / "state.json").write_text(json.dumps([{"label": "prod-c", "revision": "r1", "provider": "claude"}]))
+            b_dir = tmp_p / "prod-c-r1"
+            b_dir.mkdir()
+            (b_dir / "bundle.json").write_text(json.dumps({
+                "label": "prod-c",
+                "revision": "r1",
+                "provider": "claude",
+                "args": ["--model", "claude-sonnet-4-6"],
+                "env": {"CLAUDE_CODE_OAUTH_TOKEN": "token-test"},
+            }))
+
+            now = datetime.now(timezone.utc)
+            fut = (now + timedelta(days=3)).isoformat()
+            fake_quse = {
+                "claude": {
+                    "status": "ok",
+                    "details": {
+                        "source": "native_claude_oauth_usage",
+                        "managed": True,
+                        "model": "claude-sonnet-4-6",
+                    },
+                    "windows": {
+                        "5h": {"percent_remaining": 100.0, "reset_at": None, "inactive": True},
+                        "7d": {"percent_remaining": 85.0, "reset_at": fut},
+                    },
+                }
+            }
+
+            payload = {
+                "account_label": "prod-c",
+                "account_profile": "hub-prod-c",
+                "managed_dir": str(tmp_p),
+                "profile": "model-task",
+                "model_requirements": {
+                    "models": ["claude-sonnet-4-6"],
+                    "providers": ["claude"],
+                },
+            }
+
+            class FakeArgs:
+                def __init__(self, p, cdir):
+                    self.id = None
+                    self.payload = p
+                    self.config_dir = cdir
+
+            with patch("launcher.admission.fetch_quse", return_value=fake_quse), \
+                 patch("sys.stdout") as mock_stdout:
+                rc = plan(FakeArgs(json.dumps(payload), str(tmp_p)))
+                self.assertEqual(rc, 0)
+
+
 
 
