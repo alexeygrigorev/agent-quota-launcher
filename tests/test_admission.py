@@ -12,6 +12,14 @@ def grok_route(windows, status="ok", error=None, details=None):
     return route(windows, status=status, error=error, details=merged)
 
 class TestAdmission(unittest.TestCase):
+    def test_named_codex_model_task_has_task_fit(self):
+        from launcher.admission import _eval_task_fit, task_requirements_for
+        payload = {"profile": "model-task", "account_profile": "hub-second-codex",
+                   "model_requirements": {"providers": ["codex"], "models": ["gpt-6.1-sol"]}}
+        fit, model = _eval_task_fit("codex", task_requirements_for(payload))
+        self.assertEqual(fit, 1.0)
+        self.assertEqual(model, "gpt-6.1-sol")
+
     def setUp(self):
         self.now = datetime.now(timezone.utc)
         self.future1 = (self.now + timedelta(days=1)).isoformat()

@@ -2,6 +2,7 @@ import argparse
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,15 +52,19 @@ class TaskUnitsCliTests(unittest.TestCase):
                 id=tid, cwd=tmp.name, tmpdir=str(cfg / "tmp"),
                 backend="task-units", config_dir=str(cfg), as_controller=True,
             )
-            with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
-                 patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
-                 patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute):
-                return run_task_units(args)
+            return run_task_units(args)
 
         t1 = threading.Thread(target=run_one, args=("t-a",))
         t2 = threading.Thread(target=run_one, args=("t-b",))
-        t1.start(); t2.start()
-        t1.join(timeout=10); t2.join(timeout=10)
+        # Patch globals once around both threads. Nested concurrent patches can
+        # restore another thread's mock and contaminate later discovery tests.
+        with patch("launcher.admission.fetch_quse", return_value={"ok": True}), \
+             patch("launcher.launch.build_adapter_argv", return_value=["/bin/true"]), \
+             patch("launcher.task_units.execute_transient_task_unit", side_effect=fake_execute):
+            t1.start(); t2.start()
+            t1.join(timeout=10); t2.join(timeout=10)
+            self.assertFalse(t1.is_alive())
+            self.assertFalse(t2.is_alive())
         self.assertEqual(sorted(overlapping), ["t-a", "t-b"])
         self.assertEqual(store.get_task("t-a")["state"], "completed-awaiting-review")
         self.assertEqual(store.get_task("t-b")["state"], "completed-awaiting-review")
@@ -272,7 +277,7 @@ class TaskUnitsCliTests(unittest.TestCase):
                 "windows": {
                     "7d": {
                         "percent_remaining": 50.0,
-                        "reset_at": "2026-10-15T00:00:00+00:00",
+                        "reset_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
                     }
                 }
             }

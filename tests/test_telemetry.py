@@ -156,13 +156,14 @@ class TestStructuredTelemetry(unittest.TestCase):
                  patch("launcher.task_units.check_resources", return_value=True):
                 receipt = execute_transient_task_unit(
                     task_id=task_id,
+                    # This fixture writes synthetic events; it is not a model launch.
                     command_argv=["/bin/true"],
                     memory_mb=768,
                     workspace=str(workspace),
                     tmpdir=str(tmpdir),
                     timeout_sec=30,
                     quse_json=quse,
-                    provider="antigravity",
+                    provider=None,
                     log_dir=str(log_dir),
                 )
 

@@ -58,6 +58,7 @@ CODEX_NOT_APPLICABLE_WINDOWS = ("5h", "monthly")
 GENERAL_TASK_KINDS = ("coding", "implementation", "docs", "review")
 ROOT_TASK_KINDS = ("root-run",)
 PROVIDER_TASK_KINDS = {
+    "codex": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "grok": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "antigravity": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "zai": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,

@@ -206,11 +206,15 @@ def resolve_hub_path():
     return None
 
 
-def build_managed_profile_argv(provider, goal, label, model=None):
+def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=None):
     hub_path = resolve_hub_path()
     if not hub_path:
         raise ValueError("Cannot resolve trusted Agent Hub host path for managed profile execution")
-    script = f"import sys; sys.path.insert(0, {hub_path!r}); from agent_hub_host.provisioning import execute; execute()"
+    context = ""
+    if managed_dir is not None:
+        catalog = str(Path(managed_dir).resolve())
+        context = f"import os; os.environ['AGENT_HUB_MANAGED_DIR'] = {catalog!r}; "
+    script = context + f"import sys; sys.path.insert(0, {hub_path!r}); from agent_hub_host.provisioning import execute; execute()"
     cmd = [sys.executable, "-c", script, label]
     if provider in ("codex", "openai"):
         wrapper = get_codex_wrapper()
@@ -676,7 +680,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     cmd.extend(["--"])
     if account_profile:
         label = account_label or (account_profile[4:] if account_profile.startswith("hub-") else account_profile)
-        cmd.extend(build_managed_profile_argv(provider, goal, label, model=chosen.get("model")))
+        cmd.extend(build_managed_profile_argv(provider, goal, label, model=chosen.get("model"), managed_dir=managed_dir))
     else:
         cmd.extend(build_adapter_argv(provider, goal, model=chosen.get("model")))
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
@@ -761,7 +765,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                 details={
                     "start_phase": start_json.get("phase"),
                     "worker_pid": start_json.get("worker_pid"),
-                    "profile": start_json.get("profile") or account_profile,
+                    "profile": start_json.get("profile"),
                     "account_label": account_label,
                 },
             )
@@ -797,7 +801,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
                             "first_action_validated_at": record["first_action_validated_at"],
                             "start_phase": start_json.get("phase"),
                             "worker_pid": start_json.get("worker_pid"),
-                            "profile": start_json.get("profile") or account_profile,
+                            "profile": start_json.get("profile"),
                             "account_label": account_label,
                         },
                     )

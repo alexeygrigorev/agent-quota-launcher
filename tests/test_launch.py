@@ -653,6 +653,25 @@ class TestDoRunWaitLoop(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_managed_profile_argv("claude", "do work", "acc-claude")
 
+    def test_managed_execution_receives_explicit_catalog(self):
+        from launcher.launch import build_managed_profile_argv
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "agent_hub_host"
+            module.mkdir()
+            (module / "__init__.py").write_text("")
+            (module / "provisioning.py").write_text(
+                "import os,json,sys\n"
+                "def execute():\n"
+                " print(json.dumps({'catalog':os.environ['AGENT_HUB_MANAGED_DIR'],'label':sys.argv[1]}))\n")
+            # Quotes, spaces and shell metacharacters remain path data.
+            selected = root / "catalog ' second;account"
+            with patch("launcher.launch.resolve_hub_path", return_value=str(root)):
+                command = build_managed_profile_argv("zai", "task", "second-zai", managed_dir=selected)
+            env = dict(os.environ, AGENT_HUB_MANAGED_DIR=str(root / "wrong-default"))
+            result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(result.stdout), {"catalog": str(selected), "label": "second-zai"})
+
     def test_fetch_quse_with_managed_account_probes_isolated_env(self):
         from launcher.admission import fetch_quse
         managed_dir = Path(self.dir) / "managed-engines"
