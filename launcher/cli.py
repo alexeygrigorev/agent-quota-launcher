@@ -142,10 +142,10 @@ def run(args):
             "engine": start_doc.get("engine"),
             "phase": start_doc.get("phase"),
         }
-        if start_doc.get("profile") or record_doc.get("profile"):
-            receipt["profile"] = start_doc.get("profile") or record_doc.get("profile")
-        if record_doc.get("account_label"):
-            receipt["account_label"] = record_doc.get("account_label")
+        if start_doc.get("profile"):
+            receipt["profile"] = start_doc["profile"]
+        if start_doc.get("account_label") or record_doc.get("account_label"):
+            receipt["account_label"] = start_doc.get("account_label") or record_doc.get("account_label")
         print(json.dumps({"backend": "aplexer", "task_id": args.id,
                           "receipt": receipt}))
     except Exception:

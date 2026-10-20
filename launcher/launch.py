@@ -24,6 +24,7 @@ GLM models run ONLY via zai (zcodex); build_adapter_argv refuses them elsewhere.
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -183,9 +184,34 @@ def get_codex_wrapper():
     return None
 
 
+def resolve_hub_path():
+    env_path = os.environ.get("AGENT_HUB_HOST_PATH")
+    if env_path and os.path.exists(env_path):
+        return str(Path(env_path).resolve())
+    hub_bin = shutil.which("hub") or str(Path.home() / ".local" / "bin" / "hub")
+    if os.path.isfile(hub_bin):
+        return str(Path(hub_bin).resolve())
+    for cand in (
+        Path.home() / "git" / "agent-hub" / "host",
+        Path("/home/alexey/git/agent-hub/host"),
+    ):
+        if (cand / "agent_hub_host").is_dir():
+            return str(cand.resolve())
+    return None
+
+
 def build_managed_profile_argv(provider, goal, label, model=None):
-    cmd = [sys.executable, "-m", "agent_hub_host.provisioning", "execute", label]
+    hub_path = resolve_hub_path()
+    if not hub_path:
+        raise ValueError("Cannot resolve trusted Agent Hub host path for managed profile execution")
+    script = f"import sys; sys.path.insert(0, {hub_path!r}); from agent_hub_host.provisioning import execute; execute()"
+    cmd = [sys.executable, "-c", script, label]
     if provider in ("codex", "openai"):
+        wrapper = get_codex_wrapper()
+        if not wrapper:
+            raise ValueError(
+                "Unsupported provider: codex (genuine protected wrapper scripts/launch-codex.sh not configured; raw routing denied)"
+            )
         args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"]
         if model:
             args += ["--model", str(model)]
@@ -197,13 +223,8 @@ def build_managed_profile_argv(provider, goal, label, model=None):
     elif provider in ("go", "opencode"):
         m = model or "opencode-go/muse-spark-1.3-contributor"
         return cmd + ["run", "--pure", "--auto", "--model", str(m), str(goal)]
-    elif provider in ("gemini", "antigravity"):
-        m = model or "gemini-3.8-flash-high"
-        return cmd + ["--model", str(m), "--effort", "high", "--dangerously-skip-permissions", "--print-timeout", "0", "--output-format", "stream-json", "-p", str(goal)]
-    elif provider == "claude":
-        m = model or "sonnet"
-        return cmd + ["--model", str(m), "-p", str(goal)]
-    return cmd + [str(goal)]
+    else:
+        raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
 
 def build_adapter_argv(provider, goal, model=None):
@@ -563,10 +584,12 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     }
 
     # --- admission (fresh evidence each launch) ---
-    quse_data = fetch_quse()
+    config_dir = str(Path(lock_path).parent) if lock_path else None
+    account_label = payload.get("account_label")
+    quse_data = fetch_quse(account_label=account_label, config_dir=config_dir)
     record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
     valid_routes, rejections = validate_quse(
-        quse_data, task_requirements=payload.get("model_requirements"))
+        quse_data, task_requirements=payload.get("model_requirements"), config_dir=config_dir)
     record["rejections"] = rejections
 
     if not valid_routes:

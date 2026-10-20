@@ -632,22 +632,62 @@ class TestDoRunWaitLoop(unittest.TestCase):
     def test_build_managed_profile_argv(self):
         from launcher.launch import build_managed_profile_argv
         argv_zai = build_managed_profile_argv("zai", "do work", "acc-zai", "glm-5.3-flash")
-        self.assertIn("agent_hub_host.provisioning", argv_zai)
-        self.assertIn("execute", argv_zai)
-        self.assertIn("acc-zai", argv_zai)
+        self.assertIn("agent_hub_host.provisioning", argv_zai[2])
+        self.assertIn("execute", argv_zai[2])
+        self.assertEqual(argv_zai[3], "acc-zai")
         self.assertIn("exec", argv_zai)
         self.assertIn("glm-5.3-flash", argv_zai)
 
-        argv_codex = build_managed_profile_argv("codex", "do work", "acc-codex", "gpt-6.1-sol")
-        self.assertIn("agent_hub_host.provisioning", argv_codex)
-        self.assertIn("acc-codex", argv_codex)
-        self.assertIn("exec", argv_codex)
-        self.assertIn("gpt-6.1-sol", argv_codex)
+        with patch("launcher.launch.get_codex_wrapper", return_value="/bin/launch-codex.sh"):
+            argv_codex = build_managed_profile_argv("codex", "do work", "acc-codex", "gpt-6.1-sol")
+            self.assertIn("agent_hub_host.provisioning", argv_codex[2])
+            self.assertEqual(argv_codex[3], "acc-codex")
+            self.assertIn("exec", argv_codex)
+            self.assertIn("gpt-6.1-sol", argv_codex)
 
         argv_opencode = build_managed_profile_argv("opencode", "do work", "acc-go", "opencode-go/muse-spark-1.3-contributor")
-        self.assertIn("agent_hub_host.provisioning", argv_opencode)
-        self.assertIn("acc-go", argv_opencode)
+        self.assertIn("agent_hub_host.provisioning", argv_opencode[2])
+        self.assertEqual(argv_opencode[3], "acc-go")
         self.assertIn("run", argv_opencode)
+
+        with self.assertRaises(ValueError):
+            build_managed_profile_argv("claude", "do work", "acc-claude")
+
+    def test_fetch_quse_with_managed_account_probes_isolated_env(self):
+        from launcher.admission import fetch_quse
+        managed_dir = Path(self.dir) / "managed-engines"
+        dest = managed_dir / "acc1-rev1"
+        dest.mkdir(parents=True)
+        (dest / "home").mkdir()
+        bundle = {
+            "label": "acc1",
+            "provider": "zai",
+            "version": "0.155.1",
+            "revision": "rev1",
+            "files": {},
+            "env": {"ZAI_API_KEY": "tok-acc1"},
+        }
+        (dest / "bundle.json").write_text(json.dumps(bundle))
+        (managed_dir / "state.json").write_text(json.dumps([{"label": "acc1", "revision": "rev1", "provider": "zai"}]))
+
+        captured_env = {}
+        fake_quse_out = json.dumps({"zai": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}}}})
+
+        def fake_subprocess_run(cmd, env=None, **kwargs):
+            captured_env.update(env or {})
+            class FakeRes:
+                returncode = 0
+                stdout = fake_quse_out
+            return FakeRes()
+
+        with patch.dict(os.environ, {"AGENT_HUB_CONFIG_DIR": self.dir}), \
+             patch("launcher.admission.subprocess.run", side_effect=fake_subprocess_run):
+            data = fetch_quse(account_label="acc1", provider="zai")
+
+        self.assertIn("zai", data)
+        self.assertEqual(captured_env.get("ZAI_API_KEY"), "tok-acc1")
+        self.assertEqual(captured_env.get("HOME"), str(dest / "home"))
+        self.assertEqual(captured_env.get("ZCODE_HOME"), str(dest / "home" / ".zcode"))
 
     def test_do_run_passes_managed_profile_to_aplexer(self):
         from launcher.launch import do_run
