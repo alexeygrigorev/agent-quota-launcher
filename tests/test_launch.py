@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from launcher.launch import (validate_first_action, build_adapter_argv,
                              ADAPTERS, _kill_process_group, _bounded_timeout,
@@ -780,6 +780,123 @@ class TestDoRunWaitLoop(unittest.TestCase):
         rec = json.loads(rec_path.read_text())
         self.assertEqual(rec.get("profile"), "hub-hubacc")
         self.assertEqual(rec.get("account_label"), "hubacc")
+
+    def test_plan_and_run_use_exact_managed_quota_context(self):
+        from launcher.cli import plan
+        from launcher.launch import do_run
+
+        managed_task_id = "t-managed-quota"
+        managed_payload = {
+            "id": managed_task_id,
+            "owner": "test-owner",
+            "goal": "run under named profile",
+            "cwd": self.dir,
+            "timeout": 1200,
+            "account_label": "namedB",
+            "account_profile": "hub-namedB",
+            "provider_profile": "hub-namedB",
+            "profile": "model-task",
+            "model_requirements": {"providers": ["opencode"], "models": ["opencode-go/muse-spark-1.3-contributor"]},
+        }
+
+        legacy_task_id = "t-legacy-quota"
+        legacy_payload = {
+            "id": legacy_task_id,
+            "owner": "test-owner",
+            "goal": "run under legacy account",
+            "cwd": self.dir,
+            "timeout": 1200,
+            "account_label": "shared-gemini",
+            "profile": "model-task",
+            "model_requirements": {"providers": ["opencode"], "models": ["opencode-go/muse-spark-1.3-contributor"]},
+        }
+
+        state_store = Store(str(Path(self.dir) / "state.db"))
+        state_store.submit_task(managed_task_id, "idem-m-1", managed_payload, [])
+        state_store.submit_task(legacy_task_id, "idem-l-1", legacy_payload, [])
+        self.store.submit_task(managed_task_id, "idem-m-1", managed_payload, [])
+        self.store.submit_task(legacy_task_id, "idem-l-1", legacy_payload, [])
+
+        calls_plan = []
+        def fake_fetch_quse_plan(account_label=None, provider=None, config_dir=None, managed_dir=None):
+            calls_plan.append(account_label)
+            # 5% for ambient default (rejected), 80% for namedB (admitted)
+            perc = 5.0 if account_label is None else 80.0
+            return {
+                "status": "ok",
+                "go": {
+                    "status": "ok",
+                    "windows": {
+                        "monthly": {"percent_remaining": perc, "reset_at": "2026-11-01T00:00:00+00:00"}
+                    }
+                }
+            }
+
+        class FakeArgs:
+            def __init__(self, tid, cdir):
+                self.id = tid
+                self.payload = None
+                self.config_dir = cdir
+
+        with patch("launcher.admission.fetch_quse", side_effect=fake_fetch_quse_plan):
+            plan(FakeArgs(managed_task_id, self.dir))
+            self.assertEqual(calls_plan, ["namedB"])
+            calls_plan.clear()
+
+            plan(FakeArgs(legacy_task_id, self.dir))
+            self.assertEqual(calls_plan, [None])
+
+        # Test do_run dispatch behavior with exact managed quota context
+        calls_run = []
+        def fake_fetch_quse_run(account_label=None, provider=None, config_dir=None, managed_dir=None):
+            calls_run.append(account_label)
+            perc = 0.0 if account_label is None else 80.0
+            return {
+                "status": "ok",
+                "go": {
+                    "status": "ok",
+                    "windows": {
+                        "monthly": {"percent_remaining": perc, "reset_at": "2026-11-01T00:00:00+00:00"}
+                    }
+                }
+            }
+
+        with patch("launcher.launch.fetch_quse", side_effect=fake_fetch_quse_run), \
+             patch("launcher.launch.check_resources", return_value=True), \
+             patch("launcher.launch.validate_opencode_runtime", return_value="/bin/opencode"), \
+             patch("launcher.launch.validate_first_action", return_value=True), \
+             patch("launcher.launch.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate.return_value = (json.dumps({"id": "sess-1", "tag": f"task-{managed_task_id}", "workspace": self.dir}), "")
+            mock_popen.return_value = mock_proc
+
+            fa_path = Path(self.dir) / ".local" / f"first-action-{managed_task_id}.json"
+            fa_path.parent.mkdir(parents=True, exist_ok=True)
+            fa_path.write_text(json.dumps({
+                "schema_version": 1,
+                "id": "11111111-1111-4111-8111-111111111111",
+                "tag": f"task-{managed_task_id}",
+                "workspace": str(Path(self.dir).resolve()),
+                "engine": "opencode",
+                "command": "python3",
+                "phase": "running",
+                "worker_pid": 12345,
+                "created_at_ms": 1000000,
+                "updated_at_ms": 1001000,
+                "profile": "hub-namedB",
+                "timestamp": "2026-10-20T14:00:00+00:00",
+            }))
+
+            rc = do_run(str(self.db_path), managed_task_id, self.dir, None, self.lock_path)
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls_run, ["namedB"])
+            calls_run.clear()
+
+            # Now run legacy task - with 5% remaining, quota gate should refuse it
+            with self.assertRaises(ValueError):
+                do_run(str(self.db_path), legacy_task_id, self.dir, None, self.lock_path)
+            self.assertEqual(calls_run, [None])
 
 
 if __name__ == '__main__':

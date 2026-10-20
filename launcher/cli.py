@@ -73,7 +73,11 @@ def plan(args):
         return 1
 
     try:
-        quse_data = fetch_quse()
+        from launcher.admission import is_managed_profile_payload
+        is_managed = is_managed_profile_payload(payload)
+        account_label = payload.get("account_label") if is_managed else None
+        managed_dir = payload.get("managed_dir") if is_managed else None
+        quse_data = fetch_quse(account_label=account_label, managed_dir=managed_dir)
         config_dir = config_dir_for(args)
         valid_routes, rejections = validate_quse(
             quse_data, task_requirements=task_requirements_for(payload),

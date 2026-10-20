@@ -91,10 +91,33 @@ PROMO_CUTOFF_UTC = "2026-10-06T16:00:00+00:00"
 PROMO_WINDOW_UTC = (15, 1)
 
 
-def fetch_managed_quse(account_label, provider=None, config_dir=None):
+def is_managed_profile_payload(payload):
+    """Check if payload explicitly targets a named centrally provisioned profile.
+
+    Generic tasks with legacy account labels (e.g. shared-gemini, urgent-muse)
+    are NOT managed profiles; they consume standard ambient quota.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("account_profile"):
+        return True
+    if payload.get("provider_profile"):
+        return True
+    prof = payload.get("profile")
+    if isinstance(prof, str) and prof.startswith("hub-"):
+        return True
+    return False
+
+
+def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_dir=None):
     """Fetch fresh quota context for a named centrally managed account."""
-    hub_config = Path(os.environ.get("AGENT_HUB_CONFIG_DIR", Path.home() / ".config" / "agent-hub"))
-    managed_dir = hub_config / "managed-engines"
+    if managed_dir:
+        managed_dir = Path(managed_dir)
+    elif os.environ.get("AGENT_HUB_MANAGED_DIR"):
+        managed_dir = Path(os.environ["AGENT_HUB_MANAGED_DIR"])
+    else:
+        hub_config = Path(os.environ.get("AGENT_HUB_CONFIG_DIR", Path.home() / ".config" / "agent-hub"))
+        managed_dir = hub_config / "managed-engines"
     state_file = managed_dir / "state.json"
     if not state_file.is_file():
         raise ValueError(f"Managed engines state file not found for account {account_label}")
@@ -145,14 +168,14 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None):
     return obj
 
 
-def fetch_quse(account_label=None, provider=None, config_dir=None):
+def fetch_quse(account_label=None, provider=None, config_dir=None, managed_dir=None):
     """Run quse --json and parse the first JSON document from stdout.
 
     When account_label is provided, probes quota strictly within that managed
     account's isolated credential environment. Never falls back to default operator quota.
     """
     if account_label:
-        return fetch_managed_quse(account_label, provider=provider, config_dir=config_dir)
+        return fetch_managed_quse(account_label, provider=provider, config_dir=config_dir, managed_dir=managed_dir)
     res = subprocess.run(["quse", "--json"], capture_output=True, text=True, timeout=120)
     if res.returncode != 0:
         raise ValueError(f"Failed to fetch quse (rc={res.returncode})")

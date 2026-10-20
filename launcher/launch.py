@@ -32,7 +32,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from launcher.admission import fetch_quse, validate_quse, PROMO_MULTIPLIER, PROMO_CUTOFF_UTC
+from launcher.admission import (
+    fetch_quse,
+    validate_quse,
+    is_managed_profile_payload,
+    PROMO_MULTIPLIER,
+    PROMO_CUTOFF_UTC,
+)
 from launcher.ranking import select_candidate
 from launcher.resources import check_resources
 from launcher.store import Store, launch_lock, StateTransitionError
@@ -585,8 +591,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
 
     # --- admission (fresh evidence each launch) ---
     config_dir = str(Path(lock_path).parent) if lock_path else None
-    account_label = payload.get("account_label")
-    quse_data = fetch_quse(account_label=account_label, config_dir=config_dir)
+    is_managed = is_managed_profile_payload(payload)
+    account_label = payload.get("account_label") if is_managed else None
+    managed_dir = payload.get("managed_dir") if is_managed else None
+    quse_data = fetch_quse(account_label=account_label, config_dir=config_dir, managed_dir=managed_dir)
     record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
     valid_routes, rejections = validate_quse(
         quse_data, task_requirements=payload.get("model_requirements"), config_dir=config_dir)
