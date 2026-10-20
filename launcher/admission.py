@@ -256,6 +256,7 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
         APPDATA=str(home / "AppData" / "Roaming"),
         LOCALAPPDATA=str(home / "AppData" / "Local"),
         XDG_CONFIG_HOME=str(home / ".config"),
+        XDG_CACHE_HOME=str(home / ".cache"),
         CODEX_HOME=str(home / ".zcodex" if prov == "zai" else home / ".codex"),
         ZCODE_HOME=str(home / ".zcode"),
         CLAUDE_CONFIG_DIR=str(home / ".claude"),
