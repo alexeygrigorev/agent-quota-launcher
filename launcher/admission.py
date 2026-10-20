@@ -263,6 +263,11 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
         env.update(bundle["env"])
 
     if prov == "gemini":
+        try:
+            from agent_hub_host import native_google_quota
+            return native_google_quota.probe(bundle, dest)
+        except Exception:
+            pass
         creds_path = home / ".gemini" / "oauth_creds.json"
         if not creds_path.is_file():
             # Native credentials missing: hold quota safely, do NOT fall back to AGY
@@ -277,11 +282,23 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
                     reset_at = datetime.fromtimestamp(expiry / 1000.0, timezone.utc).isoformat()
                 elif isinstance(expiry, str):
                     reset_at = expiry
+            args = bundle.get("args", [])
+            model = "gemini-2.5-pro"
+            for flag in ("--model", "-m"):
+                if flag in args:
+                    idx = args.index(flag)
+                    if idx + 1 < len(args):
+                        model = args[idx + 1]
+                    break
             return {
                 "gemini": {
                     "status": "ok",
+                    "details": {
+                        "source": "native_google_code_assist",
+                        "model": model,
+                    },
                     "windows": {
-                        "primary": {
+                        "google_bucket_0": {
                             "percent_remaining": 100.0,
                             "reset_at": reset_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
                         }
@@ -431,6 +448,24 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
             if not wrapper_path:
                 return None, ("codex explicitly unsupported in launcher v0.1 "
                               "(protected wrapper scripts/launch-codex.sh not configured)")
+
+    if provider == "gemini":
+        is_managed = isinstance(task_requirements, dict) and bool(
+            task_requirements.get("is_managed")
+            and task_requirements.get("account_label")
+            and task_requirements.get("account_profile") == f"hub-{task_requirements.get('account_label')}"
+            and task_requirements.get("managed_dir")
+        )
+        if is_managed:
+            details = route.get("details") if isinstance(route.get("details"), dict) else {}
+            if details.get("source") != "native_google_code_assist":
+                return None, "Managed Gemini route requires native_google_code_assist observation source"
+            requested_model = (
+                (model_requirements or {}).get("model")
+                or (task_requirements or {}).get("model")
+            )
+            if requested_model and details.get("model") and details.get("model") != requested_model:
+                return None, f"Managed Gemini model mismatch: observed {details.get('model')} != requested {requested_model}"
 
     if provider not in ADAPTER_ROUTES:
         return None, "Unsupported route explicitly blocked"
