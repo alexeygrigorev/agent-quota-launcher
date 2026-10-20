@@ -17,10 +17,11 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-ADAPTER_ROUTES = ("grok", "antigravity", "zai", "opencode", "codex")
+ADAPTER_ROUTES = ("grok", "antigravity", "gemini", "zai", "opencode", "codex")
 ADAPTER_MODELS = {
     "grok": "grok-4.6",
     "antigravity": "gemini-3.8-flash-high",
+    "gemini": "gemini-2.5-pro",
     "zai": "glm-5.3-flash",
     "opencode": "opencode-go/muse-spark-1.3-contributor",
     "codex": "gpt-6.1-sol",
@@ -28,6 +29,12 @@ ADAPTER_MODELS = {
 ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
     "antigravity": ("gemini-3.8-flash-high", "gemini-4-argon-high"),
+    "gemini": (
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "auto-gemini-2.5",
+    ),
     "zai": ("glm-5.3-flash",),
     "opencode": ("opencode-go/muse-spark-1.3-contributor",),
     "codex": ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"),
@@ -61,6 +68,7 @@ PROVIDER_TASK_KINDS = {
     "codex": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "grok": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "antigravity": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
+    "gemini": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "zai": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
     "opencode": GENERAL_TASK_KINDS + ROOT_TASK_KINDS,
 }
@@ -71,25 +79,94 @@ PROFILE_TASK_KINDS = {
 }
 
 
-def task_requirements_for(payload):
-    """model_requirements plus the task kind implied by the payload profile."""
-    reqs = payload.get("model_requirements") if isinstance(payload, dict) else None
-    kind = PROFILE_TASK_KINDS.get(payload.get("profile")) if isinstance(payload, dict) else None
-    if kind is None:
-        return reqs
-    if reqs is None:
-        return {"kind": kind}
-    if isinstance(reqs, dict) and "kind" not in reqs:
-        return dict(reqs, kind=kind)
-    return reqs
-GROK_MIN_REMAINING = 5.0
+def qualify_managed_payload(payload):
+    """Strictly validate named profile payloads.
 
-# Promotion stays disabled until a verified ZCode >=3.10 GLM-5.3-Flash
-# subscription route exists; even inside the campaign window the multiplier is
-# 1.0 and the conservative cutoff bounds any future reliance.
-PROMO_MULTIPLIER = 1.0
-PROMO_CUTOFF_UTC = "2026-10-06T16:00:00+00:00"
-PROMO_WINDOW_UTC = (15, 1)
+    Returns (qualified_dict, rejection_reason).
+    If payload is not attempting a named profile, returns (None, None).
+    If payload is attempting a named profile and valid, returns (qualified_dict, None).
+    If payload is attempting a named profile but malformed/mismatched/stale, returns (None, reason).
+    """
+    if not isinstance(payload, dict):
+        return None, None
+
+    account_label = payload.get("account_label")
+    account_profile = payload.get("account_profile")
+    provider_profile = payload.get("provider_profile")
+    prof = payload.get("profile")
+    has_hub_profile = isinstance(prof, str) and prof.startswith("hub-")
+
+    is_named_attempt = bool(account_label or account_profile or provider_profile or has_hub_profile)
+    if not is_named_attempt:
+        return None, None
+
+    # If profile starts with hub- but no account_label or account_profile provided
+    if has_hub_profile and not account_label and not account_profile and not provider_profile:
+        return None, "Named profile requires explicit account_label"
+
+    target_profile = account_profile or provider_profile
+    if not account_label and target_profile and target_profile.startswith("hub-"):
+        account_label = target_profile.removeprefix("hub-")
+    elif not target_profile and has_hub_profile:
+        target_profile = prof
+
+    if not account_label or not target_profile:
+        return None, "Named profile requires both account_label and account_profile"
+
+    expected_profile = f"hub-{account_label}"
+    if target_profile != expected_profile:
+        return None, f"Profile mismatch: expected {expected_profile!r}, got {target_profile!r}"
+
+    # If managed_dir is explicitly specified, verify state and bundle
+    managed_dir = payload.get("managed_dir")
+    if managed_dir:
+        managed_dir = Path(managed_dir)
+        state_file = managed_dir / "state.json"
+        if not state_file.is_file():
+            return None, f"Managed engines state.json not found in {managed_dir}"
+
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            return None, f"Failed to read managed engines state: {e}"
+
+        record = next((b for b in state if b.get("label") == account_label), None)
+        if not record:
+            return None, f"Account {account_label!r} not found in managed state.json"
+
+        rev = record.get("revision")
+        if not rev:
+            return None, f"Account {account_label!r} has missing revision in state.json"
+
+        dest = managed_dir / f"{account_label}-{rev}"
+        bundle_file = dest / "bundle.json"
+        if not bundle_file.is_file():
+            return None, f"Managed bundle.json not found for account {account_label!r} at {dest}"
+
+        try:
+            with open(bundle_file, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+        except Exception as e:
+            return None, f"Failed to read managed bundle.json: {e}"
+
+        if bundle.get("label") != account_label or bundle.get("revision") != rev:
+            return None, f"Bundle metadata mismatch for {account_label!r}"
+
+        return {
+            "is_managed": True,
+            "account_label": account_label,
+            "account_profile": expected_profile,
+            "managed_dir": str(managed_dir),
+            "bundle_provider": record.get("provider") or bundle.get("provider"),
+            "bundle_revision": rev,
+        }, None
+
+    return {
+        "is_managed": True,
+        "account_label": account_label,
+        "account_profile": expected_profile,
+    }, None
 
 
 def is_managed_profile_payload(payload):
@@ -98,16 +175,44 @@ def is_managed_profile_payload(payload):
     Generic tasks with legacy account labels (e.g. shared-gemini, urgent-muse)
     are NOT managed profiles; they consume standard ambient quota.
     """
+    qualified, _ = qualify_managed_payload(payload)
+    return qualified is not None
+
+
+def task_requirements_for(payload):
+    """model_requirements plus the task kind implied by the payload profile."""
     if not isinstance(payload, dict):
-        return False
-    if payload.get("account_profile"):
-        return True
-    if payload.get("provider_profile"):
-        return True
-    prof = payload.get("profile")
-    if isinstance(prof, str) and prof.startswith("hub-"):
-        return True
-    return False
+        return None
+    model_reqs = payload.get("model_requirements")
+    if isinstance(model_reqs, dict):
+        # Strip reserved caller keys so caller cannot forge managed authority
+        reqs = {k: v for k, v in model_reqs.items() if k not in ("is_managed", "account_label", "account_profile", "provider_profile", "managed_dir")}
+    elif model_reqs is not None:
+        reqs = {"provider": False, "malformed_model_requirements": model_reqs}
+    else:
+        reqs = {}
+    kind = PROFILE_TASK_KINDS.get(payload.get("profile"))
+    if kind is not None:
+        reqs.setdefault("kind", kind)
+
+    qualified, rejection = qualify_managed_payload(payload)
+    if rejection:
+        # Named profile attempt failed qualification: fail closed, do NOT treat as legacy
+        return {"provider": False, "managed_rejected": rejection}
+    if qualified:
+        reqs.update(qualified)
+
+    return reqs if reqs else None
+
+
+GROK_MIN_REMAINING = 5.0
+
+# Promotion stays disabled until a verified ZCode >=3.10 GLM-5.3-Flash
+# subscription route exists; even inside the campaign window the multiplier is
+# 1.0 and the conservative cutoff bounds any future reliance.
+PROMO_MULTIPLIER = 1.0
+PROMO_CUTOFF_UTC = "2026-10-06T16:00:00+00:00"
+PROMO_WINDOW_UTC = (15, 1)
 
 
 def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_dir=None):
@@ -146,9 +251,13 @@ def fetch_managed_quse(account_label, provider=None, config_dir=None, managed_di
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR")}
     env.update(
         HOME=str(home),
+        USERPROFILE=str(home),
+        APPDATA=str(home / "AppData" / "Roaming"),
+        LOCALAPPDATA=str(home / "AppData" / "Local"),
         XDG_CONFIG_HOME=str(home / ".config"),
-        CODEX_HOME=str(home / ".codex"),
+        CODEX_HOME=str(home / ".zcodex" if prov == "zai" else home / ".codex"),
         ZCODE_HOME=str(home / ".zcode"),
+        CLAUDE_CONFIG_DIR=str(home / ".claude"),
     )
     if bundle.get("env"):
         env.update(bundle["env"])
@@ -263,8 +372,16 @@ def codex_gate_reason(route, now):
 
 def _validate_route(name, route, now, task_requirements, check_capacity=False, config_dir=None):
     """Validate one route. Returns (candidate|None, rejection_reason|None)."""
+    if isinstance(task_requirements, dict) and task_requirements.get("managed_rejected"):
+        return None, f"Managed profile rejected: {task_requirements.get('managed_rejected')}"
+    req_prov = (task_requirements.get("provider") if isinstance(task_requirements, dict) else None)
+    raw_provs = (task_requirements.get("providers") if isinstance(task_requirements, dict) else None)
+    req_provs = [x for x in raw_provs if isinstance(x, str)] if isinstance(raw_provs, (list, tuple, set)) else []
     if name == "gemini":
-        provider = "antigravity"
+        if req_prov == "gemini" or "gemini" in req_provs:
+            provider = "gemini"
+        else:
+            provider = "antigravity"
     elif name in ("go", "opencode", "opencode-go"):
         provider = "opencode"
     else:
@@ -274,10 +391,17 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
         gate = codex_gate_reason(route, now)
         if gate:
             return None, gate
-        wrapper_path = get_codex_wrapper(config_dir=config_dir)
-        if not wrapper_path:
-            return None, ("codex explicitly unsupported in launcher v0.1 "
-                          "(protected wrapper scripts/launch-codex.sh not configured)")
+        is_managed = isinstance(task_requirements, dict) and bool(
+            task_requirements.get("is_managed")
+            and task_requirements.get("account_label")
+            and task_requirements.get("account_profile") == f"hub-{task_requirements.get('account_label')}"
+            and task_requirements.get("managed_dir")
+        )
+        if not is_managed:
+            wrapper_path = get_codex_wrapper(config_dir=config_dir)
+            if not wrapper_path:
+                return None, ("codex explicitly unsupported in launcher v0.1 "
+                              "(protected wrapper scripts/launch-codex.sh not configured)")
 
     if provider not in ADAPTER_ROUTES:
         return None, "Unsupported route explicitly blocked"

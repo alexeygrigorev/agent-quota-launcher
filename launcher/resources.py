@@ -68,10 +68,34 @@ def get_max_feasible_stage(mem_available_bytes: int = None, peak: bool = False) 
 
 
 def get_mem_available():
-    with open('/proc/meminfo') as f:
-        for line in f:
-            if line.startswith('MemAvailable:'):
-                return int(line.split()[1]) * 1024
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    if os.name == 'nt':
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ('dwLength', ctypes.c_ulong),
+                ('dwMemoryLoad', ctypes.c_ulong),
+                ('ullTotalPhys', ctypes.c_ulonglong),
+                ('ullAvailPhys', ctypes.c_ulonglong),
+                ('ullTotalPageFile', ctypes.c_ulonglong),
+                ('ullAvailPageFile', ctypes.c_ulonglong),
+                ('ullTotalVirtual', ctypes.c_ulonglong),
+                ('ullAvailVirtual', ctypes.c_ulonglong),
+                ('sullAvailExtendedVirtual', ctypes.c_ulonglong),
+            ]
+        try:
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
     return 0
 
 

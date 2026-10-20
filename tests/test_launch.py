@@ -248,6 +248,14 @@ class TestAdapters(unittest.TestCase):
         argv = build_adapter_argv("antigravity", "goal", model="gemini-3.8-flash-high")
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
 
+    def test_gemini_argv_exact(self):
+        argv = build_adapter_argv("gemini", "goal text")
+        self.assertEqual(argv, ["/home/alexey/.local/bin/gemini", "-m", "gemini-2.5-pro", "-p", "goal text"])
+
+    def test_gemini_supports_model_override(self):
+        argv = build_adapter_argv("gemini", "goal text", model="gemini-2.5-flash")
+        self.assertEqual(argv, ["/home/alexey/.local/bin/gemini", "-m", "gemini-2.5-flash", "-p", "goal text"])
+
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/usr/bin/env")
@@ -649,6 +657,23 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.assertIn("agent_hub_host.provisioning", argv_opencode[2])
         self.assertEqual(argv_opencode[3], "acc-go")
         self.assertIn("run", argv_opencode)
+        self.assertIn("--standalone", argv_opencode)
+        self.assertIn("--auto", argv_opencode)
+
+        argv_gemini = build_managed_profile_argv("gemini", "do work", "acc-gemini", "gemini-2.5-pro")
+        self.assertIn("agent_hub_host.provisioning", argv_gemini[2])
+        self.assertEqual(argv_gemini[3], "acc-gemini")
+        self.assertIn("-p", argv_gemini)
+        self.assertIn("-m", argv_gemini)
+        self.assertIn("gemini-2.5-pro", argv_gemini)
+        self.assertIn("--approval-mode", argv_gemini)
+        self.assertIn("yolo", argv_gemini)
+
+        # Managed codex does not require get_codex_wrapper
+        with patch("launcher.launch.get_codex_wrapper", return_value=None):
+            argv_codex_managed = build_managed_profile_argv("codex", "do work", "acc-codex", "gpt-6.1-sol")
+            self.assertIn("agent_hub_host.provisioning", argv_codex_managed[2])
+            self.assertEqual(argv_codex_managed[3], "acc-codex")
 
         with self.assertRaises(ValueError):
             build_managed_profile_argv("claude", "do work", "acc-claude")
@@ -706,7 +731,60 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.assertIn("zai", data)
         self.assertEqual(captured_env.get("ZAI_API_KEY"), "tok-acc1")
         self.assertEqual(captured_env.get("HOME"), str(dest / "home"))
+        self.assertEqual(captured_env.get("USERPROFILE"), str(dest / "home"))
+        self.assertEqual(captured_env.get("APPDATA"), str(dest / "home" / "AppData" / "Roaming"))
+        self.assertEqual(captured_env.get("LOCALAPPDATA"), str(dest / "home" / "AppData" / "Local"))
         self.assertEqual(captured_env.get("ZCODE_HOME"), str(dest / "home" / ".zcode"))
+        self.assertEqual(captured_env.get("CODEX_HOME"), str(dest / "home" / ".zcodex"))
+        self.assertEqual(captured_env.get("CLAUDE_CONFIG_DIR"), str(dest / "home" / ".claude"))
+
+    def test_fetch_quse_two_same_provider_profiles_isolated(self):
+        from launcher.admission import fetch_quse
+        managed_dir = Path(self.dir) / "managed-engines-multi"
+        for label, key in (("accA", "tokA"), ("accB", "tokB")):
+            dest = managed_dir / f"{label}-rev1"
+            dest.mkdir(parents=True)
+            (dest / "home").mkdir()
+            bundle = {
+                "label": label,
+                "provider": "codex",
+                "version": "1.0.0",
+                "revision": "rev1",
+                "files": {},
+                "env": {"CODEX_API_KEY": key},
+            }
+            (dest / "bundle.json").write_text(json.dumps(bundle))
+        (managed_dir / "state.json").write_text(json.dumps([
+            {"label": "accA", "revision": "rev1", "provider": "codex"},
+            {"label": "accB", "revision": "rev1", "provider": "codex"},
+        ]))
+
+        envs = {}
+        fake_quse_out = json.dumps({"codex": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}}}})
+
+        def fake_subprocess_run(cmd, env=None, **kwargs):
+            h = env.get("HOME", "")
+            label = "accA" if "accA" in h else "accB"
+            envs[label] = dict(env or {})
+            class FakeRes:
+                returncode = 0
+                stdout = fake_quse_out
+            return FakeRes()
+
+        with patch.dict(os.environ, {"AGENT_HUB_CONFIG_DIR": self.dir, "OPENAI_API_KEY": "ambient-leak-attempt"}), \
+             patch("launcher.admission.subprocess.run", side_effect=fake_subprocess_run):
+            fetch_quse(account_label="accA", provider="codex", managed_dir=managed_dir)
+            fetch_quse(account_label="accB", provider="codex", managed_dir=managed_dir)
+
+        self.assertIn("accA", envs)
+        self.assertIn("accB", envs)
+        self.assertEqual(envs["accA"].get("CODEX_API_KEY"), "tokA")
+        self.assertEqual(envs["accB"].get("CODEX_API_KEY"), "tokB")
+        self.assertNotEqual(envs["accA"]["HOME"], envs["accB"]["HOME"])
+        self.assertNotEqual(envs["accA"]["USERPROFILE"], envs["accB"]["USERPROFILE"])
+        self.assertNotEqual(envs["accA"]["CODEX_HOME"], envs["accB"]["CODEX_HOME"])
+        self.assertNotIn("OPENAI_API_KEY", envs["accA"])
+        self.assertNotIn("OPENAI_API_KEY", envs["accB"])
 
     def test_do_run_passes_managed_profile_to_aplexer(self):
         from launcher.launch import do_run

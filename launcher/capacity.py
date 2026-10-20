@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import fcntl
+from launcher.portable_lock import file_lock
 import json
 import os
 import pathlib
@@ -172,8 +172,7 @@ def record_429_event(provider: str = "zai", retry_after_sec: float = DEFAULT_COO
     lock_file, cooldown_file, _ = _state_paths(config_dir)
     now_ts = time.time()
     with open(lock_file, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
+        with file_lock(f, exclusive=True):
             current = {}
             if cooldown_file.exists():
                 try:
@@ -189,8 +188,6 @@ def record_429_event(provider: str = "zai", retry_after_sec: float = DEFAULT_COO
             tmp = cooldown_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(current, indent=2), encoding="utf-8")
             tmp.replace(cooldown_file)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def record_cooldown(provider: str = "zai", retry_after_sec: float = DEFAULT_COOLDOWN_SEC,
@@ -251,8 +248,7 @@ def check_provider_capacity(
     if provider == "zai":
         ceiling = max_cap if max_cap is not None else DEFAULT_MAX_CONCURRENT_ZAI
         with open(lock_file, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
+            with file_lock(f, exclusive=False):
                 raw_res = _load_reservations(res_file)
                 zai_res = {
                     tok: info for tok, info in raw_res.items()
@@ -281,15 +277,12 @@ def check_provider_capacity(
                     return False, reason, info
 
                 return True, None, info
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
 
     # 4. Explicit max_cap ceiling check (when max_cap is explicitly specified)
     if max_cap is not None:
         ceiling = max_cap
         with open(lock_file, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
+            with file_lock(f, exclusive=False):
                 raw_res = _load_reservations(res_file)
                 prov_res = {
                     tok: info for tok, info in raw_res.items()
@@ -313,8 +306,6 @@ def check_provider_capacity(
                     "ceiling": ceiling,
                     "headroom": max(0, ceiling - reserved_count),
                 }
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
 
     # Default for other providers (codex, antigravity, opencode)
     return True, None, {"provider": provider, "admitted": True}
@@ -340,8 +331,7 @@ def reserve_provider_slot(
         raise CooldownActive(f"{provider} reservation rejected: 429 cooldown active ({round(remaining, 1)}s remaining)")
 
     with open(lock_file, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
+        with file_lock(f, exclusive=True):
             reservations = _load_reservations(res_file)
             cleaned = {tok: info for tok, info in reservations.items() if ts < info.get("expires_at", 0)}
 
@@ -378,8 +368,6 @@ def reserve_provider_slot(
             }
             _save_reservations(res_file, cleaned)
             return token
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def release_provider_slot(
@@ -391,14 +379,11 @@ def release_provider_slot(
         return
     lock_file, _, res_file = _state_paths(config_dir)
     with open(lock_file, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
+        with file_lock(f, exclusive=True):
             reservations = _load_reservations(res_file)
             if token in reservations:
                 del reservations[token]
                 _save_reservations(res_file, reservations)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def get_active_reservations(
@@ -410,15 +395,12 @@ def get_active_reservations(
     ts = now_ts or time.time()
     lock_file, _, res_file = _state_paths(config_dir)
     with open(lock_file, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
-        try:
+        with file_lock(f, exclusive=False):
             reservations = _load_reservations(res_file)
             cleaned = {tok: info for tok, info in reservations.items() if ts < info.get("expires_at", 0)}
             if provider is not None:
                 cleaned = {tok: info for tok, info in cleaned.items() if info.get("provider") == provider}
             return cleaned
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager

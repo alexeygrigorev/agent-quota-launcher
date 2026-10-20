@@ -623,3 +623,147 @@ class TestTaskKindFit(unittest.TestCase):
                      {"kind": "video-editing"}):
             valid, _ = validate_quse(self.data, task_requirements=reqs)
             self.assertEqual(valid[0]["task_fit"], 0.0, reqs)
+
+
+class TestNativeGeminiAdmission(unittest.TestCase):
+    def setUp(self):
+        self.future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.data = {"gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future}})}
+
+    def test_gemini_native_route_default_model(self):
+        valid, _ = validate_quse(self.data, task_requirements={"provider": "gemini"})
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "gemini")
+        self.assertEqual(valid[0]["model"], "gemini-2.5-pro")
+        self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_gemini_native_supported_model_override(self):
+        for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "auto-gemini-2.5"):
+            valid, _ = validate_quse(self.data, task_requirements={"provider": "gemini", "model": model})
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(valid[0]["provider"], "gemini")
+            self.assertEqual(valid[0]["model"], model)
+            self.assertEqual(valid[0]["task_fit"], 1.0)
+
+    def test_gemini_antigravity_model_rejected_for_native_gemini(self):
+        # Antigravity models (e.g. gemini-3.8-flash-high) must NOT be accepted for native gemini
+        valid, _ = validate_quse(self.data, task_requirements={"provider": "gemini", "model": "gemini-3.8-flash-high"})
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["provider"], "gemini")
+        self.assertEqual(valid[0]["task_fit"], 0.0)
+
+    def test_task_requirements_for_malformed_input_fails_closed(self):
+        from launcher.admission import task_requirements_for
+        self.assertIsNone(task_requirements_for(None))
+        self.assertIsNone(task_requirements_for("string"))
+        self.assertIsNone(task_requirements_for([]))
+
+        for malformed in (123, "antigravity", ["a"], True):
+            reqs = task_requirements_for({"model_requirements": malformed})
+            self.assertIsNotNone(reqs)
+            valid, _ = validate_quse(self.data, task_requirements=reqs)
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(valid[0]["task_fit"], 0.0)
+
+
+class TestManagedProfileQualification(unittest.TestCase):
+    def setUp(self):
+        self.future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.data = {
+            "gemini": route({"5h": {"percent_remaining": 80.0, "reset_at": self.future}}),
+            "codex": {
+                "status": "ok",
+                "windows": {
+                    "primary": {"percent_remaining": 70.0, "reset_at": self.future},
+                    "weekly": {"percent_remaining": 70.0, "reset_at": self.future},
+                },
+            },
+        }
+
+    def test_forged_flag_does_not_manufacture_managed_authority(self):
+        from launcher.admission import task_requirements_for
+        payload = {"model_requirements": {"is_managed": True, "provider": "codex"}}
+        reqs = task_requirements_for(payload)
+        self.assertNotIn("is_managed", reqs)
+        # Without valid managed authority or wrapper, codex route is rejected
+        valid, rejections = validate_quse(self.data, task_requirements=reqs)
+        codex_routes = [r for r in valid if r["provider"] == "codex"]
+        self.assertEqual(len(codex_routes), 0)
+
+    def test_missing_account_label_rejected(self):
+        from launcher.admission import task_requirements_for
+        payload = {"profile": "hub-alpha", "model_requirements": {"provider": "codex"}}
+        reqs = task_requirements_for(payload)
+        self.assertIn("managed_rejected", reqs)
+        valid, _ = validate_quse(self.data, task_requirements=reqs)
+        self.assertEqual(len(valid), 0)
+
+    def test_label_profile_mismatch_rejected(self):
+        from launcher.admission import task_requirements_for
+        payload = {
+            "account_label": "alpha",
+            "account_profile": "hub-beta",
+            "model_requirements": {"provider": "codex"},
+        }
+        reqs = task_requirements_for(payload)
+        self.assertIn("managed_rejected", reqs)
+        valid, _ = validate_quse(self.data, task_requirements=reqs)
+        self.assertEqual(len(valid), 0)
+
+    def test_removed_or_stale_bundle_rejected(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.admission import task_requirements_for
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            # state.json without matching account or bundle missing
+            (tmp_p / "state.json").write_text(json.dumps([{"label": "other", "revision": "rev1"}]))
+            payload = {
+                "account_label": "alpha",
+                "account_profile": "hub-alpha",
+                "managed_dir": str(tmp_p),
+                "model_requirements": {"provider": "codex"},
+            }
+            reqs = task_requirements_for(payload)
+            self.assertIn("managed_rejected", reqs)
+            valid, _ = validate_quse(self.data, task_requirements=reqs)
+            self.assertEqual(len(valid), 0)
+
+    def test_legacy_shared_gemini_unchanged(self):
+        from launcher.admission import task_requirements_for
+        payload = {"profile": "shared-gemini", "model_requirements": {"provider": "gemini"}}
+        reqs = task_requirements_for(payload)
+        self.assertNotIn("is_managed", reqs or {})
+        self.assertNotIn("managed_rejected", reqs or {})
+        valid, _ = validate_quse(self.data, task_requirements=reqs)
+        gemini_routes = [r for r in valid if r["provider"] == "gemini"]
+        self.assertEqual(len(gemini_routes), 1)
+        self.assertEqual(gemini_routes[0]["task_fit"], 1.0)
+
+    def test_valid_managed_profile_qualified(self):
+        import tempfile, json
+        from pathlib import Path
+        from launcher.admission import task_requirements_for
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            (tmp_p / "state.json").write_text(json.dumps([{"label": "alpha", "revision": "rev1", "provider": "codex"}]))
+            bundle_dir = tmp_p / "alpha-rev1"
+            bundle_dir.mkdir()
+            (bundle_dir / "bundle.json").write_text(json.dumps({"label": "alpha", "revision": "rev1", "provider": "codex"}))
+
+            payload = {
+                "account_label": "alpha",
+                "account_profile": "hub-alpha",
+                "managed_dir": str(tmp_p),
+                "model_requirements": {"provider": "codex"},
+            }
+            reqs = task_requirements_for(payload)
+            self.assertTrue(reqs.get("is_managed"))
+            self.assertEqual(reqs.get("account_label"), "alpha")
+            self.assertEqual(reqs.get("account_profile"), "hub-alpha")
+
+            valid, _ = validate_quse(self.data, task_requirements=reqs)
+            codex_routes = [r for r in valid if r["provider"] == "codex"]
+            self.assertEqual(len(codex_routes), 1)
+
+

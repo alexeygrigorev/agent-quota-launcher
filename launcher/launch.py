@@ -36,6 +36,7 @@ from launcher.admission import (
     fetch_quse,
     validate_quse,
     is_managed_profile_payload,
+    task_requirements_for,
     PROMO_MULTIPLIER,
     PROMO_CUTOFF_UTC,
 )
@@ -145,6 +146,10 @@ ADAPTERS = {
                  OPENCODE_MODEL],
         "env": {},
     },
+    "gemini": {
+        "argv": ["/home/alexey/.local/bin/gemini", "-p"],
+        "env": {},
+    },
 }
 
 # The native whoami is RICH (id, tag, workspace, engine, command, phase,
@@ -217,11 +222,6 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
     script = context + f"import sys; sys.path.insert(0, {hub_path!r}); from agent_hub_host.provisioning import execute; execute()"
     cmd = [sys.executable, "-c", script, label]
     if provider in ("codex", "openai"):
-        wrapper = get_codex_wrapper()
-        if not wrapper:
-            raise ValueError(
-                "Unsupported provider: codex (genuine protected wrapper scripts/launch-codex.sh not configured; raw routing denied)"
-            )
         args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"]
         if model:
             args += ["--model", str(model)]
@@ -232,7 +232,10 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
         return cmd + ["exec", "--model", str(m), "-s", "workspace-write", "-c", "check_for_update_on_startup=false", "--json", str(goal)]
     elif provider in ("go", "opencode"):
         m = model or "opencode-go/muse-spark-1.3-contributor"
-        return cmd + ["run", "--pure", "--auto", "--model", str(m), str(goal)]
+        return cmd + ["run", "--standalone", "--auto", "--model", str(m), str(goal)]
+    elif provider in ("gemini", "google"):
+        m = model or "gemini-2.5-pro"
+        return cmd + ["-m", str(m), "--approval-mode", "yolo", "-p", str(goal)]
     else:
         raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
@@ -263,6 +266,10 @@ def build_adapter_argv(provider, goal, model=None):
     adapter = ADAPTERS.get(provider)
     if not adapter:
         raise ValueError(f"Unsupported provider: {provider}")
+    if provider == "gemini":
+        gemini_bin = os.environ.get("GEMINI_BIN", "/home/alexey/.local/bin/gemini")
+        m = model or "gemini-2.5-pro"
+        return [gemini_bin, "-m", str(m), "-p", str(goal)]
     if provider == "zai":
         node, cjs, zbin = validate_zai_runtime()
         argv = [
@@ -470,9 +477,29 @@ def native_status(tag, timeout=15):
 
 def _kill_process_group(proc, grace=10.0):
     """Terminate then kill the child's whole process group."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
+            proc.wait(timeout=grace)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+
     try:
         pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
+    except (ProcessLookupError, AttributeError):
+        try:
+            proc.terminate()
+            proc.wait(timeout=grace)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return
     try:
         os.killpg(pgid, signal.SIGTERM)
@@ -600,8 +627,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     managed_dir = payload.get("managed_dir") if is_managed else None
     quse_data = fetch_quse(account_label=account_label, config_dir=config_dir, managed_dir=managed_dir)
     record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    task_reqs = task_requirements_for(payload)
     valid_routes, rejections = validate_quse(
-        quse_data, task_requirements=payload.get("model_requirements"), config_dir=config_dir)
+        quse_data, task_requirements=task_reqs, config_dir=config_dir)
     record["rejections"] = rejections
 
     if not valid_routes:
@@ -632,11 +660,11 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
 
-    # First-action artifact path (also recorded below): the opencode child
+    # First-action artifact path (also recorded below): the child
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     goal = payload.get("goal", "")
-    if provider in {"opencode", "antigravity", "zai"}:
+    if provider in {"opencode", "antigravity", "zai", "gemini"} or (provider == "codex" and is_managed):
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
     cmd = [
@@ -664,7 +692,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     # Antigravity has its own native lifecycle policy; Gemini is a distinct
     # engine even when the model name begins with gemini. Existing bindings
     # retain the engine recorded at their original birth.
-    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex"}.get(provider)
+    native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex", "gemini": "gemini"}.get(provider)
     if native_engine and not account_profile:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode":

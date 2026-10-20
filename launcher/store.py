@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import os
-import fcntl
+from launcher.portable_lock import file_lock
 import subprocess
 from pathlib import Path
 from contextlib import contextmanager
@@ -84,12 +84,9 @@ def host_fencing_lock():
     fencing_dir = get_host_fencing_dir()
     fencing_dir.mkdir(parents=True, exist_ok=True)
     lock_path = fencing_dir / "host_registry.lock"
-    with open(lock_path, 'w') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
+    with open(lock_path, 'a') as f:
+        with file_lock(f, exclusive=True):
             yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 @contextmanager
 def get_host_registry_conn():
@@ -408,16 +405,35 @@ class Store:
                         raise ValueError(
                             f"Binding workspace {validated['workspace']!r} does not match task cwd {str(Path(expected_cwd).resolve())!r}"
                         )
-                expected_engine = payload.get("engine")
-                if not expected_engine:
-                    prov = payload.get("provider")
-                    if prov == "antigravity":
-                        expected_engine = "gemini"
-                    elif prov == "opencode":
-                        expected_engine = "opencode"
-                if expected_engine and validated["engine"] != expected_engine:
+                prov = payload.get("provider")
+                is_managed = (
+                    payload.get("account_profile")
+                    or payload.get("provider_profile")
+                    or (isinstance(payload.get("profile"), str) and payload.get("profile").startswith("hub-"))
+                    or payload.get("is_managed")
+                )
+                if prov == "antigravity":
+                    valid_engines = ("antigravity",)
+                elif prov == "gemini":
+                    valid_engines = ("gemini",)
+                elif prov == "opencode":
+                    valid_engines = ("opencode",)
+                elif prov == "zai":
+                    valid_engines = ("codex",) if is_managed else ("zcodex",)
+                elif prov == "codex":
+                    valid_engines = ("codex",)
+                else:
+                    valid_engines = (payload.get("engine"),) if payload.get("engine") else ()
+
+                requested_engine = payload.get("engine")
+                if requested_engine and valid_engines and requested_engine not in valid_engines:
                     raise ValueError(
-                        f"Binding engine {validated['engine']!r} does not match expected engine {expected_engine!r}"
+                        f"Requested engine {requested_engine!r} mismatches provider {prov!r} (expected {valid_engines[0]!r})"
+                    )
+
+                if valid_engines and validated["engine"] not in valid_engines:
+                    raise ValueError(
+                        f"Binding engine {validated['engine']!r} does not match expected engine {valid_engines[0]!r}"
                     )
 
         with self.transaction() as conn:
@@ -805,9 +821,6 @@ class Store:
 def launch_lock(lock_path):
     p = Path(lock_path).resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, 'w') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
+    with open(p, 'a') as f:
+        with file_lock(f, exclusive=True):
             yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)

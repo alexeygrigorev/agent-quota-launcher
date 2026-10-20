@@ -10,9 +10,12 @@ class TestStore(unittest.TestCase):
     def setUp(self):
         self.fd, self.db_path = tempfile.mkstemp()
         os.close(self.fd)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.dir = self.temp_dir.name
         self.store = Store(self.db_path)
 
     def tearDown(self):
+        self.temp_dir.cleanup()
         os.remove(self.db_path)
 
     def test_submit_idempotent(self):
@@ -134,6 +137,58 @@ class TestStore(unittest.TestCase):
         self.store.transition_task("t1", "completed-awaiting-review", ("running",))
         mem2, _ = self.store.get_active_resources()
         self.assertEqual(mem2, 0)  # RAM/disk released after confirmed completion
+
+    def test_record_native_binding_provider_engine_expectations(self):
+        valid_uuid = "11111111-2222-4333-8444-555555555555"
+        cwd = str(Path(self.dir).resolve())
+
+        # 1. Antigravity requires antigravity, rejects gemini
+        self.store.submit_task("t-anti", "k-anti", {"owner": "me", "cwd": cwd, "timeout": 60, "provider": "antigravity"}, [])
+        with self.assertRaises(ValueError) as ctx:
+            self.store.record_native_binding("t-anti", valid_uuid, "task-t-anti", cwd, "gemini", 1000)
+        self.assertIn("does not match expected engine 'antigravity'", str(ctx.exception))
+        # Positive antigravity
+        self.store.record_native_binding("t-anti", valid_uuid, "task-t-anti", cwd, "antigravity", 1000)
+
+        # 2. Gemini requires gemini, rejects antigravity
+        valid_uuid_2 = "22222222-3333-4444-8555-666666666666"
+        self.store.submit_task("t-gem", "k-gem", {"owner": "me", "cwd": cwd, "timeout": 60, "provider": "gemini"}, [])
+        with self.assertRaises(ValueError) as ctx:
+            self.store.record_native_binding("t-gem", valid_uuid_2, "task-t-gem", cwd, "antigravity", 1000)
+        self.assertIn("does not match expected engine 'gemini'", str(ctx.exception))
+        self.store.record_native_binding("t-gem", valid_uuid_2, "task-t-gem", cwd, "gemini", 1000)
+
+        # 3. Managed Zai requires codex, rejects zcodex
+        valid_uuid_3 = "33333333-4444-4555-8666-777777777777"
+        self.store.submit_task("t-zai-m", "k-zai-m", {"owner": "me", "cwd": cwd, "timeout": 60, "provider": "zai", "account_profile": "hub-acc1"}, [])
+        with self.assertRaises(ValueError) as ctx:
+            self.store.record_native_binding("t-zai-m", valid_uuid_3, "task-t-zai-m", cwd, "zcodex", 1000)
+        self.assertIn("does not match expected engine 'codex'", str(ctx.exception))
+        self.store.record_native_binding("t-zai-m", valid_uuid_3, "task-t-zai-m", cwd, "codex", 1000)
+
+        # 4. Unprofiled Zai requires zcodex, rejects codex
+        valid_uuid_4 = "44444444-5555-4666-8777-888888888888"
+        self.store.submit_task("t-zai-u", "k-zai-u", {"owner": "me", "cwd": cwd, "timeout": 60, "provider": "zai"}, [])
+        with self.assertRaises(ValueError) as ctx:
+            self.store.record_native_binding("t-zai-u", valid_uuid_4, "task-t-zai-u", cwd, "codex", 1000)
+        self.assertIn("does not match expected engine 'zcodex'", str(ctx.exception))
+        self.store.record_native_binding("t-zai-u", valid_uuid_4, "task-t-zai-u", cwd, "zcodex", 1000)
+
+    def test_simulated_no_fcntl_portable_lock(self):
+        from unittest.mock import patch
+        import launcher.portable_lock as pl
+        with patch.object(pl, "fcntl", None):
+            # Test that file_lock fails cleanly or works with msvcrt
+            test_file = Path(self.dir) / "test.lock"
+            with open(test_file, "a") as f:
+                if pl.msvcrt is not None:
+                    with pl.file_lock(f):
+                        pass
+                else:
+                    with self.assertRaises(RuntimeError):
+                        with pl.file_lock(f):
+                            pass
+
 
 if __name__ == '__main__':
     unittest.main()
