@@ -1913,7 +1913,7 @@ class TestActualTaskUnitProviderBinding(unittest.TestCase):
         if provider == "claude":
             return ["/usr/bin/env", "-u", "APLEXER_SESSION_ID", "/usr/bin/claude",
                     "-p", "--model", "sonnet", "review prompt"]
-        return ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL,
+        return ["/usr/bin/opencode", "run", "--standalone", "--auto", "--model", GO_MODEL,
                 "--format", "json", "review prompt"]
 
     def packet(self, provider, percent=45):

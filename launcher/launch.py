@@ -14,8 +14,8 @@ launch lifecycle. Provider argv sets are exactly:
                check_for_update_on_startup=false --json <goal>
                with ZCODE_NODE and ZCODE_CJS runtime pins propagated via argv and env
 - opencode:    /home/alexey/.nvm/versions/node/v24.13.1/bin/opencode run
-               --pure --auto --model opencode-go/muse-spark-1.3-contributor
-               <goal>  (installed 1.18.31; quse key go maps here; prompt is a
+               --standalone --auto --model opencode-go/muse-spark-1.3-contributor
+               <goal>  (installed 2.0.32; quse key go maps here; prompt is a
                separate argv element, never shell-interpolated; engine opencode)
 
 Codex is unsupported in v0.1 (protected wrapper scripts/launch-codex.sh not
@@ -143,7 +143,7 @@ ADAPTERS = {
         "env": {"ZCODE_CJS": ZCODE_CJS, "ZCODE_NODE": ZCODE_NODE},
     },
     "opencode": {
-        "argv": [OPENCODE_BIN, "run", "--pure", "--auto", "--model",
+        "argv": [OPENCODE_BIN, "run", "--standalone", "--auto", "--model",
                  OPENCODE_MODEL],
         "env": {},
     },

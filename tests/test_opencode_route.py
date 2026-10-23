@@ -86,7 +86,7 @@ class TestOpencodeAdapter(unittest.TestCase):
         with patch("launcher.launch.validate_opencode_runtime", return_value=OPENCODE_BIN):
             argv = build_adapter_argv("opencode", "do the brief thing $(not interpolated)")
         self.assertEqual(argv, [
-            OPENCODE_BIN, "run", "--pure", "--auto", "--model", OPENCODE_MODEL,
+            OPENCODE_BIN, "run", "--standalone", "--auto", "--model", OPENCODE_MODEL,
             "do the brief thing $(not interpolated)",
         ])
         self.assertEqual(argv[0], "/home/alexey/.nvm/versions/node/v24.13.1/bin/opencode")
@@ -202,7 +202,7 @@ class TestOpencodeDoRunWiring(unittest.TestCase):
             self.assertIn("--", cmd)
             tail = cmd[cmd.index("--") + 1:]
             self.assertEqual(tail[:6],
-                             [OPENCODE_BIN, "run", "--pure", "--auto",
+                             [OPENCODE_BIN, "run", "--standalone", "--auto",
                               "--model", OPENCODE_MODEL])
             # Arbitrary brief stays verbatim at the head; the first-action
             # instruction (with the exact artifact path) is appended so the

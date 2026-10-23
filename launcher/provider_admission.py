@@ -126,9 +126,9 @@ def identify_command(command_argv, provider=None, model=None):
         if len(argv) < 2 or argv[1] != "run":
             raise ValueError("OpenCode requires explicit run mode")
         options = _native_options(argv[2:], {"--model", "--format", "--dir", "--title"},
-                                  {"--pure", "--auto"})
+                                  {"--standalone", "--auto"})
         if (options["--model"] != GO_MODEL
-                or options.get("--pure") is not True or options.get("--auto") is not True):
+                or options.get("--standalone") is not True or options.get("--auto") is not True):
             raise ValueError("unsupported OpenCode provider/model or run mode")
         actual = CommandIdentity("opencode", GO_MODEL)
     elif _installed_executable(argv[0], "codex", True):

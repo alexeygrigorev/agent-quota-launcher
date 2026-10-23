@@ -42,7 +42,7 @@ def model_command(provider):
     if provider == "claude":
         return ["/usr/bin/claude", "-p", "--model", "sonnet", "prompt"]
     if provider == "opencode":
-        return ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL, "prompt"]
+        return ["/usr/bin/opencode", "run", "--standalone", "--auto", "--model", GO_MODEL, "prompt"]
     if provider == "codex":
         return ["/usr/bin/codex", "exec", "prompt"]
     from launcher.launch import ADAPTERS
@@ -92,7 +92,7 @@ class CommandBindingTests(unittest.TestCase):
             self.assertEqual(identify_command(cmd, "claude", model).model, model)
 
     def test_go_explicit_route_only(self):
-        cmd = ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL,
+        cmd = ["/usr/bin/opencode", "run", "--standalone", "--auto", "--model", GO_MODEL,
                "--format", "json", "--dir", "/work", "--title", "task", "prompt"]
         for provider in (None, "go", "opencode", "opencode-go"):
             self.assertEqual(identify_command(cmd, provider), CommandIdentity("opencode", GO_MODEL))
@@ -110,9 +110,10 @@ class CommandBindingTests(unittest.TestCase):
             ["/usr/bin/claude", "--model", "sonnet", "prompt"],
             ["/usr/bin/claude", "-p", "--model", "sonnet", "--fallback-model", "opus", "prompt"],
             ["/usr/bin/claude", "-p", "--model", "sonnet", "--settings", "rogue.json", "prompt"],
-            ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", "zai/glm-5.3-flash", "prompt"],
+            ["/usr/bin/opencode", "run", "--standalone", "--auto", "--model", "zai/glm-5.3-flash", "prompt"],
             ["/usr/bin/opencode", "run", "--auto", "--model", GO_MODEL, "prompt"],
-            ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL,
+            ["/usr/bin/opencode", "run", "--pure", "--auto", "--model", GO_MODEL, "prompt"],
+            ["/usr/bin/opencode", "run", "--standalone", "--auto", "--model", GO_MODEL,
              "--model", GO_MODEL, "prompt"],
         ]
         for cmd in bad:
@@ -124,7 +125,7 @@ class CommandBindingTests(unittest.TestCase):
                "--model opus"]
         with self.assertRaises(ValueError):
             identify_command(cmd)
-        cmd = ["/usr/bin/opencode", "run", "--pure", "--auto", "--title", "--model",
+        cmd = ["/usr/bin/opencode", "run", "--standalone", "--auto", "--title", "--model",
                GO_MODEL, "prompt"]
         with self.assertRaises(ValueError):
             identify_command(cmd)
