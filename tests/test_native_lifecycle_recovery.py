@@ -398,7 +398,7 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
                 }),
                 "",
             )
-            mem, disk = self.store.get_active_resources()
+            mem, disk = self.store.get_active_resources(dry_run=True)
             self.assertEqual(mem, 0)
             self.assertEqual(disk, 0)
 
@@ -418,7 +418,7 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
                 }),
                 "",
             )
-            mem, disk = self.store.get_active_resources()
+            mem, disk = self.store.get_active_resources(dry_run=True)
             self.assertEqual((mem, disk), (1500, 512))
 
         # Case 3: containment_empty is string "false" or "true" -> cannot release!
@@ -438,7 +438,7 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
                     }),
                     "",
                 )
-                mem, disk = self.store.get_active_resources()
+                mem, disk = self.store.get_active_resources(dry_run=True)
                 self.assertEqual((mem, disk), (1500, 512))
 
     def test_live_oracle_mismatches_retain_reservation(self):
@@ -502,8 +502,8 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
             self.assertEqual(mem, 0)
             self.assertEqual(disk, 0)
 
-        # Task in DB remains running (state not mutated by pure resource projection)
-        self.assertEqual(self.store.get_task("t-hub")["state"], "running")
+        # Confirmed death is now settled, without fabricating acceptance.
+        self.assertEqual(self.store.get_task("t-hub")["state"], "failed")
 
     def test_boundary_mismatched_uuid_retains_reservation(self):
         self._write_tombstone(VALID_UUID, {
@@ -682,7 +682,8 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
             mem1, _ = self.store.get_active_resources()
             self.assertEqual(mem1, 0)
 
-            self.store.transition_task("t-hub", "completed-awaiting-review", ("running",))
+            with self.assertRaises(ValueError):
+                self.store.transition_task("t-hub", "completed-awaiting-review", ("running",))
             mem2, _ = self.store.get_active_resources()
             self.assertEqual(mem2, 0)
 

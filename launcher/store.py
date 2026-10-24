@@ -648,7 +648,7 @@ class Store:
         except Exception:
             return None
 
-    def get_active_resources(self, exclude_task_id=None):
+    def get_active_resources(self, exclude_task_id=None, *, dry_run=False, reconciliation=None):
         """Sum outstanding RAM growth and disk reservations.
 
         exclude_task_id removes the launching task's own reservation. Exact
@@ -690,7 +690,7 @@ class Store:
                 continue
 
             binding = self.get_native_binding(task_id)
-            if not binding and raw_payload:
+            if not binding and raw_payload and not dry_run:
                 try:
                     payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
                     binding = self.recover_binding_from_artifacts(task_id, payload)
@@ -701,7 +701,24 @@ class Store:
                 live_info = {}
                 status, detail = probe_native_lifecycle(binding, live_info=live_info)
                 if status in ("dead", "retired-finished"):
-                    # Proven exit releases process RAM/disk reservation
+                    # Persist confirmed death as well as releasing accounting.
+                    # No result/reviewer evidence is manufactured by a resource scan.
+                    if reconciliation is not None:
+                        reconciliation.append({"task_id": task_id, "native_id": binding["native_id"],
+                                               "previous_state": state, "native_status": status, "memory_mb": mem or 0})
+                    if not dry_run:
+                        evidence = False
+                        for path in self.get_task_paths(task_id):
+                            try:
+                                evidence |= Path(path).is_file() and Path(path).stat().st_size > 0
+                            except OSError:
+                                pass
+                        try:
+                            self.transition_task(task_id, "completed-awaiting-review" if evidence else "failed", (state,),
+                                reason="resource reconciliation: confirmed native exit; no acceptance inferred",
+                                reviewer="resource-reconciler")
+                        except StateTransitionError:
+                            pass  # A concurrent lifecycle writer owns the newer state.
                     continue
                 else:
                     # MemAvailable already excludes verified resident anonymous

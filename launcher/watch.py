@@ -219,6 +219,7 @@ def _reconcile(store, config_dir=None):
     if config_dir is None and hasattr(store, "db_path") and store.db_path != ":memory:":
         config_dir = Path(store.db_path).parent
 
+    store.get_active_resources()  # Also settle confirmed exits of running tasks.
     reconciled = []
     with store.get_conn() as conn:
         cursor = conn.execute(

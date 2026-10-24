@@ -691,6 +691,31 @@ def fail(args):
     return 0
 
 
+def resource_status(args):
+    """Reconcile without dispatch or process control; dry-run never transitions tasks."""
+    from launcher.resources import get_mem_available
+    store = get_store(args)
+    changes = []
+    memory, disk = store.get_active_resources(dry_run=args.dry_run, reconciliation=changes)
+    available = get_mem_available() // (1024 * 1024)
+    from launcher.store import RESOURCE_HOLDING_STATES
+    with store.get_conn() as conn:
+        slots = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
+        count, reserved = conn.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(r.memory_mb),0) FROM tasks t JOIN task_resources r ON r.task_id=t.id WHERE t.state IN ({slots})",
+            RESOURCE_HOLDING_STATES).fetchone()
+    if args.dry_run:
+        count -= len(changes)
+        reserved -= sum(r["memory_mb"] for r in changes)
+    print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
+                      "active_tasks": count, "reservation_mem_mb": reserved,
+                      "mem_available_mb": available,
+                      "launch_allowed": available - memory - 1500 >= 10240,
+                      "reason": None if available - memory - 1500 >= 10240 else "launcher_memory_reserve",
+                      "dry_run": args.dry_run, "reconciled": changes}))
+    return 0
+
+
 def reconcile(args):
     """Targeted reconciliation of a specific task or session without dispatching queued work."""
     store = get_store(args)
@@ -741,7 +766,7 @@ def reconcile(args):
                     state = "completed-awaiting-review"
                 except StateTransitionError:
                     pass
-        elif state in ("starting", "stalled", "launch-uncertain"):
+        elif state in ("running", "starting", "stalled", "launch-uncertain"):
             try:
                 store.transition_task(
                     task_id,
@@ -1107,6 +1132,10 @@ def main():
     parser_fail.add_argument("--reviewer", required=True)
     parser_fail.add_argument("--reason", required=True)
     parser_fail.set_defaults(func=fail)
+
+    parser_resources = subparsers.add_parser("resource-status", help="Reconcile reservations without launching or stopping sessions")
+    parser_resources.add_argument("--dry-run", action="store_true")
+    parser_resources.set_defaults(func=resource_status)
 
     parser_reconcile = subparsers.add_parser(
         "reconcile",
