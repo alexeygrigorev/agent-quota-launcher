@@ -42,6 +42,11 @@ python3 -m launcher --config-dir .local/launcher-config report [--jsonl] [--proj
 python3 -m launcher --config-dir .local/launcher-config watch \
     --cwd /repo --tmpdir /repo/.local/tmp [--interval 10] [--once]
 
+# Reconcile resource leases without starting or stopping any native session.
+# Back up state.db with SQLite backup before the first repair; preview first.
+python3 -m launcher --config-dir .local/launcher-config resource-status --dry-run
+python3 -m launcher --config-dir .local/launcher-config resource-status
+
 # Lifecycle completions are guarded and require a reviewer identity
 python3 -m launcher --config-dir .local/launcher-config complete --id task-123 --reviewer head-x
 python3 -m launcher --config-dir .local/launcher-config accept   --id task-123 --reviewer head-x

@@ -185,3 +185,28 @@ class ResidentReservationsTests(unittest.TestCase):
             with patch("launcher.resources.get_mem_available", return_value=available - 1):
                 with self.assertRaisesRegex(ValueError, "10GiB"):
                     check_resources(**kwargs)
+
+    def test_dead_running_dry_run_and_idempotent_settlement(self):
+        store = self.store()
+        store.transition_task("t1", "running", ("queued",))
+        with patch("launcher.store.probe_native_lifecycle", return_value=("retired-finished", "exact proof")):
+            changes = []
+            self.assertEqual(store.get_active_resources(dry_run=True, reconciliation=changes), (0, 0))
+            self.assertEqual(len(changes), 1)
+            self.assertEqual(store.get_task("t1")["state"], "running")
+            self.assertEqual(store.get_active_resources(), (0, 0))
+            self.assertEqual(store.get_task("t1")["state"], "failed")
+            self.assertEqual(store.get_active_resources(), (0, 0))
+
+    def test_stop_fail_uncertain_release_only_on_positive_death(self):
+        store = self.store()
+        for state in ("running", "starting", "launch-uncertain", "stalled"):
+            with store.get_conn() as conn:
+                conn.execute("UPDATE tasks SET state=? WHERE id='t1'", (state,))
+            for native in ("alive", "unknown"):
+                with patch("launcher.store.probe_native_lifecycle", return_value=(native, "probe")), patch("launcher.store.resident_credit_mb", return_value=0):
+                    self.assertEqual(store.get_active_resources(), (1500, 512))
+                    self.assertEqual(store.get_task("t1")["state"], state)
+            with patch("launcher.store.probe_native_lifecycle", return_value=("dead", "confirmed stop")):
+                self.assertEqual(store.get_active_resources(), (0, 0))
+                self.assertEqual(store.get_task("t1")["state"], "failed")
