@@ -514,7 +514,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         select.return_value = ({"provider": "antigravity", "model": "gemini-3.8-flash-high"}, {})
         proc = popen.return_value
         proc.returncode = 0
-        proc.communicate.return_value = (json.dumps({"id": "real-native", "tag": "task-t1", "workspace": self.dir}), "")
+        proc.communicate.return_value = (json.dumps({"id": "real-native", "tag": "task-t1", "workspace": self.dir, "command": ["native", "--model", select.return_value[0]["model"]]}), "")
         from launcher.launch import do_run
         self.assertEqual(do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path), 0)
         argv = popen.call_args.args[0]
@@ -537,7 +537,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         select.return_value = ({"provider": "zai", "model": "glm-5.3-flash"}, {})
         proc = popen.return_value
         proc.returncode = 0
-        proc.communicate.return_value = (json.dumps({"id": "real-native", "tag": "task-t1", "workspace": self.dir}), "")
+        proc.communicate.return_value = (json.dumps({"id": "real-native", "tag": "task-t1", "workspace": self.dir, "command": ["native", "--model", select.return_value[0]["model"]]}), "")
         from launcher.launch import do_run
         self.assertEqual(do_run(str(self.db_path), self.task_id, self.dir, None, self.lock_path), 0)
         argv = popen.call_args.args[0]
@@ -838,7 +838,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
                     "tag": f"task-{task_id}",
                     "workspace": test_dir,
                     "engine": "opencode",
-                    "command": "python3",
+                    "command": ["native", "--model", "opencode-go/muse-spark-1.3-contributor"],
                     "phase": "running",
                     "worker_pid": 12345,
                     "created_at_ms": 1000000,
@@ -859,7 +859,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
             "tag": f"task-{task_id}",
             "workspace": str(Path(self.dir).resolve()),
             "engine": "opencode",
-            "command": "python3",
+            "command": ["native", "--model", "opencode-go/muse-spark-1.3-contributor"],
             "phase": "running",
             "worker_pid": 12345,
             "created_at_ms": 1000000,
@@ -978,7 +978,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
              patch("launcher.launch.subprocess.Popen") as mock_popen:
             mock_proc = MagicMock()
             mock_proc.returncode = 0
-            mock_proc.communicate.return_value = (json.dumps({"id": "sess-1", "tag": f"task-{managed_task_id}", "workspace": self.dir}), "")
+            mock_proc.communicate.return_value = (json.dumps({"id": "sess-1", "tag": f"task-{managed_task_id}", "workspace": self.dir, "command": ["native", "--model", "opencode-go/muse-spark-1.3-contributor"]}), "")
             mock_popen.return_value = mock_proc
 
             fa_path = Path(self.dir) / ".local" / f"first-action-{managed_task_id}.json"
@@ -989,7 +989,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
                 "tag": f"task-{managed_task_id}",
                 "workspace": str(Path(self.dir).resolve()),
                 "engine": "opencode",
-                "command": "python3",
+                "command": ["native", "--model", "opencode-go/muse-spark-1.3-contributor"],
                 "phase": "running",
                 "worker_pid": 12345,
                 "created_at_ms": 1000000,

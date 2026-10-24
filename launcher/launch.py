@@ -248,6 +248,15 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
         raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
 
+def native_command_model(command):
+    """Only an explicit, unambiguous native command model is evidence."""
+    if not isinstance(command, list) or any(not isinstance(x, str) for x in command):
+        return None
+    models = [command[i + 1] for i, flag in enumerate(command[:-1]) if flag in ("--model", "-m")]
+    models += [x.split("=", 1)[1] for x in command if x.startswith("--model=")]
+    return models[0] if models and len(set(models)) == 1 else None
+
+
 def build_adapter_argv(provider, goal, model=None):
     if provider == "claude":
         raise ValueError("Claude provider requires managed profile")
@@ -818,6 +827,15 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
             record["native_binding_error"] = str(e)
     else:
         record["native_binding_unbound_reason"] = "missing or invalid required observed start fields"
+
+    record["observed_model"] = native_command_model(start_json.get("command"))
+    record["model_verified"] = record["observed_model"] == record["requested_model"]
+    if not record["model_verified"]:
+        record["outcome"] = "launch-uncertain"
+        record["reason"] = "model_mismatch: native command does not prove requested model"
+        _write_launch_record(cwd, record)
+        store.transition_task(task_id, "launch-uncertain", ("starting",), reason=record["reason"])
+        return 1
 
     # --- first-action wait happens OUTSIDE the launch lock ---
     record["first_action_path"] = str(fa_path)

@@ -31,6 +31,7 @@ ADAPTER_SUPPORTED_MODELS = {
     "grok": ("grok-4.6",),
     "antigravity": ("gemini-3.8-flash-high", "gemini-4-argon-high"),
     "gemini": (
+        "gemini-4-argon-high",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
