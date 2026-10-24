@@ -19,7 +19,7 @@ MAX_TOMBSTONE_BYTES = 65536
 MAX_ARTIFACT_JSON_BYTES = 1048576
 
 ACTIVE_PHASES = ("running", "starting", "working", "launching")
-TERMINAL_PHASES = ("exited", "dead", "failed", "completed", "finished")
+TERMINAL_PHASES = ("exiting", "exited", "dead", "failed", "completed", "finished")
 
 FORBIDDEN_DETAIL_KEYS = {
     "env", "argv", "prompt", "start_json", "command", "raw_env",
@@ -223,6 +223,10 @@ def verify_tombstone(
     if not isinstance(t_ws, str) or not t_ws.strip() or not os.path.isabs(t_ws.strip()):
         return False, f"tombstone workspace is missing or not absolute: {t_ws!r}"
     t_ws_clean = t_ws.strip()
+    # Linux /proc cwd appends this exact suffix after worktree removal.
+    # Only normalize against the persisted workspace, never another path.
+    if t_ws_clean == expected_workspace + " (deleted)":
+        t_ws_clean = expected_workspace
     try:
         if Path(t_ws_clean).resolve() != Path(expected_workspace).resolve():
             return False, f"workspace mismatch: tombstone={t_ws_clean!r}, expected={expected_workspace!r}"

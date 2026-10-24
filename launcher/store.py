@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from contextlib import contextmanager
 import re
+import time
+import math
 
 from launcher.memory_accounting import resident_credit_mb
 from launcher.tags import run_tag_for
@@ -33,6 +35,15 @@ CREATE TABLE IF NOT EXISTS task_resources (
     memory_mb INTEGER,
     disk_mb INTEGER,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_samples (
+    task_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    incarnation INTEGER NOT NULL,
+    bucket INTEGER NOT NULL,
+    resident_mb INTEGER NOT NULL,
+    PRIMARY KEY(task_id, native_id, incarnation, bucket)
 );
 
 CREATE TABLE IF NOT EXISTS task_native_bindings (
@@ -648,12 +659,36 @@ class Store:
         except Exception:
             return None
 
+    def _growth_margin(self, task_id, binding, resident, limit, dry_run=False):
+        """MemAvailable already accounts for resident usage; reserve only growth.
+
+        Keep 15 minutes of exact-incarnation samples (one maximum per 30s).
+        Reserve p95 minus current usage plus 25% of p95, bounded to 128..512
+        MiB and remaining cgroup capacity. Missing measurement stays full peak.
+        """
+        if resident <= 0:
+            return limit
+        bucket = int(time.time() // 30)
+        identity = (task_id, binding['native_id'], binding['incarnation'])
+        with self.get_conn() as conn:
+            samples = [r[0] for r in conn.execute(
+                "SELECT resident_mb FROM memory_samples WHERE task_id=? AND native_id=? AND incarnation=? AND bucket BETWEEN ? AND ?",
+                (*identity, bucket - 29, bucket))]
+            if not dry_run:
+                conn.execute("DELETE FROM memory_samples WHERE bucket < ? OR bucket > ?", (bucket - 29, bucket))
+                conn.execute("INSERT INTO memory_samples VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id,native_id,incarnation,bucket) DO UPDATE SET resident_mb=MAX(resident_mb,excluded.resident_mb)", (*identity, bucket, resident))
+        samples.append(resident)
+        samples.sort()
+        p95 = samples[math.ceil(len(samples) * .95) - 1]
+        margin = max(128, min(512, math.ceil(p95 * .25) + max(0, p95 - resident)))
+        return min(max(0, limit - resident), margin)
+
     def get_active_resources(self, exclude_task_id=None, *, dry_run=False, reconciliation=None):
         """Sum outstanding RAM growth and disk reservations.
 
         exclude_task_id removes the launching task's own reservation. Exact
-        live bounded workloads receive anonymous resident memory credit because
-        MemAvailable already excludes it; queued/unknown workers retain full
+        live bounded workloads reserve a bounded recent-p95 growth margin because
+        MemAvailable already excludes resident usage; queued/unknown workers retain full
         reservations, and disk accounting is unchanged.
 
         Uses exact native identity and current authoritative live phase or
@@ -722,9 +757,9 @@ class Store:
                     continue
                 else:
                     # MemAvailable already excludes verified resident anonymous
-                    # memory. Reserve its remaining growth to the full limit.
+                    # memory. Add only bounded recent-p95 growth, not full peak per worker.
                     credit = resident_credit_mb(binding, live_info, mem or 0) if status == "alive" else 0
-                    total_mem += max(0, (mem or 0) - credit)
+                    total_mem += self._growth_margin(task_id, binding, credit, mem or 0, dry_run)
                     total_disk += (disk or 0)
             else:
                 # Legacy or task-units without native binding:

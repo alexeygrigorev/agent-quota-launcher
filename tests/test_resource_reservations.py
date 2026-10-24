@@ -1,4 +1,4 @@
-"""Live resident memory credit retains full worker growth and host headroom."""
+"""Verified resident usage plus bounded p95 growth retains host headroom."""
 import json
 import os
 from pathlib import Path
@@ -161,7 +161,7 @@ class ResidentReservationsTests(unittest.TestCase):
             self.assertEqual(store.get_active_resources(), (1500, 512))
             run.assert_not_called()
             store.transition_task("t1", "running", ("queued",))
-            self.assertEqual(store.get_active_resources(), (700, 512))
+            self.assertEqual(store.get_active_resources(), (200, 512))
             self.assertEqual(store.get_active_resources(exclude_task_id="t1"), (0, 0))
             run.return_value = subprocess.CompletedProcess([], 0, json.dumps(dict(self.info, id="wrong")), "")
             self.assertEqual(store.get_active_resources(), (1500, 512))
@@ -173,9 +173,9 @@ class ResidentReservationsTests(unittest.TestCase):
         with patch("launcher.native_lifecycle.subprocess.run", return_value=subprocess.CompletedProcess(
                 [], 0, json.dumps(self.info), "")):
             active_mem, active_disk = store.get_active_resources()
-        self.assertEqual(active_mem, 700)
+        self.assertEqual(active_mem, 200)
         disk = type("Disk", (), {"free": 100 * 1024 ** 3})()
-        available = MIN_MEM_AVAILABLE_BYTES + (700 + 1500) * MIB
+        available = MIN_MEM_AVAILABLE_BYTES + (200 + 1500) * MIB
         kwargs = dict(requested_memory_mb=1500, requested_cwd=self.root,
                       requested_tmpdir=self.root / ".local/tmp", repo_root=self.root,
                       active_mem_mb=active_mem, active_disk_mb=active_disk, ignore_ram=False)
@@ -210,3 +210,29 @@ class ResidentReservationsTests(unittest.TestCase):
             with patch("launcher.store.probe_native_lifecycle", return_value=("dead", "confirmed stop")):
                 self.assertEqual(store.get_active_resources(), (0, 0))
                 self.assertEqual(store.get_task("t1")["state"], "failed")
+
+    def test_growth_history_is_bounded_and_dry_run_never_writes(self):
+        store = self.store()
+        with patch("launcher.store.time.time", return_value=3000):
+            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500, True), 128)
+            with store.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_samples").fetchone()[0], 0)
+            self.assertEqual(store._growth_margin("t1", self.binding, 1000, 1500), 250)
+        with patch("launcher.store.time.time", return_value=3030):
+            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500), 512)
+        with patch("launcher.store.time.time", return_value=4000):
+            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500), 128)
+        self.assertEqual(store._growth_margin("t1", self.binding, 0, 1500), 1500)
+
+    def test_thirty_one_gib_admits_ten_more_four_hundred_mib_workers(self):
+        store = self.store()
+        growth = 14 * store._growth_margin("t1", self.binding, 400, 1500)
+        available = 31 * 1024 ** 3
+        disk = type("Disk", (), {"free": 100 * 1024 ** 3})()
+        with patch("launcher.resources._get_disk_usage", return_value=disk):
+            for added in range(10):
+                with patch("launcher.resources.get_mem_available", return_value=available):
+                    self.assertTrue(check_resources(1500, self.root, self.root / ".local/tmp",
+                        active_mem_mb=growth, repo_root=self.root, ignore_ram=False))
+                available -= 400 * MIB
+                growth += 128

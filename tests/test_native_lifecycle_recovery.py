@@ -128,6 +128,23 @@ class NativeLifecycleValidationTests(unittest.TestCase):
         ok, _ = verify_tombstone(tombstone, VALID_UUID, "task-t-1", "/tmp/ws", 1792260000000)
         self.assertFalse(ok)
 
+    def test_deleted_workspace_suffix_requires_exact_finished_identity(self):
+        tomb = {"id": VALID_UUID, "tag": "task-t-1", "workspace": "/old/worktree (deleted)",
+                "cause": "finished", "finished_at_ms": 2000}
+        self.assertTrue(verify_tombstone(tomb, VALID_UUID, "task-t-1", "/old/worktree", 1000)[0])
+        for changes in ({"workspace": "/other (deleted)"}, {"cause": "pruned"},
+                        {"tag": "other"}, {"finished_at_ms": 500}):
+            self.assertFalse(verify_tombstone(dict(tomb, **changes), VALID_UUID, "task-t-1", "/old/worktree", 1000)[0])
+
+    def test_exiting_needs_exact_identity_and_positive_empty_containment(self):
+        binding = dict(native_id=VALID_UUID, tag="t", workspace="/old/worktree", engine="codex", incarnation=1000)
+        info = dict(id=VALID_UUID, tag="t", workspace="/old/worktree", engine="codex", created_at_ms=1000, phase="exiting")
+        for empty, status in ((True, "dead"), (False, "unknown"), (None, "unknown"), ("true", "unknown")):
+            with patch("launcher.native_lifecycle.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(dict(info, containment_empty=empty)), "")):
+                self.assertEqual(probe_native_lifecycle(binding)[0], status)
+        with patch("launcher.native_lifecycle.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(dict(info, containment_empty=True, created_at_ms=999)), "")):
+            self.assertEqual(probe_native_lifecycle(binding)[0], "unknown")
+
 
 class NativeStoreBindingTests(unittest.TestCase):
     def setUp(self):

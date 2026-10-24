@@ -95,3 +95,15 @@ Worker memory <= 1500 MiB; host MemAvailable must retain >= 10 GiB after active 
 ## Report (dashboard contract)
 
 `report --jsonl` emits exactly 24 hourly UTC buckets tiling the half-open window `[as_of-24h, as_of)` with `Z`-suffixed labels, explicit gap labels, and canonical `project_id` on every line (`--project-id NAME`, default: `quota-launcher` per QL-DASH-CONTRACT-1). Tasks outside the window are counted in `coverage.tasks_outside_window`, not emitted. Token fields (`input_tokens`, `output_tokens`, `cached_tokens`, `cost`) stay `null` with `source: "unproven"` unless natively proven; quota deltas are a separate object; unknown stays unknown — never zero-fabricated. Account percent deltas are not token use or cost.
+
+### Live memory admission
+
+The 1500 MiB cgroup limit is a hard worker cap, not a reservation charged
+again for every running worker. Exact native/cgroup identity and anonymous
+resident measurement establish live usage already reflected in MemAvailable.
+The launcher additionally reserves a recent-p95 growth margin: p95 minus current
+usage plus 25% of p95, bounded to 128–512 MiB and the remaining worker limit.
+Samples are per native incarnation, one maximum per 30 seconds, retained for
+15 minutes. Missing/uncertain measurement and not-yet-started workers retain
+1500 MiB. Admission keeps one 10 GiB host floor and a full new-worker allowance.
+`resource-status --dry-run` neither settles tasks nor writes memory samples.
