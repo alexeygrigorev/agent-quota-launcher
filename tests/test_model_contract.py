@@ -41,3 +41,20 @@ class ModelContractTests(unittest.TestCase):
             record = json.loads((Path(tmp) / '.local/launch-test.json').read_text())
             self.assertFalse(record['model_verified'])
             self.assertEqual(record['observed_model'], 'gemini-3.8-flash-high')
+
+
+    def test_pure_model_capability_query(self):
+        from argparse import Namespace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from launcher.cli import model_support
+        for provider, model, expected in [('antigravity', 'gemini-4-argon-high', True),
+                                          ('codex', 'gpt-6-astra', True),
+                                          ('opencode', 'opencode-go/deepseek-v4.1-flash', False)]:
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(model_support(Namespace(provider=provider, model=model)), 0)
+            receipt = json.loads(out.getvalue())
+            self.assertIs(receipt['supported'], expected)
+            if not expected:
+                self.assertEqual(receipt['reason'], 'model_unsupported')

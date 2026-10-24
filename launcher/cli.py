@@ -691,6 +691,16 @@ def fail(args):
     return 0
 
 
+def model_support(args):
+    """Pure adapter capability query; no quota, state or native effects."""
+    from launcher.admission import ADAPTER_SUPPORTED_MODELS
+    supported = args.model in ADAPTER_SUPPORTED_MODELS.get(args.provider, ())
+    print(json.dumps({"provider": args.provider, "model": args.model,
+                      "supported": supported,
+                      "reason": None if supported else "model_unsupported"}))
+    return 0
+
+
 def resource_status(args):
     """Reconcile without dispatch or process control; dry-run never transitions tasks."""
     from launcher.resources import get_mem_available
@@ -1132,6 +1142,11 @@ def main():
     parser_fail.add_argument("--reviewer", required=True)
     parser_fail.add_argument("--reason", required=True)
     parser_fail.set_defaults(func=fail)
+
+    parser_model = subparsers.add_parser("model-support", help="Check an exact provider/model adapter capability without effects")
+    parser_model.add_argument("--provider", required=True)
+    parser_model.add_argument("--model", required=True)
+    parser_model.set_defaults(func=model_support)
 
     parser_resources = subparsers.add_parser("resource-status", help="Reconcile reservations without launching or stopping sessions")
     parser_resources.add_argument("--dry-run", action="store_true")
