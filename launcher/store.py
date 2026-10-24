@@ -7,6 +7,7 @@ from pathlib import Path
 from contextlib import contextmanager
 import re
 
+from launcher.memory_accounting import resident_credit_mb
 from launcher.tags import run_tag_for
 from launcher.review_receipt import ReviewValidationError
 from launcher.native_lifecycle import validate_native_binding, probe_native_lifecycle
@@ -648,8 +649,12 @@ class Store:
             return None
 
     def get_active_resources(self, exclude_task_id=None):
-        """Sum live/uncertain reservations. exclude_task_id removes the task
-        being launched so its own reservation is not double-counted.
+        """Sum outstanding RAM growth and disk reservations.
+
+        exclude_task_id removes the launching task's own reservation. Exact
+        live bounded workloads receive anonymous resident memory credit because
+        MemAvailable already excludes it; queued/unknown workers retain full
+        reservations, and disk accounting is unchanged.
 
         Uses exact native identity and current authoritative live phase or
         exact retired-sessions/<UUID>/tombstone.json (matching UUID, tag,
@@ -693,13 +698,16 @@ class Store:
                     binding = None
 
             if binding:
-                status, detail = probe_native_lifecycle(binding)
+                live_info = {}
+                status, detail = probe_native_lifecycle(binding, live_info=live_info)
                 if status in ("dead", "retired-finished"):
                     # Proven exit releases process RAM/disk reservation
                     continue
                 else:
-                    # Alive or unknown remains conservative
-                    total_mem += (mem or 0)
+                    # MemAvailable already excludes verified resident anonymous
+                    # memory. Reserve its remaining growth to the full limit.
+                    credit = resident_credit_mb(binding, live_info, mem or 0) if status == "alive" else 0
+                    total_mem += max(0, (mem or 0) - credit)
                     total_disk += (disk or 0)
             else:
                 # Legacy or task-units without native binding:

@@ -251,6 +251,7 @@ def probe_native_lifecycle(
     binding: dict,
     state_dir: Path | None = None,
     timeout: float = 15.0,
+    live_info: dict | None = None,
 ) -> tuple[str, str]:
     """Authoritative lifecycle probe for an exact native session binding.
 
@@ -348,6 +349,8 @@ def probe_native_lifecycle(
             if phase in ACTIVE_PHASES:
                 # Active/starting always reserved even containment_empty true;
                 # malformed/truthy string false cannot release.
+                if live_info is not None:
+                    live_info.update(info)
                 return "alive", f"phase={phase} containment_empty={c_empty}"
 
             if phase in TERMINAL_PHASES:
