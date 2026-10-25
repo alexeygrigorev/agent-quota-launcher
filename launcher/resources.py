@@ -5,6 +5,9 @@ import shutil
 from pathlib import Path
 
 MAX_WORKER_MEMORY_MB = 1500
+DEFAULT_NATIVE_MEMORY_MB = 1500
+CODEX_MANAGED_NATIVE_MEMORY_MB = 4096
+CODEX_MANAGED_PROVIDERS = ("codex", "openai")
 MIN_MEM_AVAILABLE_BYTES = 10 * 1024 * 1024 * 1024
 MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
 WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
@@ -18,6 +21,48 @@ TYPICAL_WORKER_RSS_BYTES = 350 * 1024 * 1024  # 350 MiB empirical
 MAX_WORKER_RSS_BYTES = 768 * 1024 * 1024      # 768 MiB (cgroup limit)
 CONTROLLER_RSS_BYTES = 140 * 1024 * 1024      # 140 MiB
 MIN_HOST_RESERVE_RAM_BYTES = 3 * 1024 * 1024 * 1024  # 3 GiB host headroom
+
+def is_codex_managed_native(provider=None, is_managed=False):
+    """Narrow exception predicate: only a managed native Codex worker."""
+    try:
+        name = str(provider or "").strip().lower()
+    except Exception:
+        return False
+    return bool(is_managed) and name in CODEX_MANAGED_PROVIDERS
+
+
+def native_memory_request_for(provider=None, is_managed=False, explicit_mb=None):
+    """Single policy for native aplexer memory (MiB).
+
+    Covers submit reservation, admission, resource-status, and the actual
+    native ``--memory`` argv. Managed native Codex defaults to 4096MiB
+    (kernel-proved midrun kill at 1500MiB); every other provider defaults
+    to 1500MiB. Explicit payload requests are honored up to the matching
+    ceiling, never as a blanket increase.
+    """
+    if is_codex_managed_native(provider, is_managed):
+        if explicit_mb is None:
+            return CODEX_MANAGED_NATIVE_MEMORY_MB
+        try:
+            value = int(explicit_mb)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
+        if isinstance(explicit_mb, bool) or value <= 0:
+            raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
+        if value > CODEX_MANAGED_NATIVE_MEMORY_MB:
+            raise ValueError("requested worker memory > 4096MiB (managed codex ceiling)")
+        return value
+    if explicit_mb is None:
+        return DEFAULT_NATIVE_MEMORY_MB
+    try:
+        value = int(explicit_mb)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
+    if isinstance(explicit_mb, bool) or value <= 0:
+        raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
+    if value > MAX_WORKER_MEMORY_MB:
+        raise ValueError("requested worker memory > 1500MiB")
+    return value
 
 def estimate_stage_memory_bytes(concurrency: int, peak: bool = False) -> int:
     worker_mem = MAX_WORKER_RSS_BYTES if peak else TYPICAL_WORKER_RSS_BYTES
@@ -111,18 +156,27 @@ def _get_disk_usage(path):
 
 def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     active_mem_mb=0, active_disk_mb=0, repo_root=None,
-                    ignore_ram=None, requested_disk_mb=0, target_stage=None):
-    if requested_memory_mb > MAX_WORKER_MEMORY_MB:
+                    ignore_ram=None, requested_disk_mb=0, target_stage=None,
+                    provider=None, is_managed=False):
+    try:
+        requested_value = int(requested_memory_mb)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid requested worker memory {requested_memory_mb!r}")
+    if is_codex_managed_native(provider, is_managed):
+        if requested_value > CODEX_MANAGED_NATIVE_MEMORY_MB:
+            raise ValueError("requested worker memory > 4096MiB (managed codex ceiling)")
+    elif requested_value > MAX_WORKER_MEMORY_MB:
         raise ValueError("requested worker memory > 1500MiB")
 
     # Human override (experiment/human-ram-override-twentyfive-subagents-20261005.txt):
-    # Ignore host-wide MemAvailable floor; worker MemoryMax <= 1500M strictly preserved.
+    # Ignore host-wide MemAvailable floor; worker MemoryMax stays at the policy
+    # ceiling (1500M, or 4096M for managed native Codex only).
     if ignore_ram is None:
         ignore_ram = os.environ.get("HUMAN_RAM_OVERRIDE", "0") == "1"
 
     mem_avail = get_mem_available()
     if not ignore_ram:
-        req_mem = requested_memory_mb * 1024 * 1024
+        req_mem = requested_value * 1024 * 1024
         act_mem = active_mem_mb * 1024 * 1024
         if mem_avail - act_mem - req_mem < MIN_MEM_AVAILABLE_BYTES:
             raise ValueError("host MemAvailable < 10GiB")

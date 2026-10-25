@@ -703,7 +703,11 @@ def model_support(args):
 
 def resource_status(args):
     """Reconcile without dispatch or process control; dry-run never transitions tasks."""
-    from launcher.resources import get_mem_available
+    from launcher.resources import (
+        get_mem_available,
+        DEFAULT_NATIVE_MEMORY_MB,
+        CODEX_MANAGED_NATIVE_MEMORY_MB,
+    )
     store = get_store(args)
     changes = []
     memory, disk = store.get_active_resources(dry_run=args.dry_run, reconciliation=changes)
@@ -717,11 +721,20 @@ def resource_status(args):
     if args.dry_run:
         count -= len(changes)
         reserved -= sum(r["memory_mb"] for r in changes)
+    # Default gate (all providers) plus the narrow managed-Codex gate: the
+    # Codex request needs 4096MiB headroom, so resource-status must show
+    # room for it explicitly instead of implying 1500MiB is sufficient.
+    default_allowed = available - memory - DEFAULT_NATIVE_MEMORY_MB >= 10240
+    codex_allowed = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= 10240
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
                       "mem_available_mb": available,
-                      "launch_allowed": available - memory - 1500 >= 10240,
-                      "reason": None if available - memory - 1500 >= 10240 else "launcher_memory_reserve",
+                      "launch_allowed": default_allowed,
+                      "reason": None if default_allowed else "launcher_memory_reserve",
+                      "launch_allowed_codex_managed": codex_allowed,
+                      "reason_codex_managed": None if codex_allowed else "launcher_memory_reserve_codex_4096",
+                      "default_memory_mb": DEFAULT_NATIVE_MEMORY_MB,
+                      "codex_managed_memory_mb": CODEX_MANAGED_NATIVE_MEMORY_MB,
                       "dry_run": args.dry_run, "reconciled": changes}))
     return 0
 

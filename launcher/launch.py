@@ -42,7 +42,11 @@ from launcher.admission import (
     PROMO_CUTOFF_UTC,
 )
 from launcher.ranking import select_candidate
-from launcher.resources import check_resources
+from launcher.resources import (
+    check_resources,
+    native_memory_request_for,
+    is_codex_managed_native,
+)
 from launcher.store import Store, launch_lock, StateTransitionError
 from launcher.tags import run_tag_for
 
@@ -680,8 +684,20 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     active_mem, active_disk = store.get_active_resources(exclude_task_id=task_id)
     record["active_mem_mb"] = active_mem
     record["active_disk_mb"] = active_disk
-    check_resources(1500, workspace, tmpdir_resolved, active_mem, active_disk,
-                    repo_root=workspace)
+    # Single policy: managed native Codex defaults to 4096MiB (midrun OOM
+    # at 1500MiB); every other provider stays 1500MiB. Host 10GiB, disk,
+    # and quota gates are unchanged; the larger request simply reserves
+    # more MemAvailable headroom via check_resources.
+    requested_mem_mb = native_memory_request_for(
+        provider=provider,
+        is_managed=is_managed,
+        explicit_mb=payload.get("memory_mb"),
+    )
+    record["requested_memory_mb"] = requested_mem_mb
+    record["native_memory_managed_codex"] = bool(is_codex_managed_native(provider, is_managed))
+    check_resources(requested_mem_mb, workspace, tmpdir_resolved,
+                    active_mem, active_disk, repo_root=workspace,
+                    provider=provider, is_managed=is_managed)
 
     run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
@@ -696,8 +712,11 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     cmd = [
         "aplexer", "start",
         "--json",
-        "--memory", "1500M",
+        "--memory", f"{requested_mem_mb}M",
         "--pids", "100",
+        # Startup handshake only (30s). This is NOT a runtime cap: the
+        # payload timeout bounds Popen.communicate (aplexer start) plus
+        # the first-action wait below, never the native worker lifetime.
         "--startup-timeout-ms", "30000",
         "--workspace", workspace,
         "--cwd", str(Path(payload["cwd"]).resolve()),

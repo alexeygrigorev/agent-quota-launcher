@@ -344,8 +344,56 @@ class Store:
                 for p in normalized_paths:
                     conn.execute("INSERT INTO task_paths (task_id, path) VALUES (?, ?)", (task_id, str(Path(p).resolve())))
 
-                # Record reservation in task_resources (explicit payload memory_mb wins, else parameter)
-                effective_mem = int(payload["memory_mb"]) if payload.get("memory_mb") else memory_mb
+                # Record reservation in task_resources via the single native
+                # memory policy (managed native Codex defaults to 4096MiB,
+                # all others to 1500MiB; explicit payload wins up to its
+                # ceiling). Provider is inferred from the submit-time hint
+                # only; ambiguous hints fall back to 1500 and admission
+                # re-checks the exact chosen provider before dispatch.
+                from launcher.resources import native_memory_request_for
+                try:
+                    from launcher.admission import is_managed_profile_payload as _is_managed
+                    submit_managed = bool(_is_managed(payload))
+                except Exception:
+                    prof = payload.get("profile")
+                    submit_managed = bool(
+                        payload.get("account_label")
+                        or payload.get("account_profile")
+                        or payload.get("provider_profile")
+                        or (isinstance(prof, str) and prof.startswith("hub-"))
+                    )
+                submit_provider = None
+                raw_provider = payload.get("provider")
+                if isinstance(raw_provider, str) and raw_provider.strip():
+                    submit_provider = raw_provider.strip()
+                else:
+                    model_reqs = payload.get("model_requirements")
+                    if isinstance(model_reqs, dict):
+                        rp = model_reqs.get("provider")
+                        if isinstance(rp, str) and rp.strip():
+                            submit_provider = rp.strip()
+                        else:
+                            rps = model_reqs.get("providers")
+                            if isinstance(rps, (list, tuple)) and len(rps) == 1 \
+                                    and isinstance(rps[0], str) and rps[0].strip():
+                                submit_provider = rps[0].strip()
+                if payload.get("memory_mb") is not None:
+                    effective_mem = native_memory_request_for(
+                        provider=submit_provider,
+                        is_managed=submit_managed,
+                        explicit_mb=payload.get("memory_mb"),
+                    )
+                elif submit_provider is not None or submit_managed:
+                    effective_mem = native_memory_request_for(
+                        provider=submit_provider,
+                        is_managed=submit_managed,
+                        explicit_mb=None,
+                    )
+                else:
+                    # No hint: preserve caller parameter (default 1500).
+                    effective_mem = native_memory_request_for(
+                        provider=None, is_managed=False, explicit_mb=memory_mb,
+                    )
                 conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, effective_mem, disk_mb))
 
         return task_id
