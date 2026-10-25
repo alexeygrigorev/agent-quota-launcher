@@ -23,46 +23,21 @@ CONTROLLER_RSS_BYTES = 140 * 1024 * 1024      # 140 MiB
 MIN_HOST_RESERVE_RAM_BYTES = 3 * 1024 * 1024 * 1024  # 3 GiB host headroom
 
 def is_codex_managed_native(provider=None, is_managed=False):
-    """Narrow exception predicate: only a managed native Codex worker."""
-    try:
-        name = str(provider or "").strip().lower()
-    except Exception:
-        return False
-    return bool(is_managed) and name in CODEX_MANAGED_PROVIDERS
+    """Only managed native Codex receives the larger bounded allowance."""
+    return bool(is_managed) and isinstance(provider, str) and provider.lower() in CODEX_MANAGED_PROVIDERS
 
 
 def native_memory_request_for(provider=None, is_managed=False, explicit_mb=None):
-    """Single policy for native aplexer memory (MiB).
-
-    Covers submit reservation, admission, resource-status, and the actual
-    native ``--memory`` argv. Managed native Codex defaults to 4096MiB
-    (kernel-proved midrun kill at 1500MiB); every other provider defaults
-    to 1500MiB. Explicit payload requests are honored up to the matching
-    ceiling, never as a blanket increase.
-    """
-    if is_codex_managed_native(provider, is_managed):
-        if explicit_mb is None:
-            return CODEX_MANAGED_NATIVE_MEMORY_MB
-        try:
-            value = int(explicit_mb)
-        except (TypeError, ValueError):
-            raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
-        if isinstance(explicit_mb, bool) or value <= 0:
-            raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
-        if value > CODEX_MANAGED_NATIVE_MEMORY_MB:
-            raise ValueError("requested worker memory > 4096MiB (managed codex ceiling)")
-        return value
+    """Shared reservation/admission/argv policy; all values are integer MiB."""
+    ceiling = CODEX_MANAGED_NATIVE_MEMORY_MB if is_codex_managed_native(provider, is_managed) else MAX_WORKER_MEMORY_MB
     if explicit_mb is None:
-        return DEFAULT_NATIVE_MEMORY_MB
-    try:
-        value = int(explicit_mb)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
-    if isinstance(explicit_mb, bool) or value <= 0:
-        raise ValueError(f"invalid explicit worker memory {explicit_mb!r}")
-    if value > MAX_WORKER_MEMORY_MB:
-        raise ValueError("requested worker memory > 1500MiB")
-    return value
+        return ceiling
+    if type(explicit_mb) is not int or explicit_mb <= 0:
+        raise ValueError("invalid explicit worker memory")
+    if explicit_mb > ceiling:
+        raise ValueError(f"requested worker memory > {ceiling}MiB")
+    return explicit_mb
+
 
 def estimate_stage_memory_bytes(concurrency: int, peak: bool = False) -> int:
     worker_mem = MAX_WORKER_RSS_BYTES if peak else TYPICAL_WORKER_RSS_BYTES
@@ -158,15 +133,9 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     active_mem_mb=0, active_disk_mb=0, repo_root=None,
                     ignore_ram=None, requested_disk_mb=0, target_stage=None,
                     provider=None, is_managed=False):
-    try:
-        requested_value = int(requested_memory_mb)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid requested worker memory {requested_memory_mb!r}")
-    if is_codex_managed_native(provider, is_managed):
-        if requested_value > CODEX_MANAGED_NATIVE_MEMORY_MB:
-            raise ValueError("requested worker memory > 4096MiB (managed codex ceiling)")
-    elif requested_value > MAX_WORKER_MEMORY_MB:
-        raise ValueError("requested worker memory > 1500MiB")
+    if requested_memory_mb is None:
+        raise ValueError("invalid requested worker memory")
+    requested_value = native_memory_request_for(provider, is_managed, requested_memory_mb)
 
     # Human override (experiment/human-ram-override-twentyfive-subagents-20261005.txt):
     # Ignore host-wide MemAvailable floor; worker MemoryMax stays at the policy

@@ -52,6 +52,11 @@ class TestNativeMemoryPolicy(unittest.TestCase):
         self.assertFalse(is_codex_managed_native(None, True))
         self.assertFalse(is_codex_managed_native("codex", None))
 
+    def test_invalid_numeric_values_refused(self):
+        for value in (True, False, 0, -1, 1500.5, "4096", float('nan'), float('inf')):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                native_memory_request_for('codex', True, value)
+
     def test_explicit_bounds(self):
         # Managed codex honors smaller explicit requests up to its ceiling.
         self.assertEqual(native_memory_request_for("codex", True, 2000), 2000)
@@ -169,6 +174,16 @@ class TestSubmitReservationPolicy(unittest.TestCase):
         self.store.submit_task("t-codex-u", "k2", payload, [])
         self.assertEqual(self._mem("t-codex-u"), 1500)
 
+    def test_non_codex_caller_override_preserved(self):
+        from launcher.store import Store
+        with tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR)) as directory:
+            store = Store(str(Path(directory) / 'state.db'))
+            payload = dict(owner='head', cwd=directory, timeout=60, goal='test',
+                           model_requirements={'providers': ['opencode']})
+            store.submit_task('override', 'override', payload, [], memory_mb=512)
+            with store.get_conn() as conn:
+                self.assertEqual(conn.execute('SELECT memory_mb FROM task_resources WHERE task_id=?', ('override',)).fetchone()[0], 512)
+
     def test_other_provider_submit_stays_1500(self):
         payload = {"owner": "o", "cwd": self.dir, "timeout": 600,
                    "provider": "zai", "goal": "g"}
@@ -240,6 +255,11 @@ class TestDoRunNativeMemoryArgv(unittest.TestCase):
 
         def fake_popen(cmd, **kwargs):
             captured["cmd"] = list(cmd)
+            # Actual selected-route reservation must match the native cap,
+            # even when submit had no unambiguous provider hint.
+            with self.store.get_conn() as conn:
+                reserved = conn.execute('SELECT memory_mb FROM task_resources WHERE task_id=?', (task_id,)).fetchone()[0]
+            self.assertEqual(reserved, int(cmd[cmd.index('--memory') + 1][:-1]))
             return FakeProc()
 
         chosen = {"provider": provider,

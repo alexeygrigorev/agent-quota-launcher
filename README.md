@@ -107,3 +107,7 @@ Samples are per native incarnation, one maximum per 30 seconds, retained for
 15 minutes. Missing/uncertain measurement and not-yet-started workers retain
 1500 MiB. Admission keeps one 10 GiB host floor and a full new-worker allowance.
 `resource-status --dry-run` neither settles tasks nor writes memory samples.
+
+### Managed native Codex memory
+
+Managed Codex on the native aplexer backend defaults to a 4096 MiB workload cap; other providers and task-unit/FileBus backends retain their existing 1500 MiB ceiling. Submission reserves the known route allowance, and launch rebinds the reservation to the exact selected route under launch.lock before checking host headroom and spawning. The 10 GiB host floor includes the full requested allowance. The native startup timeout bounds the start handshake and first action, not the lifetime of a running job. resource-status reports both the ordinary and managed Codex admission headroom.

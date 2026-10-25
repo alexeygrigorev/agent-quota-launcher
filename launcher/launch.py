@@ -681,9 +681,6 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     record["provider"] = provider
     record["requested_model"] = chosen.get("model")
 
-    active_mem, active_disk = store.get_active_resources(exclude_task_id=task_id)
-    record["active_mem_mb"] = active_mem
-    record["active_disk_mb"] = active_disk
     # Single policy: managed native Codex defaults to 4096MiB (midrun OOM
     # at 1500MiB); every other provider stays 1500MiB. Host 10GiB, disk,
     # and quota gates are unchanged; the larger request simply reserves
@@ -695,9 +692,6 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     )
     record["requested_memory_mb"] = requested_mem_mb
     record["native_memory_managed_codex"] = bool(is_codex_managed_native(provider, is_managed))
-    check_resources(requested_mem_mb, workspace, tmpdir_resolved,
-                    active_mem, active_disk, repo_root=workspace,
-                    provider=provider, is_managed=is_managed)
 
     run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
@@ -762,6 +756,12 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
 
     # --- critical section: reserve + spawn under the exclusive launch lock ---
     with launch_lock(lock_path):
+        store.reserve_native_memory(task_id, requested_mem_mb)
+        active_mem, active_disk = store.get_active_resources(exclude_task_id=task_id)
+        record['active_mem_mb'], record['active_disk_mb'] = active_mem, active_disk
+        check_resources(requested_mem_mb, workspace, tmpdir_resolved,
+                        active_mem, active_disk, repo_root=workspace,
+                        provider=provider, is_managed=is_managed)
         store.transition_task(task_id, "starting", ("queued",),
                               reason=f"launching via {provider}")
         env = os.environ.copy()
