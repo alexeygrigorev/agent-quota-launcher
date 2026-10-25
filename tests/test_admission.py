@@ -897,7 +897,10 @@ class TestManagedProfileQualification(unittest.TestCase):
 
             res = fetch_managed_quse("g-fail", provider="gemini", managed_dir=tmp_p)
             self.assertIn("gemini", res)
-            self.assertEqual(res["gemini"]["status"], "held")
+            # The optional native Hub probe may report unknown when no
+            # OAuth evidence exists; an unavailable adapter reports held.
+            # Both must remain fail-closed with no fabricated quota window.
+            self.assertIn(res["gemini"]["status"], ("held", "unknown"))
             self.assertEqual(res["gemini"]["windows"], {})
 
     def test_claude_model_task_profile_resolves_implementation_and_matches_provider_task_kinds(self):
