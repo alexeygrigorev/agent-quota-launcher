@@ -389,6 +389,15 @@ def find_enclosing_git_root(path: Union[str, Path]) -> Path:
         current = parent
 
 
+def validate_task_memory(memory_mb, profile=None):
+    ceiling = 1500 if profile == ROOT_RUN_PROFILE_NAME else MAX_MEMORY_MB
+    if type(memory_mb) is not int or memory_mb <= 0:
+        raise TaskUnitAdmissionError("worker memory must be a positive integer")
+    if memory_mb > ceiling:
+        raise TaskUnitAdmissionError(
+            f"worker memory {memory_mb}M exceeds maximum allowed ceiling of {ceiling}M")
+
+
 def admit_task_unit(
     task_id: str,
     memory_mb: int,
@@ -422,14 +431,7 @@ def admit_task_unit(
     CPU admission is choking-only (t1511u): busy/predicted/unknown never
     refuse; only fresh PSI FULL CPU/memory, OOM, or trusted runtime hints.
     """
-    if type(memory_mb) is not int:
-        raise TaskUnitAdmissionError("worker memory must be a positive integer")
-    if memory_mb > MAX_MEMORY_MB:
-        raise TaskUnitAdmissionError(
-            f"worker memory {memory_mb}M exceeds maximum allowed ceiling of {MAX_MEMORY_MB}M"
-        )
-    if int(memory_mb) <= 0:
-        raise TaskUnitAdmissionError("worker memory must be a positive integer")
+    validate_task_memory(memory_mb)
 
     # Fail closed on missing quota evidence (C2447)
     if quse_json is None:
@@ -651,6 +653,7 @@ def build_systemd_run_argv(
     always the generic isolated form. No code in this repo mints production
     authority.
     """
+    validate_task_memory(memory_mb, profile)
     if _rejected_kwargs:
         # F1: the public override was removed. Fail loudly so a caller that
         # still passes namespace_policy=/ROOT_TRUSTED_*/duck-type cannot unmask.
@@ -1113,6 +1116,7 @@ def execute_transient_task_unit(
         module_sha256 = "unknown"
 
     # 1. Admission check
+    validate_task_memory(memory_mb, profile)
     admit_task_unit(
         task_id,
         memory_mb,
@@ -1575,6 +1579,7 @@ def spawn_transient_task_unit(
     except Exception:
         module_sha256 = "unknown"
 
+    validate_task_memory(memory_mb, profile)
     admit_task_unit(
         task_id,
         memory_mb,
