@@ -19,6 +19,13 @@ from launcher.watch import (
 
 
 class WatchRefillTests(unittest.TestCase):
+    def setUp(self):
+        # Lifecycle/quota/refill tests mock native execution; host capacity is
+        # covered independently by resource admission tests, before any lease.
+        preflight = patch("launcher.cli.task_unit_resource_context", return_value={})
+        preflight.start()
+        self.addCleanup(preflight.stop)
+
     def test_derive_task_tmpdir_contained(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             task_cwd = os.path.join(tmp_dir, "task-20")

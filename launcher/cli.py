@@ -284,7 +284,7 @@ def task_unit_resource_context(store, args, payload, memory_mb):
         trusted_choking=trusted, expected_cpu_cores=frozen["expected_cpu_cores"],
         ramping_cpu_cores=ramping_cpu_cores(entries, ramp_seconds=policy["ramp_seconds"]))
     tmpdir = args.tmpdir or str(Path(args.cwd).resolve() / ".local" / "tmp" / args.id)
-    check_resources(memory_mb, args.cwd, tmpdir, **context)
+    check_resources(memory_mb, args.cwd, tmpdir, repo_root=args.cwd, **context)
     return context
 
 

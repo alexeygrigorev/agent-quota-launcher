@@ -11,6 +11,13 @@ from launcher.store import Store
 
 
 class TaskUnitsCliTests(unittest.TestCase):
+    def setUp(self):
+        # Lifecycle/quota/refill tests mock native execution; host capacity is
+        # covered independently by resource admission tests, before any lease.
+        preflight = patch("launcher.cli.task_unit_resource_context", return_value={})
+        preflight.start()
+        self.addCleanup(preflight.stop)
+
     def test_unsubmitted_id_fails_closed(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

@@ -509,7 +509,7 @@ class AdmissionContextRecoveryTests(unittest.TestCase):
             self.assertEqual(context["expected_cpu_cores"],3)
             self.assertEqual(context["cpu_policy"]["cpu_psi_full_hard_cap_pct"],8)
             self.assertEqual(context["trusted_choking"],hint)
-            check.assert_called_once_with(1500,tmp,tmp,**context)
+            check.assert_called_once_with(1500,tmp,tmp,repo_root=tmp,**context)
 
     def test_both_task_unit_execution_paths_forward_resource_commitments_before_effects(self):
         from launcher import task_units
