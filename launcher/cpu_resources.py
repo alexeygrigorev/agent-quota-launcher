@@ -5,9 +5,12 @@ actual choking signals:
 
 - PSI CPU FULL avg10 > cpu_psi_full_hard_cap_pct (default 5) => cpu_pressure
 - PSI memory FULL avg10 > memory_psi_full_hard_cap_pct (default 1) => memory_pressure
-- /proc/vmstat oom_kill delta > 0 (fresh) => host_oom
+- classified host-wide OOM from a fresh trusted hint => host_oom
 - trusted host runtime evidence (fresh, within choking_cooldown_seconds) =>
   host_runtime_choking
+
+Raw /proc/vmstat oom_kill includes isolated session memcg kills and is
+diagnostic only; it never refuses admission or creates a host cooldown.
 
 NEVER throttle on loadavg, busy%, predicted load, or unknown CPU telemetry.
 Unknown stays visibly null/advisory, never fake-clear. Busy + expected new +
@@ -280,7 +283,8 @@ def cpu_verdict(raw_usage, cores, expected_cpu_cores, ramping_cpu_cores,
 
     Returns dict with the fixed admission numbers plus advisory
     predicted_over_target/telemetry_state/advisory and reason/admitted where
-    reason is one of cpu_pressure/memory_pressure/host_oom or None.
+    local reason is cpu_pressure/memory_pressure or None. Trusted host
+    OOM/runtime hints are applied separately by check_cpu_choking.
     """
     target = policy.get("cpu_target_utilization", 1.0)
     full_cap = policy.get("cpu_psi_full_hard_cap_pct", 5.0)
@@ -322,8 +326,9 @@ def cpu_verdict(raw_usage, cores, expected_cpu_cores, ramping_cpu_cores,
     elif fresh and usage["memory_psi_full_avg10"] is not None \
             and usage["memory_psi_full_avg10"] > mem_cap:
         reason = "memory_pressure"
-    elif fresh and (usage["oom_kills_delta"] or 0) > 0:
-        reason = "host_oom"
+    # /proc/vmstat includes isolated session memcg kills. It is diagnostic,
+    # not evidence of host-wide choking; scoped host OOM arrives via the
+    # separately validated trusted_choking channel.
     return {**numbers, "reason": reason, "admitted": reason is None}
 
 
@@ -421,13 +426,9 @@ def collect_admission_context(store, policy, dry_run=False):
         current = safe(read_oom_counter)
     previous = safe(store.get_oom_baseline, "/proc")
     usage["oom_kills_delta"] = oom_delta(previous, current)
-    if usage["oom_kills_delta"] is not None and usage["oom_kills_delta"] > 0:
-        # An independently read counter is a current observation even if busy
-        # sampling failed. Preserve it before advancing the persisted baseline.
-        observed = datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat()
-        usage["observed_at"] = observed
-        if not dry_run:
-            store.record_choking_event("host_oom", observed)
+    # Keep the aggregate counter/baseline for diagnostics only. A session's
+    # MemoryMax kill must not create a host-wide durable cooldown. Genuine
+    # kernel-classified host OOM is preserved by the trusted hint below.
     if current is not None and not dry_run:
         store.set_oom_baseline("/proc", current)
     cooldown = policy.get("choking_cooldown_seconds", 300)

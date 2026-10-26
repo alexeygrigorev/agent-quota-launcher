@@ -2,8 +2,8 @@
 
 Heavy utilization is fine (busy 90%+ admits). Only fresh actual choking
 refuses: PSI CPU FULL > cap (cpu_pressure), PSI memory FULL > cap
-(memory_pressure), fresh OOM delta > 0 (host_oom), fresh trusted host
-runtime evidence (host_runtime_choking/host_oom). Loadavg, busy%,
+(memory_pressure), or fresh classified host OOM/runtime evidence
+(host_runtime_choking/host_oom). Unscoped vmstat is diagnostic only. Loadavg, busy%,
 predicted load, and unknown telemetry NEVER refuse.
 """
 import json
@@ -122,14 +122,23 @@ class ChokingGateTests(unittest.TestCase):
         self.assertEqual(reason, "memory_pressure")
         self.assertEqual(admission["memory_psi_full_avg10"], 2.5)
 
-    def test_oom_delta_refuses_host_oom(self):
+    def test_unscoped_oom_delta_does_not_refuse_a_healthy_host(self):
         u = usage(cores=12, busy_percent=10.0, oom=2)
         allowed, reason, admission = check_cpu_choking(
             cpu_usage=u, policy=policy(), cores=12,
             expected_cpu_cores=1.0, ramping_cpu_cores=0.0)
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+        self.assertEqual(admission["oom_kills_delta"], 2)  # Diagnostic stays honest.
+
+    def test_classified_host_oom_hint_still_refuses_without_busy_or_vmstat(self):
+        hint = {"reason": "host_oom", "observed_at": now_iso()}
+        allowed, reason, _ = check_cpu_choking(
+            cpu_usage=None, policy=policy(), cores=12,
+            expected_cpu_cores=1.0, ramping_cpu_cores=0.0,
+            trusted_choking=hint)
         self.assertFalse(allowed)
         self.assertEqual(reason, "host_oom")
-        self.assertEqual(admission["oom_kills_delta"], 2)
 
     def test_trusted_runtime_hint_refuses(self):
         hint = {"reason": "host_runtime_choking", "observed_at": now_iso()}
@@ -469,9 +478,32 @@ class AdmissionContextRecoveryTests(unittest.TestCase):
         self.assertIsNone(usage["busy_cores"])
         self.assertEqual(usage["oom_kills_delta"],1)
         self.assertEqual(usage["psi_full_avg10"],7)
-        self.assertEqual(store.method_calls[1][0],"record_choking_event")
+        store.record_choking_event.assert_not_called()
         store.set_oom_baseline.assert_called_once_with("/proc",11)
-        self.assertIn(cpu.check_cpu_choking(usage,RESOURCE_DEFAULTS,cores=4,trusted_choking=hint)[1],("cpu_pressure","host_oom"))
+        self.assertEqual(cpu.check_cpu_choking(usage,RESOURCE_DEFAULTS,cores=4,trusted_choking=hint)[1],"cpu_pressure")
+
+    def test_memcg_counter_does_not_persist_cooldown_but_scoped_hint_does(self):
+        from unittest.mock import MagicMock
+        for host_hint in (None, {"reason": "host_oom", "observed_at": now_iso()}):
+            store = MagicMock()
+            store.get_oom_baseline.return_value = 10
+            store.get_fresh_choking.return_value = None
+            with self.subTest(classified=host_hint is not None), \
+                 patch.object(cpu, "sample_cpu_usage", return_value={**usage(), "oom_counter": 11}), \
+                 patch.dict(os.environ, {"LAUNCHER_TRUSTED_CHOKING_JSON": json.dumps(host_hint) if host_hint else ""}):
+                measured, hint = cpu.collect_admission_context(store, RESOURCE_DEFAULTS)
+            self.assertEqual(measured["oom_kills_delta"], 1)
+            store.set_oom_baseline.assert_called_once_with("/proc", 11)
+            if host_hint:
+                store.record_choking_event.assert_called_once_with("host_oom", host_hint["observed_at"])
+                self.assertEqual(hint, host_hint)
+            else:
+                store.record_choking_event.assert_not_called()
+                self.assertIsNone(hint)
+            admitted, reason, _ = cpu.check_cpu_choking(
+                measured, RESOURCE_DEFAULTS, cores=4, trusted_choking=hint)
+            self.assertEqual(admitted, host_hint is None)
+            self.assertEqual(reason, "host_oom" if host_hint else None)
 
     def test_new_hint_persists_over_old_hint_and_dry_run_never_writes(self):
         from unittest.mock import MagicMock
