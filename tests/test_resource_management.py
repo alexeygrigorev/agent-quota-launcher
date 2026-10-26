@@ -56,7 +56,15 @@ class PolicyDefaultsTests(unittest.TestCase):
         self.assertEqual(RESOURCE_DEFAULTS["ramp_reserve_default_mb"], 512)
         self.assertEqual(RESOURCE_DEFAULTS["estimate_percentile"], 90)
         self.assertEqual(RESOURCE_DEFAULTS["estimate_multiplier"], 1.25)
-        self.assertEqual(RESOURCE_DEFAULTS["cpu_load_factor"], 1.5)
+        # V2 (t1511u): cpu_load_factor deprecated, default 3.0, UNUSED.
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_load_factor"], 3.0)
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_target_utilization"], 1.0)
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_default_cores"], 1.0)
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_estimate_multiplier"], 1.25)
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_psi_hard_cap_pct"], 50.0)
+        self.assertEqual(RESOURCE_DEFAULTS["cpu_psi_full_hard_cap_pct"], 5.0)
+        self.assertEqual(RESOURCE_DEFAULTS["memory_psi_full_hard_cap_pct"], 1.0)
+        self.assertEqual(RESOURCE_DEFAULTS["choking_cooldown_seconds"], 300)
         self.assertEqual(RESOURCE_DEFAULTS["ramp_seconds"], 180)
 
     def test_payload_overlay(self):
@@ -78,8 +86,10 @@ class PolicyDefaultsTests(unittest.TestCase):
 
     def test_out_of_range_fails_closed(self):
         # Bounds track the Hub contract: floor 128..1048576, ramp
-        # 64..65536, percentile 50..100, multiplier 1..4, cpu 0.5..4,
-        # ramp_seconds 30..900.
+        # 64..65536, percentile 50..100, multiplier 1..4, load 0.5..4
+        # (deprecated, still validated), target 0.1..1, default cores
+        # 0.05..128, cpu multiplier 1..4, SOME cap 1..100, FULL caps
+        # 0.1..100, cooldown 30..3600, ramp_seconds 30..900.
         for knob, bad in (("memory_floor_mb", 64), ("memory_floor_mb", 2 ** 30),
                           ("ramp_reserve_default_mb", 32),
                           ("ramp_reserve_default_mb", 1 << 20),
@@ -89,6 +99,20 @@ class PolicyDefaultsTests(unittest.TestCase):
                           ("estimate_multiplier", 4.5),
                           ("cpu_load_factor", 0.4),
                           ("cpu_load_factor", 4.5),
+                          ("cpu_target_utilization", 0.05),
+                          ("cpu_target_utilization", 1.5),
+                          ("cpu_default_cores", 0.01),
+                          ("cpu_default_cores", 200),
+                          ("cpu_estimate_multiplier", 0.5),
+                          ("cpu_estimate_multiplier", 5),
+                          ("cpu_psi_hard_cap_pct", 0.5),
+                          ("cpu_psi_hard_cap_pct", 101),
+                          ("cpu_psi_full_hard_cap_pct", 0.05),
+                          ("cpu_psi_full_hard_cap_pct", 101),
+                          ("memory_psi_full_hard_cap_pct", 0.05),
+                          ("memory_psi_full_hard_cap_pct", 101),
+                          ("choking_cooldown_seconds", 10),
+                          ("choking_cooldown_seconds", 99999),
                           ("ramp_seconds", 10),
                           ("ramp_seconds", 99999)):
             with self.subTest(knob=knob, bad=bad), self.assertRaisesRegex(ValueError, "resource_management"):
@@ -98,15 +122,29 @@ class PolicyDefaultsTests(unittest.TestCase):
         policy = load_resource_policy({"resource_management": {
             "memory_floor_mb": 128, "ramp_reserve_default_mb": 65536,
             "estimate_percentile": 100, "estimate_multiplier": 4,
-            "cpu_load_factor": 0.5, "ramp_seconds": 30}})
+            "cpu_load_factor": 0.5, "ramp_seconds": 30,
+            "cpu_target_utilization": 0.1, "cpu_default_cores": 0.05,
+            "cpu_estimate_multiplier": 1, "cpu_psi_hard_cap_pct": 1,
+            "cpu_psi_full_hard_cap_pct": 0.1,
+            "memory_psi_full_hard_cap_pct": 0.1,
+            "choking_cooldown_seconds": 30}})
         self.assertEqual(policy["estimate_percentile"], 100)
         self.assertEqual(policy["cpu_load_factor"], 0.5)
+        self.assertEqual(policy["cpu_target_utilization"], 0.1)
+        self.assertEqual(policy["choking_cooldown_seconds"], 30)
         policy = load_resource_policy({"resource_management": {
             "memory_floor_mb": 1048576, "ramp_reserve_default_mb": 64,
             "estimate_percentile": 50, "estimate_multiplier": 1,
-            "cpu_load_factor": 4, "ramp_seconds": 900}})
+            "cpu_load_factor": 4, "ramp_seconds": 900,
+            "cpu_target_utilization": 1, "cpu_default_cores": 128,
+            "cpu_estimate_multiplier": 4, "cpu_psi_hard_cap_pct": 100,
+            "cpu_psi_full_hard_cap_pct": 100,
+            "memory_psi_full_hard_cap_pct": 100,
+            "choking_cooldown_seconds": 3600}})
         self.assertEqual(policy["memory_floor_mb"], 1048576)
         self.assertEqual(policy["estimate_multiplier"], 1)
+        self.assertEqual(policy["cpu_target_utilization"], 1)
+        self.assertEqual(policy["choking_cooldown_seconds"], 3600)
 
     def test_full_hub_config_object_interop(self):
         # The Hub passes its whole config/resource-management.json,
@@ -116,13 +154,22 @@ class PolicyDefaultsTests(unittest.TestCase):
                       "estimate_percentile": 90,
                       "estimate_multiplier": 1.25,
                       "ramp_seconds": 180,
-                      "cpu_load_factor": 1.5,
+                      "cpu_load_factor": 3.0,
+                      "cpu_target_utilization": 1.0,
+                      "cpu_default_cores": 1,
+                      "cpu_estimate_multiplier": 1.25,
+                      "cpu_psi_hard_cap_pct": 50,
+                      "cpu_psi_full_hard_cap_pct": 5,
+                      "memory_psi_full_hard_cap_pct": 1,
+                      "choking_cooldown_seconds": 300,
                       "watchdog_interval_s": 300,
                       "idle_minutes": 60,
                       "rss_flag_gb": 4}
         policy = load_resource_policy({"resource_management": hub_config})
         self.assertEqual(policy["memory_floor_mb"], 2048)
         self.assertEqual(policy["estimate_multiplier"], 1.25)
+        self.assertEqual(policy["cpu_load_factor"], 3.0)
+        self.assertEqual(policy["cpu_psi_full_hard_cap_pct"], 5)
         self.assertEqual(set(policy), set(RESOURCE_DEFAULTS))
 
     def test_unknown_keys_ignored(self):
@@ -221,39 +268,46 @@ class PercentileEstimateTests(unittest.TestCase):
 
 
 class CpuGuardTests(unittest.TestCase):
+    """Legacy load symbols are deprecated display-only (t1511u V2).
+
+    Load average, busy%, predicted load, and unknown telemetry NEVER refuse.
+    Only fresh PSI FULL CPU/memory, fresh OOM deltas, or fresh trusted
+    runtime hints refuse (covered by the new test_cpu_resources.py suite).
+    """
+
     def test_allows_calm_host(self):
         self.assertTrue(check_cpu_guard(load5=9.0, cpu_count=12, factor=1.5))
 
     def test_blocks_overloaded_host_with_slug(self):
-        with self.assertRaisesRegex(ValueError, "host_cpu_load"):
-            check_cpu_guard(load5=19.0, cpu_count=12, factor=1.5)
+        # V2: heavy load admits (busy 90%+ fine); load never refuses.
+        self.assertTrue(check_cpu_guard(load5=19.0, cpu_count=12, factor=1.5))
+        self.assertTrue(check_cpu_guard(load5=99.0, cpu_count=12, factor=1.5))
 
     def test_boundary_is_allowed(self):
         self.assertTrue(check_cpu_guard(load5=18.0, cpu_count=12, factor=1.5))
 
     def test_factor_is_configurable(self):
+        # Deprecated factor still accepted (validated) but unused.
         self.assertTrue(check_cpu_guard(load5=19.0, cpu_count=12, factor=2.0))
-        with self.assertRaisesRegex(ValueError, "host_cpu_load"):
-            check_cpu_guard(load5=25.0, cpu_count=12, factor=2.0)
+        self.assertTrue(check_cpu_guard(load5=25.0, cpu_count=12, factor=2.0))
 
     def test_unknown_measurements_fail_closed(self):
-        # None means "auto-detect": unknown is when the readers find nothing.
+        # V2: unknown load telemetry admits (advisory); memory/PSI unknown
+        # likewise never refuses. The legacy guard stays permissive.
         with patch("launcher.resource_policy.read_load5", return_value=None), \
              patch("launcher.resource_policy.read_cpu_count", return_value=None):
-            with self.assertRaisesRegex(ValueError, "unknown"):
-                check_cpu_guard()
-        with self.assertRaisesRegex(ValueError, "unknown"):
-            check_cpu_guard(load5=float("nan"), cpu_count=12, factor=1.5)
-        with self.assertRaisesRegex(ValueError, "invalid"):
-            check_cpu_guard(load5=1.0, cpu_count=12, factor=0)
+            self.assertTrue(check_cpu_guard())
+        self.assertTrue(check_cpu_guard(load5=float("nan"), cpu_count=12, factor=1.5))
+        self.assertTrue(check_cpu_guard(load5=1.0, cpu_count=12, factor=0))
 
     def test_status_never_raises(self):
         ok = cpu_guard_status(load5=1.0, cpu_count=4, factor=1.5)
         self.assertTrue(ok["allowed"])
         self.assertIsNone(ok["reason"])
-        blocked = cpu_guard_status(load5=99.0, cpu_count=4, factor=1.5)
-        self.assertFalse(blocked["allowed"])
-        self.assertIn("host_cpu_load", blocked["reason"])
+        # V2: even extreme load reports allowed (display only).
+        still_ok = cpu_guard_status(load5=99.0, cpu_count=4, factor=1.5)
+        self.assertTrue(still_ok["allowed"])
+        self.assertIsNone(still_ok["reason"])
 
     def test_live_readers(self):
         self.assertIsInstance(read_load5(), float)
@@ -311,22 +365,25 @@ class MemoryAdmissionTests(unittest.TestCase):
                 self.check(memory_estimate_mb=64, active_mem_mb=0)
 
     def test_cpu_guard_blocks_and_slug(self):
+        # V2 (t1511u): load/busy NEVER block, even at 99. Only choking
+        # signals (fresh PSI FULL/OOM/runtime) refuse; covered in
+        # test_cpu_resources.py.
         import launcher.resources as res
         with patch.object(res, "get_mem_available", return_value=30 * GiB), \
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
-            with self.assertRaisesRegex(ValueError, "host_cpu_load"):
-                self.check(_load5=99.0, _cpu_count=12)
+            self.assertTrue(self.check(_load5=99.0, _cpu_count=12))
             self.assertTrue(self.check(_load5=1.0, _cpu_count=12,
                                        cpu_load_factor=2.0))
 
     def test_unknown_cpu_fails_closed(self):
+        # V2: unknown CPU telemetry admits (advisory null), existing
+        # memory/disk gates still apply.
         import launcher.resources as res
         with patch.object(res, "get_mem_available", return_value=30 * GiB), \
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)), \
              patch("launcher.resource_policy.read_load5", return_value=None), \
              patch("launcher.resource_policy.read_cpu_count", return_value=None):
-            with self.assertRaisesRegex(ValueError, "unknown"):
-                self.check()
+            self.assertTrue(self.check())
 
     def test_cpu_can_be_disabled_for_unit_isolation(self):
         import launcher.resources as res
@@ -336,13 +393,14 @@ class MemoryAdmissionTests(unittest.TestCase):
                                        _load5=999.0, _cpu_count=12))
 
     def test_human_override_skips_memory_not_cpu(self):
+        # V2: HUMAN_RAM_OVERRIDE skips the memory floor; the CPU gate is
+        # choking-only so load never blocks either way.
         import launcher.resources as res
         with patch.object(res, "get_mem_available", return_value=1 * GiB), \
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
             with patch.dict(os.environ, {"HUMAN_RAM_OVERRIDE": "1"}):
                 self.assertTrue(self.check(_load5=1.0, _cpu_count=12))
-                with self.assertRaisesRegex(ValueError, "host_cpu_load"):
-                    self.check(_load5=99.0, _cpu_count=12)
+                self.assertTrue(self.check(_load5=99.0, _cpu_count=12))
 
     def test_invalid_estimate_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "invalid memory_estimate_mb"):
@@ -606,6 +664,8 @@ class ResourceStatusTests(unittest.TestCase):
         self.assertEqual(doc["reason_codex_managed"], "launcher_memory_reserve")
 
     def test_cpu_overload_reports_host_cpu_load(self):
+        # V2 (t1511u): load/busy NEVER blocks; extreme load still admits.
+        # Name retained (no deletions); body asserts the choking-only policy.
         import json as _json
         from launcher.cli import resource_status
 
@@ -620,8 +680,8 @@ class ResourceStatusTests(unittest.TestCase):
              patch("builtins.print") as pr:
             self.assertEqual(resource_status(Args()), 0)
             doc = _json.loads(pr.call_args.args[0])
-        self.assertFalse(doc["launch_allowed"])
-        self.assertEqual(doc["reason"], "host_cpu_load")
+        self.assertTrue(doc["launch_allowed"])
+        self.assertIsNone(doc["reason"])
 
     def test_explicit_config_file_flows_through(self):
         cfg = Path(self.dir) / "rm.json"

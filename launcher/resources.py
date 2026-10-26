@@ -13,6 +13,12 @@ from launcher.resource_policy import (
     check_cpu_guard,
     valid_estimate_mb,
 )
+from launcher.cpu_resources import (
+    check_cpu_choking,
+    format_cpu_refusal,
+    sample_cpu_usage,
+    trusted_choking_from_env,
+)
 
 MAX_WORKER_MEMORY_MB = 1500
 DEFAULT_NATIVE_MEMORY_MB = 1500
@@ -148,8 +154,12 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     provider=None, is_managed=False,
                     memory_floor_mb=None, memory_estimate_mb=None,
                     cpu_load_factor=None, check_cpu=True,
-                    _load5=None, _cpu_count=None):
-    """Live MemAvailable admission.
+                    _load5=None, _cpu_count=None,
+                    cpu_usage=None, trusted_choking=None,
+                    expected_cpu_cores=None, ramping_cpu_cores=0.0,
+                    cpu_policy=None, _now_ms=None,
+                    _sample_cpu=False, _proc_root="/proc"):
+    """Live MemAvailable admission + choking-only CPU gate (USER t1511u V2).
 
     The worker cap (``requested_memory_mb`` validated against 1500/4096M)
     is the cgroup safety cap only. What is charged against MemAvailable is
@@ -161,10 +171,21 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
 
         MemAvailable - ramp_reserve - estimate(new) >= floor
 
-    with ``floor`` = ``memory_floor_mb`` (default 2048). A 5-minute load
-    above ``cpu_load_factor`` x cores refuses with ``host_cpu_load``.
-    Unknown CPU measurements fail closed. ``HUMAN_RAM_OVERRIDE`` skips
-    the memory floor only, never the disk, tmpdir, stage or CPU gates.
+    with ``floor`` = ``memory_floor_mb`` (default 2048).
+
+    CPU (t1511u): heavy busy% is FINE. Refusal happens ONLY on fresh actual
+    choking: PSI CPU FULL > cap (cpu_pressure), PSI memory FULL > cap
+    (memory_pressure), fresh OOM delta > 0 (host_oom), or fresh trusted host
+    runtime evidence (host_runtime_choking/host_oom). Load average, busy%,
+    predicted load, and unknown telemetry NEVER refuse. ``cpu_load_factor``
+    is accepted for compatibility but UNUSED. ``HUMAN_RAM_OVERRIDE`` skips
+    the memory floor only, never the disk, tmpdir, stage or CPU choking gate.
+
+    On CPU choking the error is the exact refusal slug line followed by a
+    ``CPU_ADMISSION_JSON`` object (no arbitrary text), e.g.::
+
+        cpu_pressure
+        CPU_ADMISSION_JSON {"current_cpu_cores": ..., ...}
     """
     if requested_memory_mb is None:
         raise ValueError("invalid requested worker memory")
@@ -184,6 +205,12 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         estimate_mb = requested_value
 
     factor = RESOURCE_DEFAULTS["cpu_load_factor"] if cpu_load_factor is None else cpu_load_factor
+    # Deprecated compatibility: validate bounds (fail closed) but UNUSED for
+    # admission (t1511u choking-only). Load/busy/predicted never refuse.
+    try:
+        _validate_knob("cpu_load_factor", factor)
+    except ValueError:
+        raise ValueError(f"invalid cpu_load_factor: {cpu_load_factor!r}") from None
 
     # Human override (experiment/human-ram-override-twentyfive-subagents-20261005.txt):
     # Ignore host-wide MemAvailable floor; worker MemoryMax stays at the policy
@@ -201,7 +228,45 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                 f"(launcher_memory_reserve)")
 
     if check_cpu:
-        check_cpu_guard(load5=_load5, cpu_count=_cpu_count, factor=factor)
+        policy_cpu = dict(cpu_policy or {})
+        for key in ("cpu_target_utilization", "cpu_psi_full_hard_cap_pct",
+                    "memory_psi_full_hard_cap_pct", "choking_cooldown_seconds"):
+            if key in RESOURCE_DEFAULTS and key not in policy_cpu:
+                policy_cpu[key] = RESOURCE_DEFAULTS[key]
+        live_usage = cpu_usage
+        if live_usage is None and _sample_cpu:
+            try:
+                sampled = sample_cpu_usage(proc_root=_proc_root)
+                live_usage = {k: sampled.get(k) for k in
+                              ("busy_percent", "busy_cores", "cores", "psi_avg10",
+                               "psi_full_avg10", "memory_psi_full_avg10",
+                               "oom_kills_delta", "observed_at", "interval_s")}
+            except Exception:
+                live_usage = None
+        hint = trusted_choking
+        if hint is None:
+            try:
+                hint = trusted_choking_from_env(
+                    now_ms=_now_ms,
+                    cooldown_s=policy_cpu.get("choking_cooldown_seconds", 300))
+            except Exception:
+                hint = None
+        import time as _time
+        now_ms = _now_ms if _now_ms is not None else int(_time.time() * 1000)
+        try:
+            cores_for_gate = _cpu_count
+            if cores_for_gate is None and isinstance(live_usage, dict):
+                cores_for_gate = live_usage.get("cores")
+        except Exception:
+            cores_for_gate = None
+        allowed, reason, admission = check_cpu_choking(
+            cpu_usage=live_usage, policy=policy_cpu, cores=cores_for_gate,
+            expected_cpu_cores=expected_cpu_cores
+            if expected_cpu_cores is not None else 0.0,
+            ramping_cpu_cores=ramping_cpu_cores or 0.0,
+            trusted_choking=hint, now_ms=now_ms)
+        if not allowed:
+            raise ValueError(format_cpu_refusal(reason, admission))
 
     if target_stage is not None:
         cap = evaluate_stage_capacity(concurrency=target_stage, mem_available_bytes=mem_avail, ignore_ram=ignore_ram)

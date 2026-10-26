@@ -83,7 +83,7 @@ Codex is explicitly unsupported in v0.1 (the protected `scripts/launch-codex.sh`
 
 ## Resource gates
 
-Placement is gated on live data: `MemAvailable - ramp_reserve(inflight starts) - estimate(new) >= floor`. Resident workers are already counted inside MemAvailable and are never reserved again; only inflight starts hold a ramp reserve (measured p90 × 1.25, fallback 512 MiB). Queued tasks hold no RAM before starting. No new placement while the 5-minute load average exceeds `1.5 × cores` (`host_cpu_load`). Worker MemoryMax caps (1500 MiB, 4096 MiB managed Codex) are per-session safety caps, not reservations. cwd and TMPDIR filesystems must retain >= 50 GiB + active reservations + 512 MiB spike; `/tmp` is rejected and TMPDIR must resolve under the owned `<repo>/.local/tmp` (path containment, not substring).
+Placement is gated on live data: `MemAvailable - ramp_reserve(inflight starts) - estimate(new) >= floor`. Resident workers are already counted inside MemAvailable and are never reserved again; only inflight starts hold a ramp reserve (measured p90 × 1.25, fallback 512 MiB). Queued tasks hold no RAM before starting. CPU admission is choking-only (USER t1511u V2): heavy busy% is fine (90%+ admits); only fresh PSI CPU FULL / PSI memory FULL, fresh OOM kills, or fresh trusted host runtime evidence queues with `cpu_pressure` / `memory_pressure` / `host_oom` / `host_runtime_choking`. Load average, busy%, predicted load, and unknown telemetry never block. Worker MemoryMax caps (1500 MiB, 4096 MiB managed Codex) are per-session safety caps, not reservations. cwd and TMPDIR filesystems must retain >= 50 GiB + active reservations + 512 MiB spike; `/tmp` is rejected and TMPDIR must resolve under the owned `<repo>/.local/tmp` (path containment, not substring).
 
 ## Hostwide Capacity & Concurrency Governor (C2661 / C2664 / C2670)
 
@@ -115,24 +115,38 @@ workers hold that ramp estimate; queued tasks hold nothing; stale starts
 and other unknown measurements hold the full allowance (fail closed).
 Admission requires the estimate plus the
 inflight ramp reserve to fit above the floor (default 2048 MiB).
-`resource-status --dry-run` neither settles tasks nor writes memory samples.
+`resource-status --dry-run` neither settles tasks nor writes memory samples,
+CPU samples, OOM baselines, or choking events (fully readonly).
 
 Knobs arrive from the Hub payload as `resource_management`
 (`memory_floor_mb`, `ramp_reserve_default_mb`, `estimate_percentile`,
-`estimate_multiplier`, `cpu_load_factor`, `ramp_seconds`, default 180)
+`estimate_multiplier`, `ramp_seconds` default 180, `cpu_load_factor`
+deprecated default 3.0 UNUSED, `cpu_target_utilization` default 1.0
+advisory, `cpu_default_cores` default 1.0, `cpu_estimate_multiplier`
+default 1.25, legacy `cpu_psi_hard_cap_pct` default 50 unused,
+`cpu_psi_full_hard_cap_pct` default 5, `memory_psi_full_hard_cap_pct`
+default 1, `choking_cooldown_seconds` default 300)
 with an optional per-task
-`memory_estimate_mb`. Bounds track the Hub contract
+`memory_estimate_mb` plus authoritative per-task `expected_cpu_cores` /
+`expected_cpu_source` (`repo_kind`/`repo`/`global`/`default`, frozen per
+task under the launch lock; missing payload falls back to the conservative
+`cpu_default_cores`). Bounds track the Hub contract
 (`src/resource-management.ts`): floor 128..1048576, ramp default
-64..65536, percentile 50..100, multiplier 1..4, ramp 30..900 s, CPU factor
-0.5..4.0; out-of-range values fail closed. Irrelevant Hub watchdog keys
+64..65536, percentile 50..100, multiplier 1..4, ramp 30..900 s, load factor
+0.5..4.0 (validated, unused), target 0.1..1, default cores 0.05..128,
+cpu multiplier 1..4, SOME cap 1..100 (unused), FULL caps 0.1..100,
+cooldown 30..3600; out-of-range values fail closed. Irrelevant Hub watchdog keys
 (`watchdog_interval_s`, `idle_minutes`, `rss_flag_gb`) are ignored. A JSON
 file with the same keys is honored only via an
 explicit path: payload `resource_config_path`, `--resource-config`, or
 `LAUNCHER_RESOURCE_CONFIG`; the repo `config/resource-management.json` is
 never auto-loaded. Missing knobs fall back to safe defaults; invalid values
 fail closed. `resource-status` reports the floor, ramp reserve, measured
-p90, active estimate, per-task breakdown, CPU gate state, and the
-`launcher_memory_reserve` / `host_cpu_load` verdicts.
+p90, active estimate, per-task breakdown, CPU choking verdict (numbers,
+telemetry, trusted hint, advisory `predicted_over_target`), and the
+`launcher_memory_reserve` / `cpu_pressure` / `memory_pressure` / `host_oom` /
+`host_runtime_choking` verdicts. `resource-status --dry-run` is fully
+readonly: no task transitions, no CPU sample/OOM/choking writes.
 
 ### Managed native Codex memory
 

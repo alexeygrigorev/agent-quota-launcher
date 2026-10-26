@@ -760,6 +760,16 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         load_resource_policy,
         resolve_memory_estimate_mb,
     )
+    from launcher.cpu_resources import (
+        check_cpu_choking,
+        format_cpu_refusal,
+        resolve_expected_cpu,
+        ramping_cpu_cores,
+        sample_cpu_usage,
+        read_oom_counter,
+        oom_delta,
+        trusted_choking_from_env,
+    )
     with launch_lock(lock_path):
         store.reserve_native_memory(task_id, requested_mem_mb)
         policy = load_resource_policy(payload, explicit_path=resource_config_path)
@@ -769,6 +779,101 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         record["resource_policy"] = policy
         record["memory_estimate_mb"] = memory_estimate_mb
         record["measured_p90_mb"] = measured_p90
+        # CPU V2 (t1511u choking-only): authoritative expected per task,
+        # frozen under this lock; never derived from goal text.
+        try:
+            expected_cpu_cores, expected_cpu_source = resolve_expected_cpu(
+                payload, policy=policy)
+        except ValueError as e:
+            record["outcome"] = "resource-refused"
+            record["reason"] = str(e)
+            _write_launch_record(cwd, record)
+            raise
+        frozen = store.freeze_cpu_start(task_id, expected_cpu_cores,
+                                        expected_cpu_source)
+        expected_cpu_cores = float(frozen["expected_cpu_cores"])
+        expected_cpu_source = frozen["expected_cpu_source"]
+        record["expected_cpu_cores"] = expected_cpu_cores
+        record["expected_cpu_source"] = expected_cpu_source
+        # Advisory ramping total over other live tasks (never admission).
+        try:
+            entries = store.cpu_ramping_entries(
+                exclude_task_id=task_id,
+                ramp_seconds=policy["ramp_seconds"],
+                default_expected=policy["cpu_default_cores"])
+            ramping_total = float(ramping_cpu_cores(entries, ramp_seconds=policy["ramp_seconds"]))
+        except Exception:
+            entries = []
+            ramping_total = 0.0
+        record["ramping_cpu_cores"] = ramping_total
+        record["ramping_cpu_entries"] = len(entries)
+        # Fresh host CPU telemetry (0.2s delta, readonly /proc).
+        try:
+            sampled = sample_cpu_usage()
+            cpu_usage_live = {k: sampled.get(k) for k in
+                              ("busy_percent", "busy_cores", "cores", "psi_avg10",
+                               "psi_full_avg10", "memory_psi_full_avg10",
+                               "observed_at", "interval_s")}
+            oom_current = sampled.get("oom_counter")
+        except Exception:
+            cpu_usage_live = None
+            oom_current = None
+        # OOM measured delta against the persisted baseline (first sample
+        # unknown). Baseline update is part of admission state (non-dry-run
+        # launch path only); resource-status --dry-run never writes.
+        try:
+            oom_prev = store.get_oom_baseline("/proc")
+            if oom_current is None:
+                try:
+                    oom_current = read_oom_counter("/proc")
+                except Exception:
+                    oom_current = None
+            if isinstance(cpu_usage_live, dict):
+                cpu_usage_live["oom_kills_delta"] = oom_delta(oom_prev, oom_current) \
+                    if oom_prev is not None or oom_current is not None else None
+            if oom_current is not None:
+                store.set_oom_baseline("/proc", oom_current)
+        except Exception:
+            pass
+        # Trusted host runtime hint (env/file from host only) + durable
+        # positive cooldown evidence. Task payload/goal text is NEVER parsed.
+        try:
+            hint = trusted_choking_from_env(
+                cooldown_s=policy["choking_cooldown_seconds"])
+        except Exception:
+            hint = None
+        try:
+            stored = store.get_fresh_choking(
+                cooldown_s=policy["choking_cooldown_seconds"])
+        except Exception:
+            stored = None
+        trusted_hint = hint if hint is not None else stored
+        # Persist fresh positive OOM evidence so the cooldown survives
+        # cycles where the next measured delta is back to 0. PSI FULL is
+        # measured live every admission and needs no event row. Trusted
+        # host runtime hints from the environment are recorded once so
+        # later admissions see them via get_fresh_choking.
+        try:
+            import time as _ctime2
+            from datetime import datetime as _dt, timezone as _tz
+            _now2 = int(_ctime2.time() * 1000)
+            _obs = (cpu_usage_live or {}).get("observed_at")
+            _fresh = False
+            if isinstance(_obs, str):
+                try:
+                    _at = int(_dt.fromisoformat(_obs.replace("Z", "+00:00")).timestamp() * 1000)
+                    _fresh = 0 <= _now2 - _at <= 180000 and _at <= _now2 + 30000
+                except (ValueError, AttributeError, TypeError):
+                    _fresh = False
+            if _fresh and isinstance((cpu_usage_live or {}).get("oom_kills_delta"), int) \
+                    and (cpu_usage_live or {}).get("oom_kills_delta") > 0:
+                store.record_choking_event("host_oom", _obs)
+            if hint is not None and stored is None:
+                store.record_choking_event(hint["reason"], hint["observed_at"])
+        except Exception:
+            pass
+        record["cpu_usage"] = cpu_usage_live
+        record["trusted_choking"] = trusted_hint
         active_mem, active_disk = store.get_active_resources(
             exclude_task_id=task_id,
             ramp_reserve_mb=policy["ramp_reserve_default_mb"],
@@ -777,12 +882,30 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             estimate_multiplier=policy["estimate_multiplier"])
         record['active_mem_mb'], record['active_disk_mb'] = active_mem, active_disk
         record['ramp_reserve_mb'] = active_mem
-        check_resources(requested_mem_mb, workspace, tmpdir_resolved,
-                        active_mem, active_disk, repo_root=workspace,
-                        provider=provider, is_managed=is_managed,
-                        memory_floor_mb=policy["memory_floor_mb"],
-                        memory_estimate_mb=memory_estimate_mb,
-                        cpu_load_factor=policy["cpu_load_factor"])
+        try:
+            check_resources(requested_mem_mb, workspace, tmpdir_resolved,
+                            active_mem, active_disk, repo_root=workspace,
+                            provider=provider, is_managed=is_managed,
+                            memory_floor_mb=policy["memory_floor_mb"],
+                            memory_estimate_mb=memory_estimate_mb,
+                            cpu_load_factor=policy["cpu_load_factor"],
+                            cpu_usage=cpu_usage_live,
+                            trusted_choking=trusted_hint,
+                            expected_cpu_cores=expected_cpu_cores,
+                            ramping_cpu_cores=ramping_total,
+                            cpu_policy=policy)
+        except ValueError as e:
+            # CPU choking refusals carry the exact slug + CPU_ADMISSION_JSON.
+            # The task stays queued; the watch loop retries after cooldown.
+            record["outcome"] = "resource-refused"
+            record["reason"] = str(e)[:2000]
+            try:
+                record["cpu_admission"] = str(e).split("CPU_ADMISSION_JSON", 1)[1].strip()
+            except Exception:
+                pass
+            _write_launch_record(cwd, record)
+            raise
+        record["cpu_admission"] = None
         store.transition_task(task_id, "starting", ("queued",),
                               reason=f"launching via {provider}")
         env = os.environ.copy()

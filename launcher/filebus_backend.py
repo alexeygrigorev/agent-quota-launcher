@@ -127,7 +127,9 @@ def validate_filebus_identity(record: dict) -> bool:
 
 
 def admit_headless(quse_json, memory_mb, workspace, tmpdir, active_mem_mb=0, active_disk_mb=0,
-                   memory_floor_mb=None, memory_estimate_mb=None, cpu_load_factor=None):
+                   memory_floor_mb=None, memory_estimate_mb=None, cpu_load_factor=None,
+                   cpu_usage=None, trusted_choking=None, expected_cpu_cores=None,
+                   ramping_cpu_cores=0.0, cpu_policy=None):
     """Reuse canonical admission. Fail-closed. Does not raise pids.max."""
     from launcher.resources import DEFAULT_MEMORY_FLOOR_MB
     from launcher.resource_policy import RESOURCE_DEFAULTS
@@ -138,7 +140,12 @@ def admit_headless(quse_json, memory_mb, workspace, tmpdir, active_mem_mb=0, act
                     repo_root=workspace,
                     memory_floor_mb=memory_floor_mb if memory_floor_mb is not None else DEFAULT_MEMORY_FLOOR_MB,
                     memory_estimate_mb=memory_estimate_mb,
-                    cpu_load_factor=cpu_load_factor if cpu_load_factor is not None else RESOURCE_DEFAULTS["cpu_load_factor"])
+                    cpu_load_factor=cpu_load_factor if cpu_load_factor is not None else RESOURCE_DEFAULTS["cpu_load_factor"],
+                    cpu_usage=cpu_usage,
+                    trusted_choking=trusted_choking,
+                    expected_cpu_cores=expected_cpu_cores,
+                    ramping_cpu_cores=ramping_cpu_cores,
+                    cpu_policy=cpu_policy)
     tmp = Path(tmpdir).resolve()
     root = Path(workspace).resolve() / ".local" / "tmp"
     if not tmp.is_relative_to(root):

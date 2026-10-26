@@ -46,6 +46,38 @@ CREATE TABLE IF NOT EXISTS memory_samples (
     PRIMARY KEY(task_id, native_id, incarnation, bucket)
 );
 
+CREATE TABLE IF NOT EXISTS cpu_starts (
+    task_id TEXT PRIMARY KEY,
+    expected_cpu_cores REAL NOT NULL,
+    expected_cpu_source TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS cpu_samples (
+    task_id TEXT PRIMARY KEY,
+    current_cpu_cores REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    counter REAL NOT NULL,
+    observed_ms INTEGER NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS cpu_choking_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cpu_oom_baseline (
+    proc_root TEXT PRIMARY KEY,
+    counter INTEGER NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS task_native_bindings (
     task_id TEXT PRIMARY KEY,
     native_id TEXT NOT NULL,
@@ -706,6 +738,178 @@ class Store:
         with self.get_conn() as conn:
             rows = conn.execute("SELECT resident_mb FROM memory_samples").fetchall()
         return percentile_of([r[0] for r in rows], percentile)
+
+    # ---- CPU parity (t1511u V2, choking-only) ----
+
+    def freeze_cpu_start(self, task_id, expected_cpu_cores, expected_cpu_source,
+                         dry_run=False):
+        """Freeze the authoritative expected CPU per task (INSERT OR IGNORE).
+
+        Called under the existing launch lock at placement. Never overwrites
+        an existing freeze. Writes are skipped on dry_run (readonly).
+        """
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT expected_cpu_cores, expected_cpu_source FROM cpu_starts WHERE task_id = ?",
+                (task_id,)).fetchone()
+            if row:
+                return {"expected_cpu_cores": row[0], "expected_cpu_source": row[1]}
+            if not dry_run:
+                conn.execute(
+                    "INSERT OR IGNORE INTO cpu_starts (task_id, expected_cpu_cores, expected_cpu_source) VALUES (?, ?, ?)",
+                    (task_id, float(expected_cpu_cores), expected_cpu_source))
+            return {"expected_cpu_cores": float(expected_cpu_cores),
+                    "expected_cpu_source": expected_cpu_source}
+
+    def get_cpu_start(self, task_id):
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT expected_cpu_cores, expected_cpu_source FROM cpu_starts WHERE task_id = ?",
+                (task_id,)).fetchone()
+        if not row:
+            return None
+        return {"expected_cpu_cores": row[0], "expected_cpu_source": row[1]}
+
+    def record_cpu_sample(self, task_id, current_cpu_cores, observed_at,
+                          identity, counter, observed_ms, dry_run=False):
+        """Persist exact-incarnation current CPU. Skipped on dry_run."""
+        if dry_run:
+            return
+        with self.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO cpu_samples (task_id, current_cpu_cores, observed_at, identity, counter, observed_ms) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores, observed_at=excluded.observed_at, "
+                "identity=excluded.identity, counter=excluded.counter, observed_ms=excluded.observed_ms",
+                (task_id, float(current_cpu_cores), observed_at, str(identity),
+                 float(counter), int(observed_ms)))
+
+    def get_cpu_sample(self, task_id):
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT current_cpu_cores, observed_at, identity, counter, observed_ms FROM cpu_samples WHERE task_id = ?",
+                (task_id,)).fetchone()
+        if not row:
+            return None
+        return {"current_cpu_cores": row[0], "observed_at": row[1],
+                "identity": row[2], "counter": row[3], "observed_ms": row[4]}
+
+    def record_choking_event(self, reason, observed_at, dry_run=False):
+        """Keep positive choking cooldown evidence across cycles.
+
+        Writes are skipped on dry_run (readonly). Callers must pass only
+        validated fresh reasons (host_oom/host_runtime_choking).
+        """
+        if dry_run:
+            return
+        with self.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO cpu_choking_events (reason, observed_at) VALUES (?, ?)",
+                (reason, observed_at))
+
+    def get_fresh_choking(self, cooldown_s=300, now_ms=None):
+        """Latest choking event within cooldown, or None. Read-only."""
+        import time as _time
+        from datetime import datetime, timezone
+        if now_ms is None:
+            now_ms = int(_time.time() * 1000)
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT reason, observed_at FROM cpu_choking_events ORDER BY id DESC LIMIT 20").fetchall()
+        for reason, observed_at in rows:
+            if reason not in ("host_oom", "host_runtime_choking"):
+                continue
+            try:
+                text = str(observed_at).replace("Z", "+00:00")
+                at = int(datetime.fromisoformat(text).timestamp() * 1000)
+            except (ValueError, AttributeError, TypeError):
+                continue
+            if at > now_ms + 30000:
+                continue
+            if 0 <= now_ms - at <= cooldown_s * 1000:
+                return {"reason": reason, "observed_at": observed_at}
+        return None
+
+    def get_oom_baseline(self, proc_root="/proc"):
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT counter FROM cpu_oom_baseline WHERE proc_root = ?",
+                (str(proc_root),)).fetchone()
+        return row[0] if row else None
+
+    def set_oom_baseline(self, proc_root, counter, dry_run=False):
+        if dry_run:
+            return
+        with self.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO cpu_oom_baseline (proc_root, counter) VALUES (?, ?) "
+                "ON CONFLICT(proc_root) DO UPDATE SET counter=excluded.counter",
+                (str(proc_root), int(counter)))
+
+    def cpu_ramping_entries(self, exclude_task_id=None, ramp_seconds=180,
+                            default_expected=1.0, dry_run=False):
+        """Build advisory ramping entries for live tasks.
+
+        Queued entries contribute 0; stable residents at/after the ramp
+        contribute 0 (host busy already includes them); young/unknown-age
+        non-queued tasks retain max(0, frozen_expected - fresh_current).
+        Frozen expected CPU comes from cpu_starts, else the task payload
+        authoritative fields, else the conservative default. Current CPU
+        comes from exact-incarnation cpu_samples only when fresh (<=180s).
+        Read-only except for resolving payload defaults (no writes here).
+        """
+        import json as _json
+        import time as _time
+        from launcher.cpu_resources import resolve_expected_cpu
+        now_ms = int(_time.time() * 1000)
+        entries = []
+        with self.get_conn() as conn:
+            placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
+            query = (f"SELECT t.id, t.payload, t.state FROM tasks t "
+                     f"WHERE t.state IN ({placeholders})")
+            params = list(RESOURCE_HOLDING_STATES)
+            if exclude_task_id:
+                query += " AND t.id != ?"
+                params.append(exclude_task_id)
+            rows = conn.execute(query, params).fetchall()
+        for task_id, raw_payload, state in rows:
+            try:
+                payload = _json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            except (ValueError, TypeError):
+                payload = None
+            if not isinstance(payload, dict):
+                payload = {}
+            frozen = self.get_cpu_start(task_id)
+            if frozen is not None:
+                expected = frozen["expected_cpu_cores"]
+            else:
+                try:
+                    expected, _source = resolve_expected_cpu(
+                        payload, policy={"cpu_default_cores": default_expected})
+                except ValueError:
+                    continue
+            binding = self.get_native_binding(task_id)
+            age = self._task_age_seconds(task_id, binding)
+            current = None
+            sample = self.get_cpu_sample(task_id)
+            if sample is not None:
+                try:
+                    from datetime import datetime, timezone
+                    text = str(sample["observed_at"]).replace("Z", "+00:00")
+                    at = int(datetime.fromisoformat(text).timestamp() * 1000)
+                    if 0 <= now_ms - at <= 180000 and at >= now_ms - 180000:
+                        # Only credit exact-incarnation samples.
+                        if binding and sample.get("identity") == \
+                                f"{binding.get('native_id')}:{binding.get('incarnation')}":
+                            current = sample.get("current_cpu_cores")
+                        elif not binding:
+                            current = None
+                except (ValueError, AttributeError, TypeError):
+                    current = None
+            entries.append({"task_id": task_id, "state": state,
+                            "expected_cpu_cores": expected,
+                            "current_cpu_cores": current,
+                            "age_seconds": age})
+        return entries
 
     def _task_age_seconds(self, task_id, binding=None):
         """Seconds since the task/binding was last updated; None if unknown."""

@@ -17,7 +17,10 @@ per-session reservations::
 Knobs arrive from the Hub payload as ``resource_management``::
 
     {memory_floor_mb, ramp_reserve_default_mb, estimate_percentile,
-     estimate_multiplier, cpu_load_factor, ramp_seconds}
+     estimate_multiplier, ramp_seconds, cpu_target_utilization,
+     cpu_default_cores, cpu_estimate_multiplier, cpu_psi_hard_cap_pct,
+     cpu_psi_full_hard_cap_pct, memory_psi_full_hard_cap_pct,
+     choking_cooldown_seconds, cpu_load_factor (deprecated, unused)}
 
 with an optional per-task ``memory_estimate_mb``. A JSON file with the
 same keys may be supplied, but only via an explicit path (payload
@@ -26,7 +29,13 @@ same keys may be supplied, but only via an explicit path (payload
 is never auto-loaded. Missing knobs fall back to safe defaults below.
 Bounds match the Hub contract (``src/resource-management.ts``);
 irrelevant watchdog keys (``watchdog_interval_s``, ``idle_minutes``,
-``rss_flag_gb``, ``keep``) are ignored. Unknown measurements fail closed.
+``rss_flag_gb``, ``keep``) are ignored. Unknown measurements stay unknown.
+
+CPU admission (USER t1511u V2) is choking-only: heavy busy% is fine. Only
+fresh PSI CPU FULL / PSI memory FULL, fresh OOM kills, or fresh trusted
+host runtime evidence refuses. Load average, busy%, predicted load, and
+unknown telemetry never refuse. ``cpu_load_factor`` is accepted for
+compatibility (default 3.0) but UNUSED for admission.
 """
 
 import json
@@ -34,13 +43,20 @@ import math
 import os
 from pathlib import Path
 
+from launcher.cpu_resources import CPU_BOUNDS as _CPU_BOUNDS
+from launcher.cpu_resources import CPU_DEFAULTS as _CPU_DEFAULTS
+from launcher.cpu_resources import CPU_FLOAT_KNOBS as _CPU_FLOAT_KNOBS
+from launcher.cpu_resources import overlay_cpu_defaults
+
 RESOURCE_DEFAULTS = {
     "memory_floor_mb": 2048,
     "ramp_reserve_default_mb": 512,
     "estimate_percentile": 90,
     "estimate_multiplier": 1.25,
-    "cpu_load_factor": 1.5,
     "ramp_seconds": 180,
+    # Deprecated compatibility: accepted but UNUSED for admission (t1511u).
+    "cpu_load_factor": 3.0,
+    **_CPU_DEFAULTS,
 }
 
 RESOURCE_CONFIG_ENV = "LAUNCHER_RESOURCE_CONFIG"
@@ -53,12 +69,12 @@ _BOUNDS = {
     "ramp_reserve_default_mb": (64, 65536),
     "estimate_percentile": (50, 100),
     "estimate_multiplier": (1, 4),
-    "cpu_load_factor": (0.5, 4),
     "ramp_seconds": (30, 900),
+    **_CPU_BOUNDS,
 }
 
 # Knobs that accept a finite float (ints are accepted and kept as given).
-_FLOAT_KNOBS = ("estimate_multiplier", "cpu_load_factor")
+_FLOAT_KNOBS = ("estimate_multiplier", *_CPU_FLOAT_KNOBS)
 
 
 def _validate_knob(name, value):
@@ -80,6 +96,7 @@ def _overlay(base, patch, source):
     for key in RESOURCE_DEFAULTS:
         if key in patch:
             base[key] = _validate_knob(key, patch[key])
+    overlay_cpu_defaults(base, patch)
     return base
 
 
@@ -201,39 +218,22 @@ def read_cpu_count():
 
 
 def check_cpu_guard(load5=None, cpu_count=None, factor=1.5):
-    """Refuse placement while 5-min load exceeds factor x cores. Fail closed.
+    """Deprecated compatibility (USER t1511u): load NEVER refuses admission.
 
-    Raises ``ValueError("host_cpu_load ...")`` when overloaded and
-    ``ValueError("host cpu ... unknown ...")`` when either measurement is
-    missing, so unknown hosts never place blindly. Returns True otherwise.
+    Kept for callers/tests importing the old symbol. Always returns True.
+    Real CPU admission is choking-only via launcher.cpu_resources
+    (fresh PSI FULL CPU/memory, fresh OOM, fresh trusted runtime evidence).
+    ``read_load5``/``read_cpu_count`` remain for diagnostics display only.
     """
-    if load5 is None:
-        load5 = read_load5()
-    if cpu_count is None:
-        cpu_count = read_cpu_count()
-    if not isinstance(factor, (int, float)) or isinstance(factor, bool) \
-            or not math.isfinite(factor) or factor <= 0:
-        raise ValueError(f"invalid cpu_load_factor: {factor!r}")
-    if not isinstance(load5, (int, float)) or isinstance(load5, bool) \
-            or not math.isfinite(load5) or load5 < 0:
-        raise ValueError("host cpu load5 unknown: refusing placement (fail closed)")
-    if type(cpu_count) is not int or cpu_count <= 0:
-        raise ValueError("host cpu count unknown: refusing placement (fail closed)")
-    if load5 > float(factor) * cpu_count:
-        raise ValueError(
-            f"host_cpu_load: 5-min load {load5:.2f} > {factor} x {cpu_count} cores")
     return True
 
 
 def cpu_guard_status(load5=None, cpu_count=None, factor=1.5):
-    """Machine-readable CPU gate state for resource-status (never raises)."""
-    try:
-        check_cpu_guard(load5=load5, cpu_count=cpu_count, factor=factor)
-        return {"allowed": True, "load5": load5 if load5 is not None else read_load5(),
-                "cores": cpu_count if cpu_count is not None else read_cpu_count(),
-                "factor": factor, "reason": None}
-    except ValueError as e:
-        return {"allowed": False,
-                "load5": load5 if load5 is not None else read_load5(),
-                "cores": cpu_count if cpu_count is not None else read_cpu_count(),
-                "factor": factor, "reason": str(e)}
+    """Machine-readable legacy CPU gate state (always allowed, display only)."""
+    if load5 is None:
+        load5 = read_load5()
+    if cpu_count is None:
+        cpu_count = read_cpu_count()
+    return {"allowed": True, "load5": load5, "cores": cpu_count,
+            "factor": factor, "reason": None,
+            "note": "loadavg display only; admission is choking-only (t1511u)"}

@@ -404,6 +404,11 @@ def admit_task_unit(
     memory_floor_mb: Optional[int] = None,
     memory_estimate_mb: Optional[int] = None,
     cpu_load_factor: Optional[float] = None,
+    cpu_usage: Optional[dict] = None,
+    trusted_choking: Optional[dict] = None,
+    expected_cpu_cores: Optional[float] = None,
+    ramping_cpu_cores: float = 0.0,
+    cpu_policy: Optional[dict] = None,
 ) -> bool:
     """Enforce floors and actual-command quota.
 
@@ -412,6 +417,8 @@ def admit_task_unit(
     Model commands are HELD until a qualified atomic process cohort backend
     exists, even with eligible bound quota. Raw dictionaries remain legacy
     non-model preflight evidence only; no model launch authority is granted.
+    CPU admission is choking-only (t1511u): busy/predicted/unknown never
+    refuse; only fresh PSI FULL CPU/memory, OOM, or trusted runtime hints.
     """
     if int(memory_mb) > MAX_MEMORY_MB:
         raise TaskUnitAdmissionError(
@@ -467,9 +474,9 @@ def admit_task_unit(
             f"TMPDIR '{tmp_path}' must be located under '{allowed_tmp_root}'"
         )
 
-    # Check live host floors (MemAvailable ramp+estimate >= floor, CPU load
-    # guard, disk floor, deny /data). The estimate defaults to the full
-    # worker cap when the caller has no measured value (fail closed).
+    # Check live host floors (MemAvailable ramp+estimate >= floor, CPU
+    # choking-only gate, disk floor, deny /data). The estimate defaults to
+    # the full worker cap when the caller has no measured value (fail closed).
     # Runtime defaults track the shared Hub contract (floor 2048).
     try:
         check_resources(
@@ -482,6 +489,11 @@ def admit_task_unit(
             memory_floor_mb=memory_floor_mb if memory_floor_mb is not None else DEFAULT_MEMORY_FLOOR_MB,
             memory_estimate_mb=memory_estimate_mb,
             cpu_load_factor=cpu_load_factor if cpu_load_factor is not None else RESOURCE_DEFAULTS["cpu_load_factor"],
+            cpu_usage=cpu_usage,
+            trusted_choking=trusted_choking,
+            expected_cpu_cores=expected_cpu_cores,
+            ramping_cpu_cores=ramping_cpu_cores,
+            cpu_policy=cpu_policy,
         )
     except Exception as e:
         raise TaskUnitAdmissionError(f"resource floor check failed: {e}") from e
@@ -1072,6 +1084,11 @@ def execute_transient_task_unit(
     memory_floor_mb: Optional[int] = None,
     memory_estimate_mb: Optional[int] = None,
     cpu_load_factor: Optional[float] = None,
+    cpu_usage: Optional[dict] = None,
+    trusted_choking: Optional[dict] = None,
+    expected_cpu_cores: Optional[float] = None,
+    ramping_cpu_cores: float = 0.0,
+    cpu_policy: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -1104,6 +1121,11 @@ def execute_transient_task_unit(
         memory_floor_mb=memory_floor_mb,
         memory_estimate_mb=memory_estimate_mb,
         cpu_load_factor=cpu_load_factor,
+        cpu_usage=cpu_usage,
+        trusted_choking=trusted_choking,
+        expected_cpu_cores=expected_cpu_cores,
+        ramping_cpu_cores=ramping_cpu_cores,
+        cpu_policy=cpu_policy,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider
@@ -1522,6 +1544,11 @@ def spawn_transient_task_unit(
     memory_floor_mb: Optional[int] = None,
     memory_estimate_mb: Optional[int] = None,
     cpu_load_factor: Optional[float] = None,
+    cpu_usage: Optional[dict] = None,
+    trusted_choking: Optional[dict] = None,
+    expected_cpu_cores: Optional[float] = None,
+    ramping_cpu_cores: float = 0.0,
+    cpu_policy: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -1552,6 +1579,11 @@ def spawn_transient_task_unit(
         memory_floor_mb=memory_floor_mb,
         memory_estimate_mb=memory_estimate_mb,
         cpu_load_factor=cpu_load_factor,
+        cpu_usage=cpu_usage,
+        trusted_choking=trusted_choking,
+        expected_cpu_cores=expected_cpu_cores,
+        ramping_cpu_cores=ramping_cpu_cores,
+        cpu_policy=cpu_policy,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider

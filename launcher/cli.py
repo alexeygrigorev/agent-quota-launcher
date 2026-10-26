@@ -394,10 +394,18 @@ def run_task_units(args):
     model = chosen_model or payload.get("model")
     argv = build_adapter_argv(provider, goal, model=model)
     from launcher.resource_policy import load_resource_policy, resolve_memory_estimate_mb
+    from launcher.cpu_resources import resolve_expected_cpu
     tu_policy = load_resource_policy(payload)
     tu_estimate = resolve_memory_estimate_mb(
         payload, store.memory_samples_p90(tu_policy["estimate_percentile"]),
         tu_policy, cap_mb=memory_mb)
+    try:
+        tu_expected, tu_source = resolve_expected_cpu(payload, policy=tu_policy)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
+        return 1
+    with launch_lock(str(lock_path)):
+        store.freeze_cpu_start(args.id, tu_expected, tu_source)
     # C2456: hold launch.lock only for Store lease, not the model wait.
     with launch_lock(str(lock_path)):
         store.transition_task(args.id, "starting", ("queued",),
@@ -711,7 +719,12 @@ def model_support(args):
 
 
 def resource_status(args):
-    """Reconcile without dispatch or stopping sessions; dry-run never transitions tasks."""
+    """Reconcile without dispatch or stopping sessions; dry-run is readonly.
+
+    Dry-run never transitions tasks, never writes CPU samples, OOM baselines,
+    or choking events. CPU admission here is choking-only (t1511u): busy and
+    predicted load are advisory only.
+    """
     from launcher.resources import (
         get_mem_available,
         DEFAULT_NATIVE_MEMORY_MB,
@@ -722,6 +735,16 @@ def resource_status(args):
         cpu_guard_status,
         load_resource_policy,
         resolve_memory_estimate_mb,
+    )
+    from launcher.cpu_resources import (
+        check_cpu_choking,
+        oom_delta,
+        read_oom_counter,
+        ramping_cpu_cores,
+        resolve_expected_cpu,
+        sample_cpu_usage,
+        sanitize_cpu_usage,
+        trusted_choking_from_env,
     )
     store = get_store(args)
     policy = load_resource_policy(
@@ -753,19 +776,93 @@ def resource_status(args):
     if args.dry_run:
         count -= len(changes)
         reserved -= sum(r["memory_mb"] for r in changes)
-    cpu = cpu_guard_status(factor=policy["cpu_load_factor"])
+    legacy_cpu = cpu_guard_status(factor=policy["cpu_load_factor"])
+    try:
+        sampled = sample_cpu_usage()
+        cpu_usage_live = {k: sampled.get(k) for k in
+                          ("busy_percent", "busy_cores", "cores", "psi_avg10",
+                           "psi_full_avg10", "memory_psi_full_avg10",
+                           "observed_at", "interval_s")}
+    except Exception:
+        cpu_usage_live = None
+        sampled = {}
+    try:
+        oom_prev = store.get_oom_baseline("/proc")
+        oom_cur = (sampled or {}).get("oom_counter")
+        if oom_cur is None:
+            try:
+                oom_cur = read_oom_counter("/proc")
+            except Exception:
+                oom_cur = None
+        if isinstance(cpu_usage_live, dict):
+            cpu_usage_live["oom_kills_delta"] = oom_delta(oom_prev, oom_cur) \
+                if oom_prev is not None or oom_cur is not None else None
+    except Exception:
+        pass
+    try:
+        hint = trusted_choking_from_env(
+            cooldown_s=policy["choking_cooldown_seconds"])
+    except Exception:
+        hint = None
+    try:
+        stored_hint = store.get_fresh_choking(
+            cooldown_s=policy["choking_cooldown_seconds"])
+    except Exception:
+        stored_hint = None
+    trusted_hint = hint if hint is not None else stored_hint
+    try:
+        default_expected, default_source = resolve_expected_cpu(None, policy=policy)
+    except ValueError:
+        default_expected, default_source = policy["cpu_default_cores"], "default"
+    try:
+        entries = store.cpu_ramping_entries(
+            ramp_seconds=policy["ramp_seconds"],
+            default_expected=policy["cpu_default_cores"])
+        ramping_total = float(ramping_cpu_cores(entries, ramp_seconds=policy["ramp_seconds"]))
+    except Exception:
+        entries = []
+        ramping_total = 0.0
+    import time as _time
+    _now = int(_time.time() * 1000)
+    try:
+        _cores = (cpu_usage_live or {}).get("cores")
+        allowed, cpu_reason, admission = check_cpu_choking(
+            cpu_usage=cpu_usage_live, policy=policy, cores=_cores,
+            expected_cpu_cores=default_expected,
+            ramping_cpu_cores=ramping_total,
+            trusted_choking=trusted_hint, now_ms=_now)
+    except Exception:
+        allowed, cpu_reason, admission = True, None, None
+    try:
+        _san = sanitize_cpu_usage(cpu_usage_live) if cpu_usage_live else None
+        _cores2 = (cpu_usage_live or {}).get("cores")
+        _busy = _san.get("busy_cores") if _san else None
+        _limit = _cores2 * policy["cpu_target_utilization"] \
+            if isinstance(_cores2, int) else None
+        predicted = (_busy + default_expected + ramping_total > _limit) \
+            if (_busy is not None and _limit is not None) else None
+    except Exception:
+        predicted = None
+    cpu = {"allowed": allowed, "reason": cpu_reason, "admission": admission,
+           "expected_cpu_cores": default_expected,
+           "expected_cpu_source": default_source,
+           "ramping_cpu_cores": ramping_total,
+           "predicted_over_target": predicted,
+           "telemetry": cpu_usage_live,
+           "trusted_choking": trusted_hint,
+           "legacy_load_display": legacy_cpu}
     mem_ok = available - memory - estimate_new >= floor_mb
-    default_allowed = mem_ok and cpu["allowed"]
+    default_allowed = mem_ok and allowed
     if not mem_ok:
         reason = "launcher_memory_reserve"
-    elif not cpu["allowed"]:
-        reason = "host_cpu_load"
+    elif not allowed:
+        reason = cpu_reason
     else:
         reason = None
     # Managed Codex uses the same measured admission policy as native start.
     # Its 4096MiB containment cap bounds the estimate; it is not a RAM hold.
     codex_headroom = available - memory - estimate_codex >= floor_mb
-    codex_allowed = codex_headroom and cpu["allowed"]
+    codex_allowed = codex_headroom and allowed
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
                       "mem_available_mb": available,
@@ -778,13 +875,21 @@ def resource_status(args):
                       "estimate_multiplier": policy["estimate_multiplier"],
                       "ramp_reserve_default_mb": policy["ramp_reserve_default_mb"],
                       "ramp_seconds": policy["ramp_seconds"],
+                      "cpu_load_factor": policy["cpu_load_factor"],
+                      "cpu_target_utilization": policy["cpu_target_utilization"],
+                      "cpu_default_cores": policy["cpu_default_cores"],
+                      "cpu_estimate_multiplier": policy["cpu_estimate_multiplier"],
+                      "cpu_psi_hard_cap_pct": policy["cpu_psi_hard_cap_pct"],
+                      "cpu_psi_full_hard_cap_pct": policy["cpu_psi_full_hard_cap_pct"],
+                      "memory_psi_full_hard_cap_pct": policy["memory_psi_full_hard_cap_pct"],
+                      "choking_cooldown_seconds": policy["choking_cooldown_seconds"],
                       "cpu": cpu,
                       "breakdown": breakdown,
                       "launch_allowed": default_allowed,
                       "reason": reason,
                       "launch_allowed_codex_managed": codex_allowed,
                       "reason_codex_managed": None if codex_allowed else (
-                          "launcher_memory_reserve" if not codex_headroom else "host_cpu_load"),
+                          "launcher_memory_reserve" if not codex_headroom else cpu_reason),
                       "default_memory_mb": DEFAULT_NATIVE_MEMORY_MB,
                       "codex_managed_memory_mb": CODEX_MANAGED_NATIVE_MEMORY_MB,
                       "dry_run": args.dry_run, "reconciled": changes}))
