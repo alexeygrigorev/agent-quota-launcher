@@ -400,5 +400,51 @@ class SanitizeTests(unittest.TestCase):
         self.assertIsNone(sanitize_cpu_usage(bad)["busy_cores"])
 
 
+class TrustedHostCliBridgeTests(unittest.TestCase):
+    def test_native_and_task_units_receive_explicit_hint_without_task_payload_trust(self):
+        from types import SimpleNamespace
+        from launcher import cli
+        at = datetime.now(timezone.utc).isoformat()
+        hint = {"reason": "host_runtime_choking", "observed_at": at}
+        for backend, function in (("aplexer", "do_run"), ("task-units", "run_task_units")):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as tmp:
+                args = SimpleNamespace(config_dir=tmp, backend=backend, id="proof", cwd=tmp,
+                                       tmpdir=tmp, trusted_choking_json=json.dumps(hint))
+                def checked(*a, **kw):
+                    self.assertEqual(cpu.trusted_choking_from_env(), hint)
+                    return 1
+                with patch.dict(os.environ, {"LAUNCHER_TRUSTED_CHOKING_JSON": "prior"}), \
+                     patch.object(cli, function, side_effect=checked):
+                    self.assertEqual(cli.run(args), 1)
+                    self.assertEqual(os.environ["LAUNCHER_TRUSTED_CHOKING_JSON"], "prior")
+
+    def test_malformed_unknown_and_unbounded_flags_remain_advisory_and_restore_environment(self):
+        from types import SimpleNamespace
+        from launcher import cli
+        for raw in ("bad-json", "x" * 513, '{"reason":"host_oom","observed_at":"2020-01-01T00:00:00Z"}',
+                    json.dumps({"reason":"host_oom", "observed_at":datetime.now(timezone.utc).isoformat(), "extra":"text"})):
+            with self.subTest(raw=raw[:25]), patch.object(cli, "_run_with_host_hint") as run:
+                def checked(args):
+                    self.assertIsNone(cpu.trusted_choking_from_env())
+                    raise RuntimeError("backend failed")
+                run.side_effect = checked
+                with patch.dict(os.environ, {"LAUNCHER_TRUSTED_CHOKING_JSON":"prior"}):
+                    with self.assertRaises(RuntimeError):
+                        cli.run(SimpleNamespace(trusted_choking_json=raw))
+                    self.assertEqual(os.environ["LAUNCHER_TRUSTED_CHOKING_JSON"], "prior")
+
+    def test_detached_controller_carries_explicit_hint_as_argv(self):
+        from types import SimpleNamespace
+        from launcher import cli
+        with tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as tmp:
+            hint = json.dumps({"reason":"host_oom", "observed_at":datetime.now(timezone.utc).isoformat()})
+            args=SimpleNamespace(config_dir=tmp,id="proof",cwd=tmp,tmpdir=tmp,trusted_choking_json=hint)
+            with patch.object(cli.subprocess,"run",return_value=SimpleNamespace(returncode=0)) as run:
+                self.assertEqual(cli.spawn_ql_controller(args,return_dict=True)["state"],"queued-or-starting")
+                command=run.call_args.args[0]
+                index=command.index("--trusted-choking-json")
+                self.assertEqual(command[index+1],hint)
+
+
 if __name__ == "__main__":
     unittest.main()

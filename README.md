@@ -148,6 +148,12 @@ telemetry, trusted hint, advisory `predicted_over_target`), and the
 `host_runtime_choking` verdicts. `resource-status --dry-run` is fully
 readonly: no task transitions, no CPU sample/OOM/choking writes.
 
+Hosts pass validated runtime evidence through `run --trusted-choking-json`
+as a separate bounded argument, independent of task payloads. This argument
+survives detached systemd controller boundaries. It accepts only the fixed
+reason/timestamp object; malformed, stale or unknown evidence is advisory.
+The environment hint remains supported for direct operator invocation.
+
 ### Managed native Codex memory
 
 Managed Codex on the native aplexer backend defaults to a 4096 MiB workload cap; other providers and task-unit/FileBus backends retain their existing 1500 MiB ceiling. Submission reserves the known route allowance, and launch rebinds the reservation to the exact selected route under launch.lock before checking host headroom and spawning. The placement floor (default 2048 MiB) is charged the measured estimate, not the full allowance. The native startup timeout bounds the start handshake and first action, not the lifetime of a running job. resource-status reports the estimate-based gate plus the fail-closed 4096 MiB managed-Codex headroom.

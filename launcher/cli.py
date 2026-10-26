@@ -111,6 +111,34 @@ def plan(args):
 
 
 def run(args):
+    # Explicit operator/host argument crosses systemd-run without relying on
+    # inherited client environment. Never read this hint from task payloads.
+    raw = getattr(args, "trusted_choking_json", None)
+    if raw is None:
+        return _run_with_host_hint(args)
+    from launcher.cpu_resources import validate_resource_choking
+    hint = None
+    if isinstance(raw, str) and len(raw.encode("utf-8")) <= 512:
+        try:
+            value = json.loads(raw)
+            if isinstance(value, dict) and set(value) == {"reason", "observed_at"}:
+                hint = validate_resource_choking(value, cooldown_s=3600)
+        except (ValueError, TypeError):
+            pass
+    sanitized = json.dumps(hint, separators=(",", ":"))
+    previous = os.environ.get("LAUNCHER_TRUSTED_CHOKING_JSON")
+    args.trusted_choking_json = sanitized
+    os.environ["LAUNCHER_TRUSTED_CHOKING_JSON"] = sanitized
+    try:
+        return _run_with_host_hint(args)
+    finally:
+        if previous is None:
+            os.environ.pop("LAUNCHER_TRUSTED_CHOKING_JSON", None)
+        else:
+            os.environ["LAUNCHER_TRUSTED_CHOKING_JSON"] = previous
+
+
+def _run_with_host_hint(args):
     config_dir = config_dir_for(args)
     backend = getattr(args, "backend", "aplexer")
     if backend == "task-units":
@@ -200,6 +228,8 @@ def spawn_ql_controller(args, return_dict=False):
         "--id", args.id, "--cwd", args.cwd,
         "--tmpdir", effective_tmpdir,
     ]
+    if getattr(args, "trusted_choking_json", None) is not None:
+        cmd.extend(["--trusted-choking-json", args.trusted_choking_json])
     res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
     if res.returncode != 0:
         err_res = {
@@ -1254,6 +1284,8 @@ def main():
     parser_run.add_argument("--id", required=True)
     parser_run.add_argument("--cwd", required=True)
     parser_run.add_argument("--tmpdir", default=None, help="Optional. Defaults to cwd-local owned tmpdir")
+    parser_run.add_argument("--trusted-choking-json", default=None,
+                            help="Bounded trusted host runtime evidence, independent of task payload")
     parser_run.add_argument(
         "--backend",
         default="aplexer",
