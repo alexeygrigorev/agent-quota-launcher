@@ -124,10 +124,10 @@ class TestStore(unittest.TestCase):
         self.store.submit_task("t1", "key1", PAYLOAD, [])
         mem, disk = self.store.get_active_resources(exclude_task_id="t1")
         self.assertEqual((mem, disk), (0, 0))
-        # t1 is queued -> holds 1500/512 for others (subprocess call to aplexer
-        # fails in test env and queued state still holds).
+        # t1 is queued -> holds no RAM before starting (the gate only
+        # counts active starting ramps); the disk lease stays.
         mem2, disk2 = self.store.get_active_resources()
-        self.assertEqual((mem2, disk2), (1500, 512))
+        self.assertEqual((mem2, disk2), (0, 512))
 
     def test_completed_awaiting_review_releases_ram(self):
         self.store.submit_task("t1", "key1", PAYLOAD, [])

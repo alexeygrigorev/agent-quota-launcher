@@ -562,7 +562,7 @@ def _bounded_timeout(payload):
     return t
 
 
-def do_run(store_path, task_id, cwd, tmpdir, lock_path):
+def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=None):
     if tmpdir is None:
         tmpdir = str(Path(cwd).resolve() / ".local" / "tmp" / task_id)
     store = Store(store_path)
@@ -682,9 +682,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     record["requested_model"] = chosen.get("model")
 
     # Single policy: managed native Codex defaults to 4096MiB (midrun OOM
-    # at 1500MiB); every other provider stays 1500MiB. Host 10GiB, disk,
-    # and quota gates are unchanged; the larger request simply reserves
-    # more MemAvailable headroom via check_resources.
+    # at 1500MiB); every other provider stays 1500MiB. This is the cgroup
+    # MemoryMax safety cap. Host admission instead charges the placement
+    # estimate (payload memory_estimate_mb, else measured p90, else the
+    # ramp default) against the floor; see check_resources.
     requested_mem_mb = native_memory_request_for(
         provider=provider,
         is_managed=is_managed,
@@ -755,13 +756,33 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path):
     deadline = time.monotonic() + timeout_seconds
 
     # --- critical section: reserve + spawn under the exclusive launch lock ---
+    from launcher.resource_policy import (
+        load_resource_policy,
+        resolve_memory_estimate_mb,
+    )
     with launch_lock(lock_path):
         store.reserve_native_memory(task_id, requested_mem_mb)
-        active_mem, active_disk = store.get_active_resources(exclude_task_id=task_id)
+        policy = load_resource_policy(payload, explicit_path=resource_config_path)
+        measured_p90 = store.memory_samples_p90(policy["estimate_percentile"])
+        memory_estimate_mb = resolve_memory_estimate_mb(
+            payload, measured_p90, policy, cap_mb=requested_mem_mb)
+        record["resource_policy"] = policy
+        record["memory_estimate_mb"] = memory_estimate_mb
+        record["measured_p90_mb"] = measured_p90
+        active_mem, active_disk = store.get_active_resources(
+            exclude_task_id=task_id,
+            ramp_reserve_mb=policy["ramp_reserve_default_mb"],
+            estimate_percentile=policy["estimate_percentile"],
+            ramp_seconds=policy["ramp_seconds"],
+            estimate_multiplier=policy["estimate_multiplier"])
         record['active_mem_mb'], record['active_disk_mb'] = active_mem, active_disk
+        record['ramp_reserve_mb'] = active_mem
         check_resources(requested_mem_mb, workspace, tmpdir_resolved,
                         active_mem, active_disk, repo_root=workspace,
-                        provider=provider, is_managed=is_managed)
+                        provider=provider, is_managed=is_managed,
+                        memory_floor_mb=policy["memory_floor_mb"],
+                        memory_estimate_mb=memory_estimate_mb,
+                        cpu_load_factor=policy["cpu_load_factor"])
         store.transition_task(task_id, "starting", ("queued",),
                               reason=f"launching via {provider}")
         env = os.environ.copy()

@@ -1,15 +1,27 @@
-"""Host resource admission gates. All limits are conservative GiB/MiB."""
+"""Host resource admission gates. Placement (intake 4fcd3139) is gated on
+live data: MemAvailable - ramp_reserve(inflight starts) - estimate(new)
+>= floor. Worker MemoryMax caps (1500M, 4096M managed Codex) are
+per-session safety caps and are never charged as reservations."""
 import math
 import os
 import shutil
 from pathlib import Path
 
+from launcher.resource_policy import (
+    RESOURCE_DEFAULTS,
+    _validate_knob,
+    check_cpu_guard,
+    valid_estimate_mb,
+)
+
 MAX_WORKER_MEMORY_MB = 1500
 DEFAULT_NATIVE_MEMORY_MB = 1500
 CODEX_MANAGED_NATIVE_MEMORY_MB = 4096
 CODEX_MANAGED_PROVIDERS = ("codex", "openai")
-# Host MemAvailable floor (Alexey t1476u 2026-10-26: 2 GiB; was 10 GiB).
-MIN_MEM_AVAILABLE_BYTES = 2 * 1024 * 1024 * 1024
+# Host MemAvailable floor default (Alexey t1476u 2026-10-26: 2 GiB).
+# Configurable per launch via memory_floor_mb; this constant is the default.
+MIN_MEM_AVAILABLE_BYTES = RESOURCE_DEFAULTS["memory_floor_mb"] * 1024 * 1024
+DEFAULT_MEMORY_FLOOR_MB = RESOURCE_DEFAULTS["memory_floor_mb"]
 MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
 WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
 MAX_DISK_SPIKE_BYTES = 512 * 1024 * 1024
@@ -133,10 +145,45 @@ def _get_disk_usage(path):
 def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     active_mem_mb=0, active_disk_mb=0, repo_root=None,
                     ignore_ram=None, requested_disk_mb=0, target_stage=None,
-                    provider=None, is_managed=False):
+                    provider=None, is_managed=False,
+                    memory_floor_mb=None, memory_estimate_mb=None,
+                    cpu_load_factor=None, check_cpu=True,
+                    _load5=None, _cpu_count=None):
+    """Live MemAvailable admission.
+
+    The worker cap (``requested_memory_mb`` validated against 1500/4096M)
+    is the cgroup safety cap only. What is charged against MemAvailable is
+    the placement ``estimate(new)``: ``memory_estimate_mb`` when valid,
+    otherwise the full requested allowance (fail closed). ``active_mem_mb``
+    is the ramp reserve of other inflight starts (see
+    ``Store.get_active_resources``); resident workers are already inside
+    MemAvailable and are not charged again. Admission requires::
+
+        MemAvailable - ramp_reserve - estimate(new) >= floor
+
+    with ``floor`` = ``memory_floor_mb`` (default 2048). A 5-minute load
+    above ``cpu_load_factor`` x cores refuses with ``host_cpu_load``.
+    Unknown CPU measurements fail closed. ``HUMAN_RAM_OVERRIDE`` skips
+    the memory floor only, never the disk, tmpdir, stage or CPU gates.
+    """
     if requested_memory_mb is None:
         raise ValueError("invalid requested worker memory")
     requested_value = native_memory_request_for(provider, is_managed, requested_memory_mb)
+
+    floor_mb = DEFAULT_MEMORY_FLOOR_MB if memory_floor_mb is None else memory_floor_mb
+    try:
+        floor_mb = _validate_knob("memory_floor_mb", floor_mb)
+    except ValueError:
+        raise ValueError(f"invalid memory_floor_mb: {memory_floor_mb!r}") from None
+    floor_bytes = floor_mb * 1024 * 1024
+
+    estimate_mb = valid_estimate_mb(memory_estimate_mb, cap_mb=requested_value)
+    if estimate_mb is None:
+        if memory_estimate_mb is not None:
+            raise ValueError(f"invalid memory_estimate_mb: {memory_estimate_mb!r}")
+        estimate_mb = requested_value
+
+    factor = RESOURCE_DEFAULTS["cpu_load_factor"] if cpu_load_factor is None else cpu_load_factor
 
     # Human override (experiment/human-ram-override-twentyfive-subagents-20261005.txt):
     # Ignore host-wide MemAvailable floor; worker MemoryMax stays at the policy
@@ -146,10 +193,15 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
 
     mem_avail = get_mem_available()
     if not ignore_ram:
-        req_mem = requested_value * 1024 * 1024
+        req_mem = estimate_mb * 1024 * 1024
         act_mem = active_mem_mb * 1024 * 1024
-        if mem_avail - act_mem - req_mem < MIN_MEM_AVAILABLE_BYTES:
-            raise ValueError("host MemAvailable < 10GiB")  # message kept stable for Hub diagnostics mapping
+        if mem_avail - act_mem - req_mem < floor_bytes:
+            raise ValueError(
+                f"host MemAvailable below {floor_mb}MiB floor after reservation "
+                f"(launcher_memory_reserve)")
+
+    if check_cpu:
+        check_cpu_guard(load5=_load5, cpu_count=_cpu_count, factor=factor)
 
     if target_stage is not None:
         cap = evaluate_stage_capacity(concurrency=target_stage, mem_available_bytes=mem_avail, ignore_ram=ignore_ram)

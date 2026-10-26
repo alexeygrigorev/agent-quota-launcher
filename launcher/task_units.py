@@ -28,7 +28,11 @@ from launcher.provider_admission import (
     QuotaAcquisition, identify_command,
     validate_command_environment, validate_provider_quota, require_quota_lifecycle,
 )
-from launcher.resources import check_resources
+from launcher.resources import (
+    DEFAULT_MEMORY_FLOOR_MB,
+    check_resources,
+)
+from launcher.resource_policy import RESOURCE_DEFAULTS
 from launcher.task_profiles import (
     ENV_KEY_PATTERN,
     MAX_ENV_FILE_BYTES,
@@ -397,6 +401,9 @@ def admit_task_unit(
     command_argv: Optional[List[str]] = None,
     model: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    memory_floor_mb: Optional[int] = None,
+    memory_estimate_mb: Optional[int] = None,
+    cpu_load_factor: Optional[float] = None,
 ) -> bool:
     """Enforce floors and actual-command quota.
 
@@ -460,7 +467,10 @@ def admit_task_unit(
             f"TMPDIR '{tmp_path}' must be located under '{allowed_tmp_root}'"
         )
 
-    # Check host floors (MemAvailable >= 10 GiB, root disk >= 50 GiB, deny /data)
+    # Check live host floors (MemAvailable ramp+estimate >= floor, CPU load
+    # guard, disk floor, deny /data). The estimate defaults to the full
+    # worker cap when the caller has no measured value (fail closed).
+    # Runtime defaults track the shared Hub contract (floor 2048).
     try:
         check_resources(
             int(memory_mb),
@@ -469,6 +479,9 @@ def admit_task_unit(
             active_mem_mb=active_mem_mb,
             active_disk_mb=active_disk_mb,
             repo_root=workspace,
+            memory_floor_mb=memory_floor_mb if memory_floor_mb is not None else DEFAULT_MEMORY_FLOOR_MB,
+            memory_estimate_mb=memory_estimate_mb,
+            cpu_load_factor=cpu_load_factor if cpu_load_factor is not None else RESOURCE_DEFAULTS["cpu_load_factor"],
         )
     except Exception as e:
         raise TaskUnitAdmissionError(f"resource floor check failed: {e}") from e
@@ -1056,6 +1069,9 @@ def execute_transient_task_unit(
     profile: Optional[str] = None,
     trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
     model: Optional[str] = None,
+    memory_floor_mb: Optional[int] = None,
+    memory_estimate_mb: Optional[int] = None,
+    cpu_load_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -1085,6 +1101,9 @@ def execute_transient_task_unit(
         command_argv=command_argv,
         model=model,
         extra_env=extra_env,
+        memory_floor_mb=memory_floor_mb,
+        memory_estimate_mb=memory_estimate_mb,
+        cpu_load_factor=cpu_load_factor,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider
@@ -1500,6 +1519,9 @@ def spawn_transient_task_unit(
     profile: Optional[str] = None,
     trusted_root_evidence: Optional[TrustedRootJobEvidence] = None,
     model: Optional[str] = None,
+    memory_floor_mb: Optional[int] = None,
+    memory_estimate_mb: Optional[int] = None,
+    cpu_load_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -1527,6 +1549,9 @@ def spawn_transient_task_unit(
         command_argv=command_argv,
         model=model,
         extra_env=extra_env,
+        memory_floor_mb=memory_floor_mb,
+        memory_estimate_mb=memory_estimate_mb,
+        cpu_load_factor=cpu_load_factor,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider

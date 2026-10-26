@@ -32,8 +32,18 @@ class TestResources(unittest.TestCase):
         self.disk_patch = patch('shutil.disk_usage',
                                 return_value=DiskUsage(100 * GiB))
         self.disk_patch.start()
+        # Deterministic calm CPU: the 5-min load guard is covered by the
+        # dedicated CPU tests; memory/disk tests must not depend on host load.
+        self.load_patch = patch('launcher.resource_policy.read_load5',
+                                return_value=1.0)
+        self.load_patch.start()
+        self.cpu_patch = patch('launcher.resource_policy.read_cpu_count',
+                               return_value=12)
+        self.cpu_patch.start()
         self.addCleanup(self.mem_patch.stop)
         self.addCleanup(self.disk_patch.stop)
+        self.addCleanup(self.load_patch.stop)
+        self.addCleanup(self.cpu_patch.stop)
 
     def test_owned_tmpdir_passes(self):
         self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp),
@@ -46,14 +56,14 @@ class TestResources(unittest.TestCase):
     def test_memavailable_floor(self):
         import launcher.resources as res
         with patch.object(res, 'get_mem_available', return_value=2.5 * GiB):
-            with self.assertRaisesRegex(ValueError, "host MemAvailable < 10GiB"):
+            with self.assertRaisesRegex(ValueError, "launcher_memory_reserve"):
                 check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo)
 
     def test_active_reservations_counted(self):
         # 3 GiB available, 1.5 GiB already reserved -> below floor after request.
         import launcher.resources as res
         with patch.object(res, 'get_mem_available', return_value=3 * GiB):
-            with self.assertRaisesRegex(ValueError, "host MemAvailable < 10GiB"):
+            with self.assertRaisesRegex(ValueError, "launcher_memory_reserve"):
                 check_resources(1500, self.repo, str(self.owned_tmp),
                                 active_mem_mb=1500, repo_root=self.repo)
 

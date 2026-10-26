@@ -158,33 +158,39 @@ class ResidentReservationsTests(unittest.TestCase):
         store = self.store()
         with patch("launcher.native_lifecycle.subprocess.run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, json.dumps(self.info), "")
-            self.assertEqual(store.get_active_resources(), (1500, 512))
+            # Queued tasks hold no RAM before starting (only active
+            # starting ramps gate placement); disk leases are unchanged.
+            self.assertEqual(store.get_active_resources(), (0, 512))
             run.assert_not_called()
             store.transition_task("t1", "running", ("queued",))
-            self.assertEqual(store.get_active_resources(), (200, 512))
+            # Young measured resident: 512 estimate minus 800 proven anon
+            # usage floors at 0; disk lease unchanged.
+            self.assertEqual(store.get_active_resources(), (0, 512))
             self.assertEqual(store.get_active_resources(exclude_task_id="t1"), (0, 0))
             run.return_value = subprocess.CompletedProcess([], 0, json.dumps(dict(self.info, id="wrong")), "")
             self.assertEqual(store.get_active_resources(), (1500, 512))
             self.assertEqual(store.get_task("t1")["state"], "running")
 
-    def test_corrected_growth_reservation_preserves_exact_ten_gib_floor(self):
+    def test_credited_ramp_reservation_preserves_exact_ten_gib_floor(self):
         store = self.store()
         store.transition_task("t1", "running", ("queued",))
         with patch("launcher.native_lifecycle.subprocess.run", return_value=subprocess.CompletedProcess(
                 [], 0, json.dumps(self.info), "")):
             active_mem, active_disk = store.get_active_resources()
-        self.assertEqual(active_mem, 200)
+        # Young measured resident: 512 estimate minus 800 proven usage = 0.
+        self.assertEqual(active_mem, 0)
         disk = type("Disk", (), {"free": 100 * 1024 ** 3})()
-        available = MIN_MEM_AVAILABLE_BYTES + (200 + 1500) * MIB
+        available = MIN_MEM_AVAILABLE_BYTES + (0 + 1500) * MIB
         kwargs = dict(requested_memory_mb=1500, requested_cwd=self.root,
                       requested_tmpdir=self.root / ".local/tmp", repo_root=self.root,
                       active_mem_mb=active_mem, active_disk_mb=active_disk, ignore_ram=False)
+        calm_cpu = dict(_load5=1.0, _cpu_count=12)
         with patch("launcher.resources._get_disk_usage", return_value=disk):
             with patch("launcher.resources.get_mem_available", return_value=available):
-                self.assertTrue(check_resources(**kwargs))
+                self.assertTrue(check_resources(**kwargs, **calm_cpu))
             with patch("launcher.resources.get_mem_available", return_value=available - 1):
-                with self.assertRaisesRegex(ValueError, "10GiB"):
-                    check_resources(**kwargs)
+                with self.assertRaisesRegex(ValueError, "launcher_memory_reserve"):
+                    check_resources(**kwargs, **calm_cpu)
 
     def test_dead_running_dry_run_and_idempotent_settlement(self):
         store = self.store()
@@ -205,34 +211,67 @@ class ResidentReservationsTests(unittest.TestCase):
                 conn.execute("UPDATE tasks SET state=? WHERE id='t1'", (state,))
             for native in ("alive", "unknown"):
                 with patch("launcher.store.probe_native_lifecycle", return_value=(native, "probe")), patch("launcher.store.resident_credit_mb", return_value=0):
-                    self.assertEqual(store.get_active_resources(), (1500, 512))
+                    # Alive proof on an inflight start holds the ramp
+                    # estimate; unknown measurements hold the full allowance.
+                    expected = 512 if native == "alive" else 1500
+                    self.assertEqual(store.get_active_resources(), (expected, 512))
                     self.assertEqual(store.get_task("t1")["state"], state)
             with patch("launcher.store.probe_native_lifecycle", return_value=("dead", "confirmed stop")):
                 self.assertEqual(store.get_active_resources(), (0, 0))
                 self.assertEqual(store.get_task("t1")["state"], "failed")
 
-    def test_growth_history_is_bounded_and_dry_run_never_writes(self):
+    def test_sample_history_is_bounded_and_dry_run_never_writes(self):
         store = self.store()
         with patch("launcher.store.time.time", return_value=3000):
-            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500, True), 128)
+            store._record_resident_sample("t1", self.binding, 400, True)
             with store.get_conn() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_samples").fetchone()[0], 0)
-            self.assertEqual(store._growth_margin("t1", self.binding, 1000, 1500), 250)
+            store._record_resident_sample("t1", self.binding, 0, False)
+            store._record_resident_sample("t1", self.binding, 400, False)
+            store._record_resident_sample("t1", self.binding, 1000, False)
+            with store.get_conn() as conn:
+                rows = conn.execute("SELECT bucket, resident_mb FROM memory_samples").fetchall()
+                # Same 30s bucket keeps one maximum; non-positive ignored.
+                self.assertEqual(rows, [(100, 1000)])
         with patch("launcher.store.time.time", return_value=3030):
-            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500), 512)
+            store._record_resident_sample("t1", self.binding, 400, False)
+            with store.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_samples").fetchone()[0], 2)
         with patch("launcher.store.time.time", return_value=4000):
-            self.assertEqual(store._growth_margin("t1", self.binding, 400, 1500), 128)
-        self.assertEqual(store._growth_margin("t1", self.binding, 0, 1500), 1500)
+            store._record_resident_sample("t1", self.binding, 400, False)
+            with store.get_conn() as conn:
+                # Buckets older than 15 minutes are evicted.
+                self.assertEqual(conn.execute("SELECT resident_mb FROM memory_samples").fetchall(), [(400,)])
 
-    def test_thirty_one_gib_admits_ten_more_four_hundred_mib_workers(self):
+    def test_thirty_one_gib_admits_many_old_measured_residents(self):
+        # Stable measured residents hold no additional RAM: 14 old tasks
+        # with proven usage add 0 to the ramp reserve, so a 31 GiB host
+        # still admits new workers against the floor.
         store = self.store()
-        growth = 14 * store._growth_margin("t1", self.binding, 400, 1500)
+        for i in range(2, 15):
+            tid = f"t{i}"
+            store.submit_task(tid, f"key-{tid}", {"goal": "test", "owner": "head",
+                                                  "cwd": str(self.root), "timeout": 60,
+                                                  "provider": "codex"}, [])
+            store.record_native_binding(
+                tid, native_id=f"11111111-2222-4333-8444-{i:012d}",
+                tag=f"task-{tid}", workspace=str(self.root),
+                engine="codex", incarnation=1000 + i)
+            store.transition_task(tid, "running", ("queued",))
+        store.transition_task("t1", "running", ("queued",))
+        with patch("launcher.store.probe_native_lifecycle", return_value=("alive", {})), \
+             patch("launcher.store.resident_credit_mb", return_value=400), \
+             patch.object(Store, "_task_age_seconds", return_value=9999):
+            mem, disk = store.get_active_resources()
+            self.assertEqual(mem, 0)
+            self.assertEqual(disk, 14 * 512)
         available = 31 * 1024 ** 3
-        disk = type("Disk", (), {"free": 100 * 1024 ** 3})()
-        with patch("launcher.resources._get_disk_usage", return_value=disk):
-            for added in range(10):
+        disk_usage = type("Disk", (), {"free": 100 * 1024 ** 3})()
+        with patch("launcher.resources._get_disk_usage", return_value=disk_usage), \
+             patch("launcher.resource_policy.read_load5", return_value=1.0), \
+             patch("launcher.resource_policy.read_cpu_count", return_value=12):
+            for _ in range(10):
                 with patch("launcher.resources.get_mem_available", return_value=available):
                     self.assertTrue(check_resources(1500, self.root, self.root / ".local/tmp",
-                        active_mem_mb=growth, repo_root=self.root, ignore_ram=False))
+                        active_mem_mb=mem, repo_root=self.root, ignore_ram=False))
                 available -= 400 * MIB
-                growth += 128

@@ -677,48 +677,94 @@ class Store:
         except Exception:
             return None
 
-    def _growth_margin(self, task_id, binding, resident, limit, dry_run=False):
-        """MemAvailable already accounts for resident usage; reserve only growth.
+    def _record_resident_sample(self, task_id, binding, resident, dry_run=False):
+        """Record one exact-incarnation resident observation for the p90 estimate.
 
-        Keep 15 minutes of exact-incarnation samples (one maximum per 30s).
-        Reserve p95 minus current usage plus 25% of p95, bounded to 128..512
-        MiB and remaining cgroup capacity. Missing measurement stays full peak.
+        Keeps 15 minutes of samples (one maximum per 30s bucket). The samples
+        feed ``memory_samples_p90``; the reservation itself is decided by the
+        caller (stable measured residents hold no additional RAM, young ones
+        hold estimate-minus-current). Writes are skipped on dry_run.
         """
         if resident <= 0:
-            return limit
+            return
         bucket = int(time.time() // 30)
         identity = (task_id, binding['native_id'], binding['incarnation'])
         with self.get_conn() as conn:
-            samples = [r[0] for r in conn.execute(
-                "SELECT resident_mb FROM memory_samples WHERE task_id=? AND native_id=? AND incarnation=? AND bucket BETWEEN ? AND ?",
-                (*identity, bucket - 29, bucket))]
             if not dry_run:
                 conn.execute("DELETE FROM memory_samples WHERE bucket < ? OR bucket > ?", (bucket - 29, bucket))
                 conn.execute("INSERT INTO memory_samples VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id,native_id,incarnation,bucket) DO UPDATE SET resident_mb=MAX(resident_mb,excluded.resident_mb)", (*identity, bucket, resident))
-        samples.append(resident)
-        samples.sort()
-        p95 = samples[math.ceil(len(samples) * .95) - 1]
-        margin = max(128, min(512, math.ceil(p95 * .25) + max(0, p95 - resident)))
-        return min(max(0, limit - resident), margin)
 
-    def get_active_resources(self, exclude_task_id=None, *, dry_run=False, reconciliation=None):
-        """Sum outstanding RAM growth and disk reservations.
+    def memory_samples_p90(self, percentile=90):
+        """Measured placement estimate: percentile over resident samples.
 
-        exclude_task_id removes the launching task's own reservation. Exact
-        live bounded workloads reserve a bounded recent-p95 growth margin because
-        MemAvailable already excludes resident usage; queued/unknown workers retain full
-        reservations, and disk accounting is unchanged.
-
-        Uses exact native identity and current authoritative live phase or
-        exact retired-sessions/<UUID>/tombstone.json (matching UUID, tag,
-        workspace, creation ordering, and cause finished). Proven exit
-        releases process RAM/disk reservation without inventing task success/
-        review/acceptance. Unknown/missing/transport error remains conservative.
-        Materializes SQL rows and closes read connection BEFORE recovery writes
-        or probes to prevent SQLite deadlocks.
+        Returns an int MiB, or None when nothing has been measured yet
+        (caller falls back to the configured ramp default). Samples are
+        exact-incarnation resident observations written by
+        _record_resident_sample.
         """
-        total_mem = 0
-        total_disk = 0
+        from launcher.resource_policy import percentile_of
+        with self.get_conn() as conn:
+            rows = conn.execute("SELECT resident_mb FROM memory_samples").fetchall()
+        return percentile_of([r[0] for r in rows], percentile)
+
+    def _task_age_seconds(self, task_id, binding=None):
+        """Seconds since the task/binding was last updated; None if unknown."""
+        from datetime import datetime, timezone
+        stamp = None
+        if binding:
+            with self.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT updated_at FROM task_native_bindings WHERE task_id = ?",
+                    (task_id,)).fetchone()
+                if row:
+                    stamp = row[0]
+        if stamp is None:
+            with self.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT updated_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row:
+                    stamp = row[0]
+        if not stamp or not isinstance(stamp, str):
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(stamp[:19], fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                dt = None
+        if dt is None:
+            return None
+        import time as _time
+        return max(0.0, _time.time() - dt.timestamp())
+
+    def resource_breakdown(self, exclude_task_id=None, *, dry_run=False,
+                           reconciliation=None, ramp_reserve_mb=512,
+                           estimate_percentile=90, ramp_seconds=180,
+                           estimate_multiplier=1.25):
+        """Per-task reservation rows under the placement policy.
+
+        Each row is {task_id, state, reserve_mb, basis} where basis is one
+        of: queued-estimate, start-ramp, resident-settled, full-unknown,
+        settled-dead. Queued tasks hold no RAM before starting (reserve 0;
+        the gate only counts active starting ramps). Live residents with an
+        exact measurement past the ramp window hold no additional RAM (their
+        usage is already inside MemAvailable); young ones hold the measured
+        estimate minus proven current usage, mirroring the Hub headroom
+        credit. Unknown measurements hold the full allowance (fail
+        closed). Dead tasks settle (dry_run only reports them).
+        """
+        from launcher.resource_policy import resolve_memory_estimate_mb
+        if type(ramp_reserve_mb) is not int or ramp_reserve_mb <= 0:
+            raise ValueError(f"invalid ramp_reserve_mb: {ramp_reserve_mb!r}")
+        if isinstance(estimate_multiplier, bool) \
+                or not isinstance(estimate_multiplier, (int, float)) \
+                or not math.isfinite(estimate_multiplier) \
+                or not (1 <= estimate_multiplier <= 4):
+            raise ValueError(f"invalid estimate_multiplier: {estimate_multiplier!r}")
+        mini_policy = {"ramp_reserve_default_mb": ramp_reserve_mb,
+                       "estimate_multiplier": estimate_multiplier}
+        measured = self.memory_samples_p90(estimate_percentile)
+        rows_out = []
         with self.get_conn() as conn:
             placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
             query = f"""
@@ -735,17 +781,35 @@ class Store:
             rows = cursor.fetchall()
 
         # Connection is CLOSED before performing recovery writes or probes
+        # to prevent SQLite deadlocks.
         for row in rows:
             task_id, mem, disk, raw_payload, state = row
+            allowance = mem or 0
+            payload = None
+            if isinstance(raw_payload, str):
+                try:
+                    payload = json.loads(raw_payload)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
+            elif isinstance(raw_payload, dict):
+                payload = raw_payload
+            if not isinstance(payload, dict):
+                payload = {}
+            estimate = resolve_memory_estimate_mb(
+                payload, measured, mini_policy)
+            estimate = min(max(1, estimate), max(1, allowance)) if allowance else estimate
+
             if state == "queued":
-                total_mem += (mem or 0)
-                total_disk += (disk or 0)
+                # Queued tasks hold no RAM before starting: only active
+                # starting ramps gate placement (Hub headroom contract).
+                rows_out.append({"task_id": task_id, "state": state,
+                                 "reserve_mb": 0, "disk_mb": disk or 0,
+                                 "basis": "queued-estimate"})
                 continue
 
             binding = self.get_native_binding(task_id)
-            if not binding and raw_payload and not dry_run:
+            if not binding and payload and not dry_run:
                 try:
-                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
                     binding = self.recover_binding_from_artifacts(task_id, payload)
                 except Exception:
                     binding = None
@@ -758,7 +822,7 @@ class Store:
                     # No result/reviewer evidence is manufactured by a resource scan.
                     if reconciliation is not None:
                         reconciliation.append({"task_id": task_id, "native_id": binding["native_id"],
-                                               "previous_state": state, "native_status": status, "memory_mb": mem or 0})
+                                               "previous_state": state, "native_status": status, "memory_mb": allowance})
                     if not dry_run:
                         evidence = False
                         for path in self.get_task_paths(task_id):
@@ -772,20 +836,92 @@ class Store:
                                 reviewer="resource-reconciler")
                         except StateTransitionError:
                             pass  # A concurrent lifecycle writer owns the newer state.
+                    rows_out.append({"task_id": task_id, "state": state,
+                                     "reserve_mb": 0, "disk_mb": 0,
+                                     "basis": "settled-dead"})
                     continue
                 else:
                     # MemAvailable already excludes verified resident anonymous
-                    # memory. Add only bounded recent-p95 growth, not full peak per worker.
-                    credit = resident_credit_mb(binding, live_info, mem or 0) if status == "alive" else 0
-                    total_mem += self._growth_margin(task_id, binding, credit, mem or 0, dry_run)
-                    total_disk += (disk or 0)
+                    # memory. Stable measured residents (past the ramp window)
+                    # hold no additional reserve; young ones hold the estimate
+                    # minus proven current usage, mirroring the Hub headroom
+                    # credit. Unknown holds the full allowance (fail closed).
+                    credit = resident_credit_mb(binding, live_info, allowance) if status == "alive" else 0
+                    if status == "alive" and credit > 0:
+                        self._record_resident_sample(task_id, binding, credit, dry_run)
+                        age = self._task_age_seconds(task_id, binding)
+                        if age is not None and age >= ramp_seconds:
+                            rows_out.append({"task_id": task_id, "state": state,
+                                             "reserve_mb": 0, "disk_mb": disk or 0,
+                                             "basis": "resident-settled"})
+                        else:
+                            rows_out.append({"task_id": task_id, "state": state,
+                                             "reserve_mb": max(0, estimate - credit),
+                                             "disk_mb": disk or 0,
+                                             "basis": "start-ramp"})
+                    elif status == "alive" and (
+                            state in ("starting", "launch-uncertain", "stalled")
+                            or (state == "running"
+                                and (self._task_age_seconds(task_id, binding) or 0) < ramp_seconds)):
+                        # Inflight start (or young running worker) before
+                        # samples land: hold the measured estimate.
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": estimate, "disk_mb": disk or 0,
+                                         "basis": "start-ramp"})
+                    else:
+                        # Legacy or task-units without native binding proof, or
+                        # a long-running worker with no measurements:
+                        # stays conservative under actual ownership proof.
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": allowance, "disk_mb": disk or 0,
+                                         "basis": "full-unknown"})
             else:
-                # Legacy or task-units without native binding:
-                # Stays conservative under actual ownership proof
-                total_mem += (mem or 0)
-                total_disk += (disk or 0)
+                # No binding even after recovery: starting states are proven
+                # inflight starts by lifecycle state alone, so young ones hold
+                # the ramp estimate. Stale or clock-unknown starts hold the
+                # full allowance (fail closed). Running/legacy rows without
+                # proof stay conservative under actual ownership proof.
+                if state in ("starting", "launch-uncertain", "stalled"):
+                    age = self._task_age_seconds(task_id, None)
+                    if age is not None and age < ramp_seconds:
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": estimate, "disk_mb": disk or 0,
+                                         "basis": "start-ramp"})
+                    else:
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": allowance, "disk_mb": disk or 0,
+                                         "basis": "full-unknown"})
+                else:
+                    # Legacy or task-units without native binding:
+                    # Stays conservative under actual ownership proof
+                    rows_out.append({"task_id": task_id, "state": state,
+                                     "reserve_mb": allowance, "disk_mb": disk or 0,
+                                     "basis": "full-unknown"})
 
-        return total_mem, total_disk
+        return rows_out
+
+    def get_active_resources(self, exclude_task_id=None, *, dry_run=False,
+                             reconciliation=None, ramp_reserve_mb=512,
+                             estimate_percentile=90, ramp_seconds=180,
+                             estimate_multiplier=1.25):
+        """Sum outstanding ramp/growth reservations and disk leases.
+
+        Totals the per-task rows from resource_breakdown: queued tasks hold
+        nothing, inflight starts hold the measured estimate (payload
+        ``memory_estimate_mb`` first, then the sample p90 scaled by
+        ``estimate_multiplier``, then ``ramp_reserve_mb``) minus proven
+        current resident usage, stable measured residents hold nothing,
+        and unknown measurements hold the full allowance.
+        ``exclude_task_id`` removes the launching task's own reservation.
+        Dead tasks settle unless ``dry_run``.
+        """
+        rows = self.resource_breakdown(
+            exclude_task_id, dry_run=dry_run, reconciliation=reconciliation,
+            ramp_reserve_mb=ramp_reserve_mb,
+            estimate_percentile=estimate_percentile, ramp_seconds=ramp_seconds,
+            estimate_multiplier=estimate_multiplier)
+        return (sum(r["reserve_mb"] for r in rows),
+                sum(r["disk_mb"] for r in rows))
 
     def list_tasks(self):
         with self.get_conn() as conn:

@@ -872,7 +872,9 @@ class TestDoRunWaitLoop(unittest.TestCase):
         with patch("launcher.launch.fetch_quse", return_value=fake_quse), \
              patch("launcher.launch.subprocess.Popen", side_effect=fake_popen), \
              patch("launcher.launch.validate_first_action", return_value=True), \
-             patch("launcher.launch.validate_opencode_runtime", return_value="/bin/opencode"):
+             patch("launcher.launch.validate_opencode_runtime", return_value="/bin/opencode"), \
+             patch("launcher.resource_policy.read_load5", return_value=1.0), \
+             patch("launcher.resource_policy.read_cpu_count", return_value=12):
             rc = do_run(str(self.db_path), task_id, self.dir, None, self.lock_path)
 
         self.assertEqual(rc, 0)

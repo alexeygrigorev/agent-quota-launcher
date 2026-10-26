@@ -29,6 +29,16 @@ class DiskUsage:
 
 
 class TestNativeMemoryPolicy(unittest.TestCase):
+    def setUp(self):
+        # Deterministic calm CPU for admission tests (live host load is
+        # covered by the dedicated CPU-guard tests).
+        patcher_load = patch('launcher.resource_policy.read_load5', return_value=1.0)
+        patcher_cpus = patch('launcher.resource_policy.read_cpu_count', return_value=12)
+        patcher_load.start()
+        patcher_cpus.start()
+        self.addCleanup(patcher_load.stop)
+        self.addCleanup(patcher_cpus.stop)
+
     def test_defaults(self):
         self.assertEqual(native_memory_request_for("codex", True), 4096)
         self.assertEqual(native_memory_request_for("openai", True), 4096)
@@ -106,6 +116,12 @@ class TestCodexAdmissionRoom(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         self.owned = Path(self.repo) / ".local" / "tmp" / "r1"
         self.owned.mkdir(parents=True)
+        patcher_load = patch('launcher.resource_policy.read_load5', return_value=1.0)
+        patcher_cpus = patch('launcher.resource_policy.read_cpu_count', return_value=12)
+        patcher_load.start()
+        patcher_cpus.start()
+        self.addCleanup(patcher_load.stop)
+        self.addCleanup(patcher_cpus.stop)
 
     def test_host_floor_accounts_for_4096(self):
         # 5GiB available: 1500MiB request leaves >2GiB floor, 4096MiB does not.
@@ -116,7 +132,7 @@ class TestCodexAdmissionRoom(unittest.TestCase):
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
             self.assertTrue(check_resources(1500, self.repo, str(self.owned),
                                             repo_root=self.repo))
-            with self.assertRaisesRegex(ValueError, "host MemAvailable < 10GiB"):
+            with self.assertRaisesRegex(ValueError, "launcher_memory_reserve"):
                 check_resources(4096, self.repo, str(self.owned), repo_root=self.repo,
                                 provider="codex", is_managed=True)
 
@@ -272,6 +288,8 @@ class TestDoRunNativeMemoryArgv(unittest.TestCase):
              patch("launcher.launch.subprocess.Popen", side_effect=fake_popen), \
              patch("launcher.launch.validate_first_action", return_value=True), \
              patch("launcher.resources.get_mem_available", return_value=30 * GiB), \
+             patch("launcher.resource_policy.read_load5", return_value=1.0), \
+             patch("launcher.resource_policy.read_cpu_count", return_value=12), \
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
             rc = do_run(self.db, task_id, self.dir, None, self.lock)
         self.assertEqual(rc, 0)
@@ -294,6 +312,14 @@ class TestDoRunNativeMemoryArgv(unittest.TestCase):
 
 
 class TestResourceStatusCodexRoom(unittest.TestCase):
+    def setUp(self):
+        patcher_load = patch('launcher.resource_policy.read_load5', return_value=1.0)
+        patcher_cpus = patch('launcher.resource_policy.read_cpu_count', return_value=12)
+        patcher_load.start()
+        patcher_cpus.start()
+        self.addCleanup(patcher_load.stop)
+        self.addCleanup(patcher_cpus.stop)
+
     def test_reports_both_gates(self):
         import tempfile, json
         from launcher.cli import resource_status

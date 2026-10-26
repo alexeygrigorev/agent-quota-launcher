@@ -372,7 +372,7 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
                 "",
             )
             mem, disk = self.store.get_active_resources()
-            self.assertEqual(mem, 1500)
+            self.assertEqual(mem, 512)
             self.assertEqual(disk, 512)
             mock_run.assert_called_once()
             self.assertEqual(mock_run.call_args[0][0][2], VALID_UUID)
@@ -395,7 +395,10 @@ class ActiveResourcesAccountingTests(unittest.TestCase):
                     "",
                 )
                 mem, disk = self.store.get_active_resources()
-                self.assertEqual(mem, 1500)
+                # Inflight starts hold the ramp estimate (512 default), not a
+                # full second reservation; containment_empty drains to growth
+                # once measurable residence lands.
+                self.assertEqual(mem, 512)
                 self.assertEqual(disk, 512)
 
     def test_live_oracle_terminal_requires_explicit_containment_empty_is_true(self):

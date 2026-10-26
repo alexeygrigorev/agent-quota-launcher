@@ -83,7 +83,7 @@ Codex is explicitly unsupported in v0.1 (the protected `scripts/launch-codex.sh`
 
 ## Resource gates
 
-Worker memory <= 1500 MiB; host MemAvailable must retain >= 10 GiB after active reservations; cwd and TMPDIR filesystems must retain >= 50 GiB + active reservations + 512 MiB spike; `/tmp` is rejected and TMPDIR must resolve under the owned `<repo>/.local/tmp` (path containment, not substring).
+Placement is gated on live data: `MemAvailable - ramp_reserve(inflight starts) - estimate(new) >= floor`. Resident workers are already counted inside MemAvailable and are never reserved again; only inflight starts hold a ramp reserve (measured p90 × 1.25, fallback 512 MiB). Queued tasks hold no RAM before starting. No new placement while the 5-minute load average exceeds `1.5 × cores` (`host_cpu_load`). Worker MemoryMax caps (1500 MiB, 4096 MiB managed Codex) are per-session safety caps, not reservations. cwd and TMPDIR filesystems must retain >= 50 GiB + active reservations + 512 MiB spike; `/tmp` is rejected and TMPDIR must resolve under the owned `<repo>/.local/tmp` (path containment, not substring).
 
 ## Hostwide Capacity & Concurrency Governor (C2661 / C2664 / C2670)
 
@@ -101,13 +101,39 @@ Worker memory <= 1500 MiB; host MemAvailable must retain >= 10 GiB after active 
 The 1500 MiB cgroup limit is a hard worker cap, not a reservation charged
 again for every running worker. Exact native/cgroup identity and anonymous
 resident measurement establish live usage already reflected in MemAvailable.
-The launcher additionally reserves a recent-p95 growth margin: p95 minus current
-usage plus 25% of p95, bounded to 128–512 MiB and the remaining worker limit.
-Samples are per native incarnation, one maximum per 30 seconds, retained for
-15 minutes. Missing/uncertain measurement and not-yet-started workers retain
-1500 MiB. Admission keeps one 10 GiB host floor and a full new-worker allowance.
+A live resident past the start-ramp window holds no additional RAM; a young
+one holds the placement estimate minus proven current usage (`max(0,
+estimate - current)`, mirroring the Hub headroom credit). Samples are per
+native incarnation, one maximum per 30 seconds, retained for 15 minutes,
+and still recorded for the measured p90 even when the reserve is zero. A
+new worker is charged the placement estimate: payload `memory_estimate_mb` (the Hub p90 by project/engine/kind),
+else the measured p90 over resident samples scaled by `estimate_multiplier`
+(`ceil(max(64, p90 × multiplier))`, default ×1.25), else the 512 MiB ramp
+default — capped to the worker cgroup ceiling so a historic oversized
+sample shrinks the estimate instead of blocking placement. Still-starting
+workers hold that ramp estimate; queued tasks hold nothing; stale starts
+and other unknown measurements hold the full allowance (fail closed).
+Admission requires the estimate plus the
+inflight ramp reserve to fit above the floor (default 2048 MiB).
 `resource-status --dry-run` neither settles tasks nor writes memory samples.
+
+Knobs arrive from the Hub payload as `resource_management`
+(`memory_floor_mb`, `ramp_reserve_default_mb`, `estimate_percentile`,
+`estimate_multiplier`, `cpu_load_factor`, `ramp_seconds`, default 180)
+with an optional per-task
+`memory_estimate_mb`. Bounds track the Hub contract
+(`src/resource-management.ts`): floor 128..1048576, ramp default
+64..65536, percentile 50..100, multiplier 1..4, ramp 30..900 s, CPU factor
+0.5..4.0; out-of-range values fail closed. Irrelevant Hub watchdog keys
+(`watchdog_interval_s`, `idle_minutes`, `rss_flag_gb`) are ignored. A JSON
+file with the same keys is honored only via an
+explicit path: payload `resource_config_path`, `--resource-config`, or
+`LAUNCHER_RESOURCE_CONFIG`; the repo `config/resource-management.json` is
+never auto-loaded. Missing knobs fall back to safe defaults; invalid values
+fail closed. `resource-status` reports the floor, ramp reserve, measured
+p90, active estimate, per-task breakdown, CPU gate state, and the
+`launcher_memory_reserve` / `host_cpu_load` verdicts.
 
 ### Managed native Codex memory
 
-Managed Codex on the native aplexer backend defaults to a 4096 MiB workload cap; other providers and task-unit/FileBus backends retain their existing 1500 MiB ceiling. Submission reserves the known route allowance, and launch rebinds the reservation to the exact selected route under launch.lock before checking host headroom and spawning. The 10 GiB host floor includes the full requested allowance. The native startup timeout bounds the start handshake and first action, not the lifetime of a running job. resource-status reports both the ordinary and managed Codex admission headroom.
+Managed Codex on the native aplexer backend defaults to a 4096 MiB workload cap; other providers and task-unit/FileBus backends retain their existing 1500 MiB ceiling. Submission reserves the known route allowance, and launch rebinds the reservation to the exact selected route under launch.lock before checking host headroom and spawning. The placement floor (default 2048 MiB) is charged the measured estimate, not the full allowance. The native startup timeout bounds the start handshake and first action, not the lifetime of a running job. resource-status reports the estimate-based gate plus the fail-closed 4096 MiB managed-Codex headroom.

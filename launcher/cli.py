@@ -120,7 +120,8 @@ def run(args):
         return 1
     lock_path = config_dir / 'launch.lock'
     rc = do_run(str(config_dir / 'state.db'), args.id, args.cwd, args.tmpdir,
-                str(lock_path))
+                str(lock_path),
+                resource_config_path=getattr(args, "resource_config", None))
     if rc != 0 or backend != "aplexer":
         return rc
     # Narrow native receipt for the maintained aplexer backend (Hub fleet
@@ -392,6 +393,11 @@ def run_task_units(args):
     provider = chosen_provider
     model = chosen_model or payload.get("model")
     argv = build_adapter_argv(provider, goal, model=model)
+    from launcher.resource_policy import load_resource_policy, resolve_memory_estimate_mb
+    tu_policy = load_resource_policy(payload)
+    tu_estimate = resolve_memory_estimate_mb(
+        payload, store.memory_samples_p90(tu_policy["estimate_percentile"]),
+        tu_policy, cap_mb=memory_mb)
     # C2456: hold launch.lock only for Store lease, not the model wait.
     with launch_lock(str(lock_path)):
         store.transition_task(args.id, "starting", ("queued",),
@@ -417,6 +423,9 @@ def run_task_units(args):
                 read_only_paths=read_only_paths,
                 read_write_paths=read_write_paths,
                 extra_env=payload.get("private_env") or payload.get("extra_env"),
+                memory_floor_mb=tu_policy["memory_floor_mb"],
+                memory_estimate_mb=tu_estimate,
+                cpu_load_factor=tu_policy["cpu_load_factor"],
             )
     except Exception as e:
         with launch_lock(str(lock_path)):
@@ -702,17 +711,37 @@ def model_support(args):
 
 
 def resource_status(args):
-    """Reconcile without dispatch or process control; dry-run never transitions tasks."""
+    """Reconcile without dispatch or stopping sessions; dry-run never transitions tasks."""
     from launcher.resources import (
         get_mem_available,
         DEFAULT_NATIVE_MEMORY_MB,
         CODEX_MANAGED_NATIVE_MEMORY_MB,
-        MIN_MEM_AVAILABLE_BYTES,
+        DEFAULT_MEMORY_FLOOR_MB,
+    )
+    from launcher.resource_policy import (
+        cpu_guard_status,
+        load_resource_policy,
+        resolve_memory_estimate_mb,
     )
     store = get_store(args)
+    policy = load_resource_policy(
+        None, explicit_path=getattr(args, "resource_config", None))
+    measured_p90 = store.memory_samples_p90(policy["estimate_percentile"])
+    estimate_new = resolve_memory_estimate_mb(
+        None, measured_p90, policy, cap_mb=DEFAULT_NATIVE_MEMORY_MB)
     changes = []
-    memory, disk = store.get_active_resources(dry_run=args.dry_run, reconciliation=changes)
+    breakdown = store.resource_breakdown(
+        dry_run=args.dry_run, reconciliation=changes,
+        ramp_reserve_mb=policy["ramp_reserve_default_mb"],
+        estimate_percentile=policy["estimate_percentile"],
+        ramp_seconds=policy["ramp_seconds"],
+        estimate_multiplier=policy["estimate_multiplier"])
+    memory = sum(r["reserve_mb"] for r in breakdown)
+    disk = sum(r["disk_mb"] for r in breakdown)
+    ramp_total = sum(r["reserve_mb"] for r in breakdown
+                     if r["basis"] in ("queued-estimate", "start-ramp"))
     available = get_mem_available() // (1024 * 1024)
+    floor_mb = policy["memory_floor_mb"]
     from launcher.store import RESOURCE_HOLDING_STATES
     with store.get_conn() as conn:
         slots = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
@@ -722,18 +751,38 @@ def resource_status(args):
     if args.dry_run:
         count -= len(changes)
         reserved -= sum(r["memory_mb"] for r in changes)
-    # Default gate (all providers) plus the narrow managed-Codex gate: the
-    # Codex request needs 4096MiB headroom, so resource-status must show
-    # room for it explicitly instead of implying 1500MiB is sufficient.
-    default_allowed = available - memory - DEFAULT_NATIVE_MEMORY_MB >= MIN_MEM_AVAILABLE_BYTES // (1024 * 1024)
-    codex_allowed = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= MIN_MEM_AVAILABLE_BYTES // (1024 * 1024)
+    cpu = cpu_guard_status(factor=policy["cpu_load_factor"])
+    mem_ok = available - memory - estimate_new >= floor_mb
+    default_allowed = mem_ok and cpu["allowed"]
+    if not mem_ok:
+        reason = "launcher_memory_reserve"
+    elif not cpu["allowed"]:
+        reason = "host_cpu_load"
+    else:
+        reason = None
+    # Narrow managed-Codex gate: the Codex request needs 4096MiB headroom,
+    # so resource-status shows room for it explicitly. The Codex allowance
+    # is a cap, not an estimate, so it stays fail-closed at full size.
+    codex_headroom = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= floor_mb
+    codex_allowed = codex_headroom and cpu["allowed"]
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
                       "mem_available_mb": available,
+                      "memory_floor_mb": floor_mb,
+                      "ramp_reserve_mb": ramp_total,
+                      "measured_p90_mb": measured_p90,
+                      "estimate_new_mb": estimate_new,
+                      "estimate_percentile": policy["estimate_percentile"],
+                      "estimate_multiplier": policy["estimate_multiplier"],
+                      "ramp_reserve_default_mb": policy["ramp_reserve_default_mb"],
+                      "ramp_seconds": policy["ramp_seconds"],
+                      "cpu": cpu,
+                      "breakdown": breakdown,
                       "launch_allowed": default_allowed,
-                      "reason": None if default_allowed else "launcher_memory_reserve",
+                      "reason": reason,
                       "launch_allowed_codex_managed": codex_allowed,
-                      "reason_codex_managed": None if codex_allowed else "launcher_memory_reserve_codex_4096",
+                      "reason_codex_managed": None if codex_allowed else (
+                          "launcher_memory_reserve_codex_4096" if not codex_headroom else "host_cpu_load"),
                       "default_memory_mb": DEFAULT_NATIVE_MEMORY_MB,
                       "codex_managed_memory_mb": CODEX_MANAGED_NATIVE_MEMORY_MB,
                       "dry_run": args.dry_run, "reconciled": changes}))
@@ -1109,6 +1158,11 @@ def main():
         action="store_true",
         help="inner ql-ctl process: keep proven --wait execute path",
     )
+    parser_run.add_argument(
+        "--resource-config",
+        default=None,
+        help="explicit path to config/resource-management.json (never auto-loaded)",
+    )
     parser_run.set_defaults(func=run)
 
     parser_request = subparsers.add_parser("request", help="one-command admission, validation, and execution")
@@ -1164,6 +1218,11 @@ def main():
 
     parser_resources = subparsers.add_parser("resource-status", help="Reconcile reservations without launching or stopping sessions")
     parser_resources.add_argument("--dry-run", action="store_true")
+    parser_resources.add_argument(
+        "--resource-config",
+        default=None,
+        help="explicit path to config/resource-management.json (never auto-loaded)",
+    )
     parser_resources.set_defaults(func=resource_status)
 
     parser_reconcile = subparsers.add_parser(
