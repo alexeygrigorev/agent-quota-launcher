@@ -1089,6 +1089,8 @@ def execute_transient_task_unit(
     expected_cpu_cores: Optional[float] = None,
     ramping_cpu_cores: float = 0.0,
     cpu_policy: Optional[dict] = None,
+    active_mem_mb: int = 0,
+    active_disk_mb: int = 0,
 ) -> Dict[str, Any]:
     """Execute a task in a manager-spawned sibling systemd unit.
 
@@ -1126,6 +1128,8 @@ def execute_transient_task_unit(
         expected_cpu_cores=expected_cpu_cores,
         ramping_cpu_cores=ramping_cpu_cores,
         cpu_policy=cpu_policy,
+        active_mem_mb=active_mem_mb,
+        active_disk_mb=active_disk_mb,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider
@@ -1549,6 +1553,8 @@ def spawn_transient_task_unit(
     expected_cpu_cores: Optional[float] = None,
     ramping_cpu_cores: float = 0.0,
     cpu_policy: Optional[dict] = None,
+    active_mem_mb: int = 0,
+    active_disk_mb: int = 0,
 ) -> Dict[str, Any]:
     """Asynchronously spawn a manager-spawned sibling systemd unit.
 
@@ -1584,6 +1590,8 @@ def spawn_transient_task_unit(
         expected_cpu_cores=expected_cpu_cores,
         ramping_cpu_cores=ramping_cpu_cores,
         cpu_policy=cpu_policy,
+        active_mem_mb=active_mem_mb,
+        active_disk_mb=active_disk_mb,
     )
     command_identity = identify_command(command_argv, provider, model)
     provider = command_identity.provider

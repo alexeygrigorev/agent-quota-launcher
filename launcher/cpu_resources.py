@@ -393,6 +393,54 @@ def trusted_choking_from_env(now_ms=None, cooldown_s=300):
     return validate_resource_choking(value, now_ms=now_ms, cooldown_s=cooldown_s)
 
 
+def collect_admission_context(store, policy, dry_run=False):
+    """Independent live signals and durable positive hints for every backend.
+
+    A failed busy sampler must not consume an OOM delta or hide full PSI.
+    Dry-run reads exactly the same evidence without advancing any baseline.
+    """
+    def safe(function, *args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            return None
+
+    now_ms = int(time.time() * 1000)
+    sampled = safe(sample_cpu_usage)
+    sampled = sampled if isinstance(sampled, dict) else {}
+    keys = ("busy_percent", "busy_cores", "cores", "psi_avg10", "psi_full_avg10",
+            "memory_psi_full_avg10", "observed_at", "interval_s")
+    usage = {key: sampled.get(key) for key in keys}
+    if not sampled:
+        usage.update(observed_at=datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(),
+                     psi_avg10=safe(read_cpu_psi),
+                     psi_full_avg10=safe(read_cpu_psi, category="full"),
+                     memory_psi_full_avg10=safe(read_cpu_psi, resource="memory", category="full"))
+    current = sampled.get("oom_counter")
+    if current is None:
+        current = safe(read_oom_counter)
+    previous = safe(store.get_oom_baseline, "/proc")
+    usage["oom_kills_delta"] = oom_delta(previous, current)
+    if usage["oom_kills_delta"] is not None and usage["oom_kills_delta"] > 0:
+        # An independently read counter is a current observation even if busy
+        # sampling failed. Preserve it before advancing the persisted baseline.
+        observed = datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat()
+        usage["observed_at"] = observed
+        if not dry_run:
+            store.record_choking_event("host_oom", observed)
+    if current is not None and not dry_run:
+        store.set_oom_baseline("/proc", current)
+    cooldown = policy.get("choking_cooldown_seconds", 300)
+    hint = trusted_choking_from_env(now_ms=now_ms, cooldown_s=cooldown)
+    stored = safe(store.get_fresh_choking, cooldown_s=cooldown, now_ms=now_ms)
+    stored = validate_resource_choking(stored, now_ms=now_ms, cooldown_s=cooldown)
+    if hint is not None and not dry_run:
+        store.record_choking_event(hint["reason"], hint["observed_at"])
+    candidates = [value for value in (hint, stored) if value is not None]
+    trusted = max(candidates, key=lambda value: _parse_observed_ms(value["observed_at"])) if candidates else None
+    return usage, trusted
+
+
 def check_cpu_choking(cpu_usage=None, policy=None, cores=None,
                       expected_cpu_cores=0.0, ramping_cpu_cores=0.0,
                       trusted_choking=None, now_ms=None):

@@ -243,9 +243,8 @@ class PercentileEstimateTests(unittest.TestCase):
             resolve_memory_estimate_mb({}, 900, RESOURCE_DEFAULTS), 1125)
         self.assertEqual(
             resolve_memory_estimate_mb({}, None, RESOURCE_DEFAULTS), 512)
-        self.assertEqual(
-            resolve_memory_estimate_mb({"memory_estimate_mb": 0}, None,
-                                       RESOURCE_DEFAULTS), 512)
+        with self.assertRaisesRegex(ValueError, "memory_estimate_mb"):
+            resolve_memory_estimate_mb({"memory_estimate_mb": 0}, None, RESOURCE_DEFAULTS)
         policy = dict(RESOURCE_DEFAULTS, ramp_reserve_default_mb=256)
         self.assertEqual(resolve_memory_estimate_mb({}, None, policy), 256)
         # Multiplier honored; tiny samples floor at 64.
@@ -265,6 +264,11 @@ class PercentileEstimateTests(unittest.TestCase):
         self.assertEqual(
             resolve_memory_estimate_mb({}, 2000, RESOURCE_DEFAULTS,
                                        cap_mb=4096), 2500)
+
+    def test_explicit_invalid_estimates_cannot_silently_use_default(self):
+        for value in (-100, "bad", True, 12.5, None, float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "memory_estimate_mb"):
+                resolve_memory_estimate_mb({"memory_estimate_mb": value}, 900, RESOURCE_DEFAULTS)
 
 
 class CpuGuardTests(unittest.TestCase):
@@ -590,13 +594,26 @@ class ResidentSettleTests(unittest.TestCase):
             self.assertEqual(rows[0]["reserve_mb"], 0)
             self.assertEqual(rows[0]["basis"], "start-ramp")
 
-    def test_unknown_age_with_live_measurement_uses_ramp_credit(self):
+    def test_unknown_age_cannot_claim_a_young_ramp(self):
         self.submit_running()
         p1, p2, p3 = self.live(200, None)
         with p1, p2, p3:
             rows = self.store.resource_breakdown()
-            self.assertEqual(rows[0]["reserve_mb"], 312)
-            self.assertEqual(rows[0]["basis"], "start-ramp")
+            self.assertEqual(rows[0]["reserve_mb"], 1500)
+            self.assertEqual(rows[0]["basis"], "full-unknown")
+
+    def test_bound_workers_without_rss_need_a_known_young_age_for_ramp_estimate(self):
+        self.submit_running()
+        for state in ("starting", "launch-uncertain", "stalled", "running"):
+            for age in (None, 180, 9999, 10):
+                with self.subTest(state=state, age=age):
+                    with self.store.get_conn() as conn:
+                        conn.execute("UPDATE tasks SET state=? WHERE id='t1'", (state,))
+                    p1,p2,p3=self.live(0,age)
+                    with p1,p2,p3:
+                        row=self.store.resource_breakdown()[0]
+                    self.assertEqual(row["basis"], "start-ramp" if age==10 else "full-unknown")
+                    self.assertEqual(row["reserve_mb"], 512 if age==10 else 1500)
 
 
 class ResourceStatusTests(unittest.TestCase):

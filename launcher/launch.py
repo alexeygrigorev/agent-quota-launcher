@@ -807,71 +807,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             ramping_total = 0.0
         record["ramping_cpu_cores"] = ramping_total
         record["ramping_cpu_entries"] = len(entries)
-        # Fresh host CPU telemetry (0.2s delta, readonly /proc).
-        try:
-            sampled = sample_cpu_usage()
-            cpu_usage_live = {k: sampled.get(k) for k in
-                              ("busy_percent", "busy_cores", "cores", "psi_avg10",
-                               "psi_full_avg10", "memory_psi_full_avg10",
-                               "observed_at", "interval_s")}
-            oom_current = sampled.get("oom_counter")
-        except Exception:
-            cpu_usage_live = None
-            oom_current = None
-        # OOM measured delta against the persisted baseline (first sample
-        # unknown). Baseline update is part of admission state (non-dry-run
-        # launch path only); resource-status --dry-run never writes.
-        try:
-            oom_prev = store.get_oom_baseline("/proc")
-            if oom_current is None:
-                try:
-                    oom_current = read_oom_counter("/proc")
-                except Exception:
-                    oom_current = None
-            if isinstance(cpu_usage_live, dict):
-                cpu_usage_live["oom_kills_delta"] = oom_delta(oom_prev, oom_current) \
-                    if oom_prev is not None or oom_current is not None else None
-            if oom_current is not None:
-                store.set_oom_baseline("/proc", oom_current)
-        except Exception:
-            pass
-        # Trusted host runtime hint (env/file from host only) + durable
-        # positive cooldown evidence. Task payload/goal text is NEVER parsed.
-        try:
-            hint = trusted_choking_from_env(
-                cooldown_s=policy["choking_cooldown_seconds"])
-        except Exception:
-            hint = None
-        try:
-            stored = store.get_fresh_choking(
-                cooldown_s=policy["choking_cooldown_seconds"])
-        except Exception:
-            stored = None
-        trusted_hint = hint if hint is not None else stored
-        # Persist fresh positive OOM evidence so the cooldown survives
-        # cycles where the next measured delta is back to 0. PSI FULL is
-        # measured live every admission and needs no event row. Trusted
-        # host runtime hints from the environment are recorded once so
-        # later admissions see them via get_fresh_choking.
-        try:
-            import time as _ctime2
-            from datetime import datetime as _dt, timezone as _tz
-            _now2 = int(_ctime2.time() * 1000)
-            _obs = (cpu_usage_live or {}).get("observed_at")
-            _fresh = False
-            if isinstance(_obs, str):
-                try:
-                    _at = int(_dt.fromisoformat(_obs.replace("Z", "+00:00")).timestamp() * 1000)
-                    _fresh = 0 <= _now2 - _at <= 180000 and _at <= _now2 + 30000
-                except (ValueError, AttributeError, TypeError):
-                    _fresh = False
-            if _fresh and isinstance((cpu_usage_live or {}).get("oom_kills_delta"), int) \
-                    and (cpu_usage_live or {}).get("oom_kills_delta") > 0:
-                store.record_choking_event("host_oom", _obs)
-            if hint is not None and stored is None:
-                store.record_choking_event(hint["reason"], hint["observed_at"])
-        except Exception:
-            pass
+        from launcher.cpu_resources import collect_admission_context
+        cpu_usage_live, trusted_hint = collect_admission_context(store, policy)
         record["cpu_usage"] = cpu_usage_live
         record["trusted_choking"] = trusted_hint
         active_mem, active_disk = store.get_active_resources(

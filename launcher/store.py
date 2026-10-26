@@ -801,10 +801,18 @@ class Store:
         """
         if dry_run:
             return
+        from datetime import datetime, timezone
+        if reason not in ("host_oom", "host_runtime_choking"):
+            raise ValueError("invalid choking reason")
+        parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("choking observation requires timezone")
+        observed_at = parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
         with self.get_conn() as conn:
             conn.execute(
-                "INSERT INTO cpu_choking_events (reason, observed_at) VALUES (?, ?)",
-                (reason, observed_at))
+                "INSERT INTO cpu_choking_events (reason, observed_at) SELECT ?, ? "
+                "WHERE NOT EXISTS (SELECT 1 FROM cpu_choking_events WHERE reason=? AND observed_at=?)",
+                (reason, observed_at, reason, observed_at))
 
     def get_fresh_choking(self, cooldown_s=300, now_ms=None):
         """Latest choking event within cooldown, or None. Read-only."""
@@ -814,7 +822,7 @@ class Store:
             now_ms = int(_time.time() * 1000)
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT reason, observed_at FROM cpu_choking_events ORDER BY id DESC LIMIT 20").fetchall()
+                "SELECT reason, observed_at FROM cpu_choking_events ORDER BY observed_at DESC LIMIT 20").fetchall()
         for reason, observed_at in rows:
             if reason not in ("host_oom", "host_runtime_choking"):
                 continue
@@ -1051,10 +1059,10 @@ class Store:
                     # minus proven current usage, mirroring the Hub headroom
                     # credit. Unknown holds the full allowance (fail closed).
                     credit = resident_credit_mb(binding, live_info, allowance) if status == "alive" else 0
-                    if status == "alive" and credit > 0:
+                    age = self._task_age_seconds(task_id, binding)
+                    if status == "alive" and credit > 0 and age is not None:
                         self._record_resident_sample(task_id, binding, credit, dry_run)
-                        age = self._task_age_seconds(task_id, binding)
-                        if age is not None and age >= ramp_seconds:
+                        if age >= ramp_seconds:
                             rows_out.append({"task_id": task_id, "state": state,
                                              "reserve_mb": 0, "disk_mb": disk or 0,
                                              "basis": "resident-settled"})
@@ -1063,10 +1071,8 @@ class Store:
                                              "reserve_mb": max(0, estimate - credit),
                                              "disk_mb": disk or 0,
                                              "basis": "start-ramp"})
-                    elif status == "alive" and (
-                            state in ("starting", "launch-uncertain", "stalled")
-                            or (state == "running"
-                                and (self._task_age_seconds(task_id, binding) or 0) < ramp_seconds)):
+                    elif status == "alive" and age is not None and age < ramp_seconds and state in (
+                            "starting", "launch-uncertain", "stalled", "running"):
                         # Inflight start (or young running worker) before
                         # samples land: hold the measured estimate.
                         rows_out.append({"task_id": task_id, "state": state,

@@ -125,6 +125,11 @@ def run(args):
                 hint = validate_resource_choking(value, cooldown_s=3600)
         except (ValueError, TypeError):
             pass
+    if hint is None:
+        from launcher.cpu_resources import trusted_choking_from_env
+        inherited = trusted_choking_from_env(cooldown_s=3600)
+        args.trusted_choking_json = json.dumps(inherited) if inherited is not None else None
+        return _run_with_host_hint(args)
     sanitized = json.dumps(hint, separators=(",", ":"))
     previous = os.environ.get("LAUNCHER_TRUSTED_CHOKING_JSON")
     args.trusted_choking_json = sanitized
@@ -230,6 +235,8 @@ def spawn_ql_controller(args, return_dict=False):
     ]
     if getattr(args, "trusted_choking_json", None) is not None:
         cmd.extend(["--trusted-choking-json", args.trusted_choking_json])
+    if getattr(args, "resource_config", None) is not None:
+        cmd.extend(["--resource-config", args.resource_config])
     res = subprocess.run(cmd, cwd=launcher_root, capture_output=True, text=True)
     if res.returncode != 0:
         err_res = {
@@ -253,6 +260,32 @@ def spawn_ql_controller(args, return_dict=False):
         return success_res
     print(json.dumps(success_res))
     return 0
+
+
+def task_unit_resource_context(store, args, payload, memory_mb):
+    """Called under launch.lock before taking the task-unit start lease."""
+    from launcher.resource_policy import load_resource_policy, resolve_memory_estimate_mb
+    from launcher.cpu_resources import resolve_expected_cpu, ramping_cpu_cores, collect_admission_context
+    from launcher.resources import check_resources
+    policy = load_resource_policy(payload, explicit_path=getattr(args, "resource_config", None))
+    estimate = resolve_memory_estimate_mb(payload, store.memory_samples_p90(policy["estimate_percentile"]),
+                                          policy, cap_mb=memory_mb)
+    expected, source = resolve_expected_cpu(payload, policy=policy)
+    frozen = store.freeze_cpu_start(args.id, expected, source)
+    active_mem, active_disk = store.get_active_resources(exclude_task_id=args.id,
+        ramp_reserve_mb=policy["ramp_reserve_default_mb"], estimate_percentile=policy["estimate_percentile"],
+        ramp_seconds=policy["ramp_seconds"], estimate_multiplier=policy["estimate_multiplier"])
+    entries = store.cpu_ramping_entries(exclude_task_id=args.id, ramp_seconds=policy["ramp_seconds"],
+                                        default_expected=policy["cpu_default_cores"])
+    usage, trusted = collect_admission_context(store, policy)
+    context = dict(active_mem_mb=active_mem, active_disk_mb=active_disk,
+        memory_floor_mb=policy["memory_floor_mb"], memory_estimate_mb=estimate,
+        cpu_load_factor=policy["cpu_load_factor"], cpu_policy=policy, cpu_usage=usage,
+        trusted_choking=trusted, expected_cpu_cores=frozen["expected_cpu_cores"],
+        ramping_cpu_cores=ramping_cpu_cores(entries, ramp_seconds=policy["ramp_seconds"]))
+    tmpdir = args.tmpdir or str(Path(args.cwd).resolve() / ".local" / "tmp" / args.id)
+    check_resources(memory_mb, args.cwd, tmpdir, **context)
+    return context
 
 
 def run_task_units(args):
@@ -423,21 +456,14 @@ def run_task_units(args):
     provider = chosen_provider
     model = chosen_model or payload.get("model")
     argv = build_adapter_argv(provider, goal, model=model)
-    from launcher.resource_policy import load_resource_policy, resolve_memory_estimate_mb
-    from launcher.cpu_resources import resolve_expected_cpu
-    tu_policy = load_resource_policy(payload)
-    tu_estimate = resolve_memory_estimate_mb(
-        payload, store.memory_samples_p90(tu_policy["estimate_percentile"]),
-        tu_policy, cap_mb=memory_mb)
-    try:
-        tu_expected, tu_source = resolve_expected_cpu(payload, policy=tu_policy)
-    except ValueError as e:
-        print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
-        return 1
-    with launch_lock(str(lock_path)):
-        store.freeze_cpu_start(args.id, tu_expected, tu_source)
     # C2456: hold launch.lock only for Store lease, not the model wait.
     with launch_lock(str(lock_path)):
+        try:
+            resource_context = task_unit_resource_context(store, args, payload, memory_mb)
+        except ValueError as e:
+            store.record_reason(args.id, str(e))
+            print(json.dumps({"error": str(e), "backend": "task-units", "task_id": args.id}))
+            return 1
         store.transition_task(args.id, "starting", ("queued",),
                               reason=f"task-units lease {provider}")
     try:
@@ -461,9 +487,7 @@ def run_task_units(args):
                 read_only_paths=read_only_paths,
                 read_write_paths=read_write_paths,
                 extra_env=payload.get("private_env") or payload.get("extra_env"),
-                memory_floor_mb=tu_policy["memory_floor_mb"],
-                memory_estimate_mb=tu_estimate,
-                cpu_load_factor=tu_policy["cpu_load_factor"],
+                **resource_context,
             )
     except Exception as e:
         with launch_lock(str(lock_path)):
@@ -807,39 +831,8 @@ def resource_status(args):
         count -= len(changes)
         reserved -= sum(r["memory_mb"] for r in changes)
     legacy_cpu = cpu_guard_status(factor=policy["cpu_load_factor"])
-    try:
-        sampled = sample_cpu_usage()
-        cpu_usage_live = {k: sampled.get(k) for k in
-                          ("busy_percent", "busy_cores", "cores", "psi_avg10",
-                           "psi_full_avg10", "memory_psi_full_avg10",
-                           "observed_at", "interval_s")}
-    except Exception:
-        cpu_usage_live = None
-        sampled = {}
-    try:
-        oom_prev = store.get_oom_baseline("/proc")
-        oom_cur = (sampled or {}).get("oom_counter")
-        if oom_cur is None:
-            try:
-                oom_cur = read_oom_counter("/proc")
-            except Exception:
-                oom_cur = None
-        if isinstance(cpu_usage_live, dict):
-            cpu_usage_live["oom_kills_delta"] = oom_delta(oom_prev, oom_cur) \
-                if oom_prev is not None or oom_cur is not None else None
-    except Exception:
-        pass
-    try:
-        hint = trusted_choking_from_env(
-            cooldown_s=policy["choking_cooldown_seconds"])
-    except Exception:
-        hint = None
-    try:
-        stored_hint = store.get_fresh_choking(
-            cooldown_s=policy["choking_cooldown_seconds"])
-    except Exception:
-        stored_hint = None
-    trusted_hint = hint if hint is not None else stored_hint
+    from launcher.cpu_resources import collect_admission_context
+    cpu_usage_live, trusted_hint = collect_admission_context(store, policy, dry_run=args.dry_run)
     try:
         default_expected, default_source = resolve_expected_cpu(None, policy=policy)
     except ValueError:

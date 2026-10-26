@@ -401,6 +401,14 @@ class SanitizeTests(unittest.TestCase):
 
 
 class TrustedHostCliBridgeTests(unittest.TestCase):
+    def test_bad_explicit_hint_does_not_clear_valid_inherited_evidence(self):
+        from types import SimpleNamespace
+        from launcher import cli
+        hint={"reason":"host_oom","observed_at":datetime.now(timezone.utc).isoformat()}
+        with patch.dict(os.environ,{"LAUNCHER_TRUSTED_CHOKING_JSON":json.dumps(hint)}), \
+             patch.object(cli,"_run_with_host_hint",side_effect=lambda args: cpu.trusted_choking_from_env()):
+            self.assertEqual(cli.run(SimpleNamespace(trusted_choking_json="bad")),hint)
+
     def test_native_and_task_units_receive_explicit_hint_without_task_payload_trust(self):
         from types import SimpleNamespace
         from launcher import cli
@@ -438,12 +446,85 @@ class TrustedHostCliBridgeTests(unittest.TestCase):
         from launcher import cli
         with tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as tmp:
             hint = json.dumps({"reason":"host_oom", "observed_at":datetime.now(timezone.utc).isoformat()})
-            args=SimpleNamespace(config_dir=tmp,id="proof",cwd=tmp,tmpdir=tmp,trusted_choking_json=hint)
+            args=SimpleNamespace(config_dir=tmp,id="proof",cwd=tmp,tmpdir=tmp,trusted_choking_json=hint,resource_config="/trusted/policy.json")
             with patch.object(cli.subprocess,"run",return_value=SimpleNamespace(returncode=0)) as run:
                 self.assertEqual(cli.spawn_ql_controller(args,return_dict=True)["state"],"queued-or-starting")
                 command=run.call_args.args[0]
                 index=command.index("--trusted-choking-json")
                 self.assertEqual(command[index+1],hint)
+                self.assertEqual(command[command.index("--resource-config")+1],"/trusted/policy.json")
+
+
+class AdmissionContextRecoveryTests(unittest.TestCase):
+    def test_oom_and_full_psi_survive_busy_sampler_exception_before_baseline_advances(self):
+        from unittest.mock import MagicMock
+        store=MagicMock()
+        store.get_oom_baseline.return_value=10
+        store.get_fresh_choking.return_value=None
+        with patch.object(cpu,"sample_cpu_usage",side_effect=OSError), \
+             patch.object(cpu,"read_oom_counter",return_value=11), \
+             patch.object(cpu,"read_cpu_psi",return_value=7), \
+             patch.dict(os.environ,{"LAUNCHER_TRUSTED_CHOKING_JSON":""}):
+            usage,hint=cpu.collect_admission_context(store,RESOURCE_DEFAULTS)
+        self.assertIsNone(usage["busy_cores"])
+        self.assertEqual(usage["oom_kills_delta"],1)
+        self.assertEqual(usage["psi_full_avg10"],7)
+        self.assertEqual(store.method_calls[1][0],"record_choking_event")
+        store.set_oom_baseline.assert_called_once_with("/proc",11)
+        self.assertIn(cpu.check_cpu_choking(usage,RESOURCE_DEFAULTS,cores=4,trusted_choking=hint)[1],("cpu_pressure","host_oom"))
+
+    def test_new_hint_persists_over_old_hint_and_dry_run_never_writes(self):
+        from unittest.mock import MagicMock
+        now=datetime.now(timezone.utc)
+        newer={"reason":"host_runtime_choking","observed_at":now.isoformat()}
+        older={"reason":"host_oom","observed_at":datetime.fromtimestamp(now.timestamp()-295,timezone.utc).isoformat()}
+        for dry in (False,True):
+            store=MagicMock();store.get_oom_baseline.return_value=10;store.get_fresh_choking.return_value=older
+            with self.subTest(dry=dry), patch.object(cpu,"sample_cpu_usage",return_value={**usage(),"oom_counter":10}), \
+                 patch.dict(os.environ,{"LAUNCHER_TRUSTED_CHOKING_JSON":json.dumps(newer)}):
+                _,hint=cpu.collect_admission_context(store,RESOURCE_DEFAULTS,dry_run=dry)
+            self.assertEqual(hint,newer)
+            if dry:
+                store.record_choking_event.assert_not_called();store.set_oom_baseline.assert_not_called()
+            else:
+                store.record_choking_event.assert_called_once_with(newer["reason"],newer["observed_at"])
+
+    def test_task_unit_context_honors_file_active_commitments_and_frozen_cpu(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from launcher import cli
+        with tempfile.TemporaryDirectory(dir=LOCAL_TMP_DIR) as tmp:
+            policy=Path(tmp)/"policy.json";policy.write_text(json.dumps({"memory_floor_mb":4096,"cpu_psi_full_hard_cap_pct":8}))
+            store=MagicMock();store.memory_samples_p90.return_value=None
+            store.freeze_cpu_start.return_value={"expected_cpu_cores":3,"expected_cpu_source":"repo"}
+            store.get_active_resources.return_value=(700,25)
+            store.cpu_ramping_entries.return_value=[]
+            hint={"reason":"host_runtime_choking","observed_at":datetime.now(timezone.utc).isoformat()}
+            args=SimpleNamespace(id="task",cwd=tmp,tmpdir=tmp,resource_config=str(policy))
+            with patch.object(cpu,"collect_admission_context",return_value=(usage(),hint)), \
+                 patch("launcher.resources.check_resources") as check:
+                context=cli.task_unit_resource_context(store,args,{"expected_cpu_cores":1,"expected_cpu_source":"default"},1500)
+            self.assertEqual(context["memory_floor_mb"],4096)
+            self.assertEqual(context["active_mem_mb"],700);self.assertEqual(context["active_disk_mb"],25)
+            self.assertEqual(context["expected_cpu_cores"],3)
+            self.assertEqual(context["cpu_policy"]["cpu_psi_full_hard_cap_pct"],8)
+            self.assertEqual(context["trusted_choking"],hint)
+            check.assert_called_once_with(1500,tmp,tmp,**context)
+
+    def test_both_task_unit_execution_paths_forward_resource_commitments_before_effects(self):
+        from launcher import task_units
+        context=dict(active_mem_mb=700,active_disk_mb=25,expected_cpu_cores=3,
+                     ramping_cpu_cores=2,cpu_policy=dict(RESOURCE_DEFAULTS),cpu_usage=usage(),
+                     trusted_choking={"reason":"host_oom","observed_at":datetime.now(timezone.utc).isoformat()})
+        for execute in (task_units.execute_transient_task_unit,task_units.spawn_transient_task_unit):
+            with self.subTest(execute=execute.__name__), \
+                 patch.object(task_units,"admit_task_unit",side_effect=task_units.TaskUnitAdmissionError("known choking")) as admit, \
+                 patch.object(task_units.subprocess,"run") as effect:
+                with self.assertRaisesRegex(task_units.TaskUnitAdmissionError,"known choking"):
+                    execute(task_id="proof",command_argv=["/usr/bin/true"],memory_mb=1500,workspace="/repo",**context)
+                for key,value in context.items():
+                    self.assertEqual(admit.call_args.kwargs[key],value)
+                effect.assert_not_called()
 
 
 if __name__ == "__main__":

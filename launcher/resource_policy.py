@@ -183,10 +183,11 @@ def resolve_memory_estimate_mb(payload=None, measured_p90_mb=None, policy=None,
             return value
         return min(value, cap_mb)
 
-    if isinstance(payload, dict):
-        hit = valid_estimate_mb(payload.get("memory_estimate_mb"))
-        if hit is not None:
-            return _cap(hit)
+    if isinstance(payload, dict) and "memory_estimate_mb" in payload:
+        hit = valid_estimate_mb(payload["memory_estimate_mb"])
+        if hit is None:
+            raise ValueError("invalid memory_estimate_mb")
+        return _cap(hit)
     if type(measured_p90_mb) is int and measured_p90_mb > 0:
         return _cap(max(64, math.ceil(measured_p90_mb * mult)))
     return _cap(default)
