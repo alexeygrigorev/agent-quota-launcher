@@ -8,7 +8,8 @@ MAX_WORKER_MEMORY_MB = 1500
 DEFAULT_NATIVE_MEMORY_MB = 1500
 CODEX_MANAGED_NATIVE_MEMORY_MB = 4096
 CODEX_MANAGED_PROVIDERS = ("codex", "openai")
-MIN_MEM_AVAILABLE_BYTES = 10 * 1024 * 1024 * 1024
+# Host MemAvailable floor (Alexey t1476u 2026-10-26: 2 GiB; was 10 GiB).
+MIN_MEM_AVAILABLE_BYTES = 2 * 1024 * 1024 * 1024
 MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
 WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
 MAX_DISK_SPIKE_BYTES = 512 * 1024 * 1024
@@ -148,7 +149,7 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         req_mem = requested_value * 1024 * 1024
         act_mem = active_mem_mb * 1024 * 1024
         if mem_avail - act_mem - req_mem < MIN_MEM_AVAILABLE_BYTES:
-            raise ValueError("host MemAvailable < 10GiB")
+            raise ValueError("host MemAvailable < 10GiB")  # message kept stable for Hub diagnostics mapping
 
     if target_stage is not None:
         cap = evaluate_stage_capacity(concurrency=target_stage, mem_available_bytes=mem_avail, ignore_ram=ignore_ram)

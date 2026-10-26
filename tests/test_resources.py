@@ -45,14 +45,14 @@ class TestResources(unittest.TestCase):
 
     def test_memavailable_floor(self):
         import launcher.resources as res
-        with patch.object(res, 'get_mem_available', return_value=10.5 * GiB):
+        with patch.object(res, 'get_mem_available', return_value=2.5 * GiB):
             with self.assertRaisesRegex(ValueError, "host MemAvailable < 10GiB"):
                 check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo)
 
     def test_active_reservations_counted(self):
-        # 11 GiB available, 1.5 GiB already reserved -> below floor after request.
+        # 3 GiB available, 1.5 GiB already reserved -> below floor after request.
         import launcher.resources as res
-        with patch.object(res, 'get_mem_available', return_value=11 * GiB):
+        with patch.object(res, 'get_mem_available', return_value=3 * GiB):
             with self.assertRaisesRegex(ValueError, "host MemAvailable < 10GiB"):
                 check_resources(1500, self.repo, str(self.owned_tmp),
                                 active_mem_mb=1500, repo_root=self.repo)

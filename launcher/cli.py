@@ -707,6 +707,7 @@ def resource_status(args):
         get_mem_available,
         DEFAULT_NATIVE_MEMORY_MB,
         CODEX_MANAGED_NATIVE_MEMORY_MB,
+        MIN_MEM_AVAILABLE_BYTES,
     )
     store = get_store(args)
     changes = []
@@ -724,8 +725,8 @@ def resource_status(args):
     # Default gate (all providers) plus the narrow managed-Codex gate: the
     # Codex request needs 4096MiB headroom, so resource-status must show
     # room for it explicitly instead of implying 1500MiB is sufficient.
-    default_allowed = available - memory - DEFAULT_NATIVE_MEMORY_MB >= 10240
-    codex_allowed = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= 10240
+    default_allowed = available - memory - DEFAULT_NATIVE_MEMORY_MB >= MIN_MEM_AVAILABLE_BYTES // (1024 * 1024)
+    codex_allowed = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= MIN_MEM_AVAILABLE_BYTES // (1024 * 1024)
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
                       "mem_available_mb": available,

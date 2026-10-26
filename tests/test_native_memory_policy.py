@@ -108,11 +108,11 @@ class TestCodexAdmissionRoom(unittest.TestCase):
         self.owned.mkdir(parents=True)
 
     def test_host_floor_accounts_for_4096(self):
-        # 13GiB available: 1500MiB request leaves >10GiB, 4096MiB does not.
+        # 5GiB available: 1500MiB request leaves >2GiB floor, 4096MiB does not.
         # This is the midrun-kill regression: 1500-passing hosts must not
         # silently admit a 4096 Codex request without room.
         import launcher.resources as res
-        with patch.object(res, "get_mem_available", return_value=13 * GiB), \
+        with patch.object(res, "get_mem_available", return_value=5 * GiB), \
              patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
             self.assertTrue(check_resources(1500, self.repo, str(self.owned),
                                             repo_root=self.repo))
@@ -335,7 +335,7 @@ class TestResourceStatusCodexRoom(unittest.TestCase):
             dry_run = True
 
         # 13GiB: default 1500 passes, codex 4096 must not.
-        with patch("launcher.resources.get_mem_available", return_value=13 * GiB):
+        with patch("launcher.resources.get_mem_available", return_value=5 * GiB):
             with patch("builtins.print") as pr:
                 self.assertEqual(resource_status(Args()), 0)
                 doc = json.loads(pr.call_args.args[0])
