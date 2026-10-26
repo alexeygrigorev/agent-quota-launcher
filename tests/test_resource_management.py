@@ -581,6 +581,7 @@ class ResourceStatusTests(unittest.TestCase):
         self.assertEqual(doc["memory_floor_mb"], 2048)
         self.assertEqual(doc["estimate_multiplier"], 1.25)
         self.assertEqual(doc["estimate_new_mb"], 512)
+        self.assertEqual(doc["estimate_new_codex_managed_mb"], 512)
         self.assertTrue(doc["launch_allowed"])
         self.assertIsNone(doc["reason"])
         self.assertTrue(doc["cpu"]["allowed"])
@@ -601,6 +602,8 @@ class ResourceStatusTests(unittest.TestCase):
             doc = _json.loads(pr.call_args.args[0])
         self.assertFalse(doc["launch_allowed"])
         self.assertEqual(doc["reason"], "launcher_memory_reserve")
+        self.assertFalse(doc["launch_allowed_codex_managed"])
+        self.assertEqual(doc["reason_codex_managed"], "launcher_memory_reserve")
 
     def test_cpu_overload_reports_host_cpu_load(self):
         import json as _json

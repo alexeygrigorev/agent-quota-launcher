@@ -346,7 +346,7 @@ class TestResourceStatusCodexRoom(unittest.TestCase):
         self.assertTrue(doc["launch_allowed"])
         self.assertTrue(doc["launch_allowed_codex_managed"])
 
-    def test_tight_host_blocks_codex_but_not_default(self):
+    def test_tight_host_uses_estimate_for_codex_and_default(self):
         import tempfile, json
         from launcher.cli import resource_status
         from launcher.store import Store
@@ -360,15 +360,17 @@ class TestResourceStatusCodexRoom(unittest.TestCase):
             config_dir = str(cfg)
             dry_run = True
 
-        # 13GiB: default 1500 passes, codex 4096 must not.
-        with patch("launcher.resources.get_mem_available", return_value=5 * GiB):
+        # 3GiB leaves room for floor + default estimate, even though the
+        # managed-Codex containment cap alone is larger than available RAM.
+        with patch("launcher.resources.get_mem_available", return_value=3 * GiB):
             with patch("builtins.print") as pr:
                 self.assertEqual(resource_status(Args()), 0)
                 doc = json.loads(pr.call_args.args[0])
         self.assertTrue(doc["launch_allowed"])
-        self.assertFalse(doc["launch_allowed_codex_managed"])
-        self.assertEqual(doc["reason_codex_managed"],
-                         "launcher_memory_reserve_codex_4096")
+        self.assertTrue(doc["launch_allowed_codex_managed"])
+        self.assertIsNone(doc["reason_codex_managed"])
+        self.assertEqual(doc["estimate_new_codex_managed_mb"], 512)
+        self.assertEqual(doc["codex_managed_memory_mb"], 4096)
 
 
 if __name__ == "__main__":

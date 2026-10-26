@@ -729,6 +729,8 @@ def resource_status(args):
     measured_p90 = store.memory_samples_p90(policy["estimate_percentile"])
     estimate_new = resolve_memory_estimate_mb(
         None, measured_p90, policy, cap_mb=DEFAULT_NATIVE_MEMORY_MB)
+    estimate_codex = resolve_memory_estimate_mb(
+        None, measured_p90, policy, cap_mb=CODEX_MANAGED_NATIVE_MEMORY_MB)
     changes = []
     breakdown = store.resource_breakdown(
         dry_run=args.dry_run, reconciliation=changes,
@@ -760,10 +762,9 @@ def resource_status(args):
         reason = "host_cpu_load"
     else:
         reason = None
-    # Narrow managed-Codex gate: the Codex request needs 4096MiB headroom,
-    # so resource-status shows room for it explicitly. The Codex allowance
-    # is a cap, not an estimate, so it stays fail-closed at full size.
-    codex_headroom = available - memory - CODEX_MANAGED_NATIVE_MEMORY_MB >= floor_mb
+    # Managed Codex uses the same measured admission policy as native start.
+    # Its 4096MiB containment cap bounds the estimate; it is not a RAM hold.
+    codex_headroom = available - memory - estimate_codex >= floor_mb
     codex_allowed = codex_headroom and cpu["allowed"]
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
@@ -772,6 +773,7 @@ def resource_status(args):
                       "ramp_reserve_mb": ramp_total,
                       "measured_p90_mb": measured_p90,
                       "estimate_new_mb": estimate_new,
+                      "estimate_new_codex_managed_mb": estimate_codex,
                       "estimate_percentile": policy["estimate_percentile"],
                       "estimate_multiplier": policy["estimate_multiplier"],
                       "ramp_reserve_default_mb": policy["ramp_reserve_default_mb"],
@@ -782,7 +784,7 @@ def resource_status(args):
                       "reason": reason,
                       "launch_allowed_codex_managed": codex_allowed,
                       "reason_codex_managed": None if codex_allowed else (
-                          "launcher_memory_reserve_codex_4096" if not codex_headroom else "host_cpu_load"),
+                          "launcher_memory_reserve" if not codex_headroom else "host_cpu_load"),
                       "default_memory_mb": DEFAULT_NATIVE_MEMORY_MB,
                       "codex_managed_memory_mb": CODEX_MANAGED_NATIVE_MEMORY_MB,
                       "dry_run": args.dry_run, "reconciled": changes}))
