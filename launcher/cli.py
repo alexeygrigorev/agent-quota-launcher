@@ -284,7 +284,12 @@ def task_unit_resource_context(store, args, payload, memory_mb):
         trusted_choking=trusted, expected_cpu_cores=frozen["expected_cpu_cores"],
         ramping_cpu_cores=ramping_cpu_cores(entries, ramp_seconds=policy["ramp_seconds"]))
     tmpdir = args.tmpdir or str(Path(args.cwd).resolve() / ".local" / "tmp" / args.id)
-    check_resources(memory_mb, args.cwd, tmpdir, repo_root=args.cwd, **context)
+    from launcher.task_resource_limits import hub_headless_memory_mb, MAX_TASK_MEMORY_MB
+    cap = {}
+    if hub_headless_memory_mb(payload) is not None:
+        context["memory_estimate_mb"] = max(estimate, memory_mb)
+        cap["memory_ceiling_mb"] = MAX_TASK_MEMORY_MB
+    check_resources(memory_mb, args.cwd, tmpdir, repo_root=args.cwd, **cap, **context)
     return context
 
 
@@ -365,7 +370,7 @@ def run_task_units(args):
     allow_fallback = payload.get("allow_fallback", True)
 
     tmpdir = args.tmpdir
-    memory_mb = int(payload.get("memory_mb") or bounds["memory_mb"])
+    memory_mb = bounds["memory_mb"]
     timeout_sec = float(payload.get("timeout") or bounds["timeout"])
     protect_system = payload.get("protect_system")
     read_only_paths = payload.get("read_only_paths")

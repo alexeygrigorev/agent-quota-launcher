@@ -179,7 +179,7 @@ class TestTaskUnitAdmission(unittest.TestCase):
         with self.assertRaises(TaskUnitAdmissionError) as ctx:
             admit_task_unit(
                 task_id="t1",
-                memory_mb=1501,
+                memory_mb=32769,
                 workspace=str(self.repo),
                 tmpdir=str(self.allowed_tmp),
                 quse_json=self.valid_quse,
@@ -252,7 +252,7 @@ class TestTaskUnitCommandAndPrelude(unittest.TestCase):
         self.assertIn("--pipe", cmd)
         self.assertIn("-p", cmd)
         self.assertIn("MemoryMax=768M", cmd)
-        self.assertIn("TasksMax=100", cmd)
+        self.assertIn("TasksMax=1024", cmd)
         self.assertIn("-E", cmd)
         self.assertIn("TMPDIR=/repo/.local/tmp/t1", cmd)
         self.assertTrue(any(arg.startswith("PATH=") for arg in cmd))
@@ -739,7 +739,7 @@ class TestTaskUnitEnvironmentExpansionLiteralPreservation(unittest.TestCase):
         self.assertNotIn("--pipe", cmd_wait)
         self.assertIn("-p", cmd_wait)
         self.assertTrue(any("MemoryMax=1024M" in x for x in cmd_wait))
-        self.assertTrue(any("TasksMax=100" in x for x in cmd_wait))
+        self.assertTrue(any("TasksMax=1024" in x for x in cmd_wait))
         self.assertTrue(any("ProtectSystem=strict" in x for x in cmd_wait))
         self.assertTrue(any("ReadOnlyPaths=/repo" in x for x in cmd_wait))
         self.assertTrue(any("ReadWritePaths=/repo/.local/tmp" in x for x in cmd_wait))
@@ -934,7 +934,7 @@ class TestTaskUnitExecutionLifecycle(unittest.TestCase):
         self.assertEqual(len(receipt["module_sha256"]), 64)
         self.assertTrue(receipt["cleanup_verified"])
         self.assertEqual(receipt["memory_max_mb"], 512)
-        self.assertEqual(receipt["tasks_max"], 100)
+        self.assertEqual(receipt["tasks_max"], 1024)
         self.assertTrue(Path(receipt["stdout_log"]).exists())
 
 
@@ -1994,7 +1994,7 @@ class TestActualTaskUnitProviderBinding(unittest.TestCase):
                 with patch("launcher.task_units.check_resources", side_effect=ValueError(reason)):
                     with self.assertRaisesRegex(TaskUnitAdmissionError, reason):
                         admit_task_unit(**kwargs)
-            for memory in (0, -1, 1501):
+            for memory in (0, -1, 32769):
                 with self.assertRaises(TaskUnitAdmissionError):
                     admit_task_unit(**dict(kwargs, memory_mb=memory))
             with self.assertRaisesRegex(TaskUnitAdmissionError, "must be located under"):

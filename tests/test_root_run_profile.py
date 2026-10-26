@@ -281,7 +281,7 @@ class TestSystemdArgvNamespaceShape(RootRunProfileTestCase):
         self.assertIn("/usr/bin/unshare", argv)
         self.assertIn("-p", argv)
         self.assertIn(f"MemoryMax=1500M", argv)
-        self.assertIn("TasksMax=100", argv)
+        self.assertIn("TasksMax=1024", argv)
         self.assertIn("--", argv)
         self.assertEqual(argv[argv.index("--") + 1], "/usr/bin/unshare")
 

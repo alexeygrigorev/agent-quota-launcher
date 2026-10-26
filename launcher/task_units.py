@@ -2,7 +2,7 @@
 
 Spawns detached transient task service units outside the interactive head's
 cgroup (aplexer-workload-6be4c247-4410-4bdb-968e-7fc2d5844941.scope).
-Each task unit receives its own independent MemoryMax (<= 1500M) and TasksMax (100)
+Each task unit receives independent bounded MemoryMax and memory-derived TasksMax
 under app.slice, preventing parent-bound 100-PID exhaustion and allowing
 up to 50 concurrent headless workers across host memory.
 """
@@ -47,8 +47,10 @@ from launcher.task_profiles import (
     require_full_sha256,
 )
 
-MAX_MEMORY_MB = 1500
-TASKS_MAX = 100
+from launcher.task_resource_limits import MAX_TASK_MEMORY_MB, MIN_TASKS, tasks_max_for
+
+MAX_MEMORY_MB = MAX_TASK_MEMORY_MB
+TASKS_MAX = MIN_TASKS  # compatibility export: minimum, not the actual per-task limit
 MAX_DISK_LOG_BYTES = 64 * 1024  # 64 KiB bounded disk log
 CLEANUP_POLL_INTERVAL_SEC = 0.05
 CLEANUP_TIMEOUT_SEC = 5.0
@@ -420,7 +422,9 @@ def admit_task_unit(
     CPU admission is choking-only (t1511u): busy/predicted/unknown never
     refuse; only fresh PSI FULL CPU/memory, OOM, or trusted runtime hints.
     """
-    if int(memory_mb) > MAX_MEMORY_MB:
+    if type(memory_mb) is not int:
+        raise TaskUnitAdmissionError("worker memory must be a positive integer")
+    if memory_mb > MAX_MEMORY_MB:
         raise TaskUnitAdmissionError(
             f"worker memory {memory_mb}M exceeds maximum allowed ceiling of {MAX_MEMORY_MB}M"
         )
@@ -488,6 +492,7 @@ def admit_task_unit(
             repo_root=workspace,
             memory_floor_mb=memory_floor_mb if memory_floor_mb is not None else DEFAULT_MEMORY_FLOOR_MB,
             memory_estimate_mb=memory_estimate_mb,
+            memory_ceiling_mb=MAX_MEMORY_MB,
             cpu_load_factor=cpu_load_factor if cpu_load_factor is not None else RESOURCE_DEFAULTS["cpu_load_factor"],
             cpu_usage=cpu_usage,
             trusted_choking=trusted_choking,
@@ -707,7 +712,7 @@ def build_systemd_run_argv(
         argv.append("--wait")
     argv.extend([
         "-p", f"MemoryMax={int(memory_mb)}M",
-        "-p", f"TasksMax={TASKS_MAX}",
+        "-p", f"TasksMax={tasks_max_for(memory_mb)}",
         "-E", f"TMPDIR={tmpdir}",
         "-E", f"TEMP={tmpdir}",
         "-E", f"TMP={tmpdir}",
@@ -1399,7 +1404,7 @@ def execute_transient_task_unit(
         "finished_at": finished_at,
         "cleanup_verified": True,
         "memory_max_mb": memory_mb,
-        "tasks_max": TASKS_MAX,
+        "tasks_max": tasks_max_for(memory_mb),
         "stdout_log": str(stdout_log),
         "stderr_log": str(stderr_log),
         "telemetry_events_path": str(events_artifact) if events else None,
@@ -1727,7 +1732,7 @@ def spawn_transient_task_unit(
         "model_identity_source": "command-argv",
         "started_at": started_at,
         "memory_max_mb": memory_mb,
-        "tasks_max": TASKS_MAX,
+        "tasks_max": tasks_max_for(memory_mb),
         "stdout_log": str(stdout_log),
         "stderr_log": str(stderr_log),
     }

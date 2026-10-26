@@ -693,12 +693,12 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     record["provider"] = provider
     record["requested_model"] = chosen.get("model")
 
-    # Single policy: managed native Codex defaults to 4096MiB (midrun OOM
-    # at 1500MiB); every other provider stays 1500MiB. This is the cgroup
-    # MemoryMax safety cap. Host admission instead charges the placement
-    # estimate (payload memory_estimate_mb, else measured p90, else the
-    # ramp default) against the floor; see check_resources.
-    requested_mem_mb = native_memory_request_for(
+    # Hub headless sizing follows the offered estimate plus cold-start headroom.
+    # Other callers retain their native provider policy. The same effective
+    # memory is used for the saved allowance, admission and actual cgroup.
+    from launcher.task_resource_limits import hub_headless_memory_mb, MAX_TASK_MEMORY_MB, tasks_max_for
+    hub_memory = hub_headless_memory_mb(payload)
+    requested_mem_mb = hub_memory if hub_memory is not None else native_memory_request_for(
         provider=provider,
         is_managed=is_managed,
         explicit_mb=payload.get("memory_mb"),
@@ -720,7 +720,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         "aplexer", "start",
         "--json",
         "--memory", f"{requested_mem_mb}M",
-        "--pids", "100",
+        "--pids", str(tasks_max_for(requested_mem_mb)),
         # Startup handshake only (30s). This is NOT a runtime cap: the
         # payload timeout bounds Popen.communicate (aplexer start) plus
         # the first-action wait below, never the native worker lifetime.
@@ -792,6 +792,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         measured_p90 = store.memory_samples_p90(policy["estimate_percentile"])
         memory_estimate_mb = resolve_memory_estimate_mb(
             payload, measured_p90, policy, cap_mb=requested_mem_mb)
+        if hub_memory is not None:
+            memory_estimate_mb = max(memory_estimate_mb, requested_mem_mb)
+        record["tasks_max"] = tasks_max_for(requested_mem_mb)
         record["resource_policy"] = policy
         record["memory_estimate_mb"] = memory_estimate_mb
         record["measured_p90_mb"] = measured_p90
@@ -839,6 +842,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             check_resources(requested_mem_mb, workspace, tmpdir_resolved,
                             active_mem, active_disk, repo_root=workspace,
                             provider=provider, is_managed=is_managed,
+                            memory_ceiling_mb=MAX_TASK_MEMORY_MB if hub_memory is not None else None,
                             memory_floor_mb=policy["memory_floor_mb"],
                             memory_estimate_mb=memory_estimate_mb,
                             cpu_load_factor=policy["cpu_load_factor"],

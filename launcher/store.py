@@ -388,7 +388,10 @@ class Store:
                 explicit = payload.get('memory_mb')
                 if explicit is None and memory_mb != 1500:
                     explicit = memory_mb  # Preserve the existing caller override.
-                effective_mem = native_memory_request_for(provider, is_managed_profile_payload(payload), explicit)
+                from launcher.task_resource_limits import hub_headless_memory_mb
+                effective_mem = hub_headless_memory_mb(payload)
+                if effective_mem is None:
+                    effective_mem = native_memory_request_for(provider, is_managed_profile_payload(payload), explicit)
                 conn.execute("INSERT INTO task_resources (task_id, memory_mb, disk_mb) VALUES (?, ?, ?)", (task_id, effective_mem, disk_mb))
 
         return task_id
@@ -1009,6 +1012,10 @@ class Store:
                 payload = {}
             estimate = resolve_memory_estimate_mb(
                 payload, measured, mini_policy)
+            from launcher.task_resource_limits import is_hub_headless, HUB_MEMORY_FLOOR_MB
+            if is_hub_headless(payload) and (allowance or 0) >= HUB_MEMORY_FLOOR_MB:
+                # The saved allowance includes compile cold-start headroom.
+                estimate = max(estimate, allowance or 0)
             estimate = min(max(1, estimate), max(1, allowance)) if allowance else estimate
 
             if state == "queued":

@@ -369,8 +369,9 @@ def resolve_task_bounds(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         effective_memory = int(profile["memory_mb"])
 
-    # Enforce memory ceiling <= 1500MB
-    effective_memory = max(128, min(1500, effective_memory))
+    from launcher.task_resource_limits import hub_headless_memory_mb
+    hub_memory = hub_headless_memory_mb(payload)
+    effective_memory = hub_memory if hub_memory is not None else max(128, min(1500, effective_memory))
 
     return {
         "profile": profile_name,

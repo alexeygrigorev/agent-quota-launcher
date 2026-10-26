@@ -158,7 +158,7 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
                     cpu_usage=None, trusted_choking=None,
                     expected_cpu_cores=None, ramping_cpu_cores=0.0,
                     cpu_policy=None, _now_ms=None,
-                    _sample_cpu=False, _proc_root="/proc"):
+                    _sample_cpu=False, _proc_root="/proc", memory_ceiling_mb=None):
     """Live MemAvailable admission + choking-only CPU gate (USER t1511u V2).
 
     The worker cap (``requested_memory_mb`` validated against 1500/4096M)
@@ -189,7 +189,15 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
     """
     if requested_memory_mb is None:
         raise ValueError("invalid requested worker memory")
-    requested_value = native_memory_request_for(provider, is_managed, requested_memory_mb)
+    if memory_ceiling_mb is None:
+        requested_value = native_memory_request_for(provider, is_managed, requested_memory_mb)
+    else:
+        from launcher.task_resource_limits import MAX_TASK_MEMORY_MB
+        if type(memory_ceiling_mb) is not int or not 1 <= memory_ceiling_mb <= MAX_TASK_MEMORY_MB:
+            raise ValueError("invalid task memory ceiling")
+        if type(requested_memory_mb) is not int or not 1 <= requested_memory_mb <= memory_ceiling_mb:
+            raise ValueError("requested worker memory exceeds task ceiling")
+        requested_value = requested_memory_mb
 
     floor_mb = DEFAULT_MEMORY_FLOOR_MB if memory_floor_mb is None else memory_floor_mb
     try:
