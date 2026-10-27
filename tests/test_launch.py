@@ -666,6 +666,8 @@ class TestDoRunWaitLoop(unittest.TestCase):
         self.assertEqual(argv_zai[3], "acc-zai")
         self.assertIn("exec", argv_zai)
         self.assertIn("glm-5.3-flash", argv_zai)
+        self.assertNotIn("workspace-write", argv_zai)
+        self.assertLess(argv_zai.index("--dangerously-bypass-approvals-and-sandbox"), argv_zai.index("exec"))
 
         with patch("launcher.launch.get_codex_wrapper", return_value="/bin/launch-codex.sh"):
             argv_codex = build_managed_profile_argv("codex", "do work", "acc-codex", "gpt-6.1-sol")

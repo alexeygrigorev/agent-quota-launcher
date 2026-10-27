@@ -244,7 +244,10 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
         return cmd + args
     elif provider in ("zai", "zcodex"):
         m = model or "glm-5.3-flash"
-        return cmd + ["exec", "--model", str(m), "-s", "workspace-write", "-c", "check_for_update_on_startup=false", "--json", str(goal)]
+        # Same contract as the unmanaged zai adapter: zcodex's bubblewrap
+        # sandbox refuses hosts whose /tmp is a bind mount (its app-server
+        # socket dir is fixed at /tmp/codex-daemon-<uid>), failing every tool.
+        return cmd + ["--dangerously-bypass-approvals-and-sandbox", "exec", "--model", str(m), "--disable", "shell_snapshot", "-c", "check_for_update_on_startup=false", "--json", str(goal)]
     elif provider in ("go", "opencode"):
         m = model or "opencode-go/muse-spark-1.3-contributor"
         return cmd + ["run", "--standalone", "--auto", "--model", str(m), str(goal)]
