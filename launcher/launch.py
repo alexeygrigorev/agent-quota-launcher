@@ -9,10 +9,13 @@ launch lifecycle. Provider argv sets are exactly:
                --output-format text <goal>   (OAuth route; ambient API keys stripped)
 - zai:         /usr/bin/env ZCODE_NODE=/home/alexey/.nvm/versions/node/v24.13.1/bin/node
                ZCODE_CJS=/opt/ZCode/resources/glm/zcode.cjs
-               /home/alexey/.local/bin/zcodex exec --model glm-5.3-flash
-               -s workspace-write -c
+               ZCODE_WARM=1 ZCODE_WARM_MODE=yolo
+               /home/alexey/.local/bin/zcodex --dangerously-bypass-approvals-and-sandbox
+               exec --model glm-5.3-flash --disable shell_snapshot -c
                check_for_update_on_startup=false --json <goal>
-               with ZCODE_NODE and ZCODE_CJS runtime pins propagated via argv and env
+               (installed warm bridge; ZCODE_NODE and ZCODE_CJS runtime pins plus
+               ZCODE_WARM/ZCODE_WARM_MODE propagated via argv and env; cold
+               -s workspace-write never appears here)
 - opencode:    /home/alexey/.nvm/versions/node/v24.13.1/bin/opencode run
                --standalone --auto --model opencode-go/muse-spark-1.3-contributor
                <goal>  (installed 2.0.32; quse key go maps here; prompt is a
@@ -141,10 +144,13 @@ ADAPTERS = {
     },
     "zai": {
         "argv": ["/usr/bin/env", f"ZCODE_NODE={ZCODE_NODE}", f"ZCODE_CJS={ZCODE_CJS}",
-                 ZCODEX_BIN, "exec", "--model", "glm-5.3-flash",
-                 "-s", "workspace-write",
+                 "ZCODE_WARM=1", "ZCODE_WARM_MODE=yolo",
+                 ZCODEX_BIN, "--dangerously-bypass-approvals-and-sandbox",
+                 "exec", "--model", "glm-5.3-flash",
+                 "--disable", "shell_snapshot",
                  "-c", "check_for_update_on_startup=false", "--json"],
-        "env": {"ZCODE_CJS": ZCODE_CJS, "ZCODE_NODE": ZCODE_NODE},
+        "env": {"ZCODE_CJS": ZCODE_CJS, "ZCODE_NODE": ZCODE_NODE,
+                "ZCODE_WARM": "1", "ZCODE_WARM_MODE": "yolo"},
     },
     "opencode": {
         "argv": [OPENCODE_BIN, "run", "--standalone", "--auto", "--model",
@@ -299,6 +305,8 @@ def build_adapter_argv(provider, goal, model=None):
             "/usr/bin/env",
             f"ZCODE_NODE={node}",
             f"ZCODE_CJS={cjs}",
+            "ZCODE_WARM=1",
+            "ZCODE_WARM_MODE=yolo",
             zbin,
         ]
         base_argv = list(adapter["argv"])
@@ -309,8 +317,9 @@ def build_adapter_argv(provider, goal, model=None):
             idx = base_argv.index(ZCODEX_BIN) + 1
             argv.extend(base_argv[idx:])
         else:
-            argv.extend(["exec", "--model", "glm-5.3-flash",
-                         "-s", "workspace-write",
+            argv.extend(["--dangerously-bypass-approvals-and-sandbox",
+                         "exec", "--model", "glm-5.3-flash",
+                         "--disable", "shell_snapshot",
                          "-c", "check_for_update_on_startup=false", "--json"])
     else:
         argv = list(adapter["argv"])
@@ -742,6 +751,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         node, cjs, _ = validate_zai_runtime()
         child_env["ZCODE_NODE"] = node
         child_env["ZCODE_CJS"] = cjs
+        # Installed warm bridge: inner YOLO loop owns tool execution exactly
+        # once; the outer harness must not re-execute emitted Bash calls.
+        child_env["ZCODE_WARM"] = "1"
+        child_env["ZCODE_WARM_MODE"] = "yolo"
     child_env["TMPDIR"] = tmpdir_resolved
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])

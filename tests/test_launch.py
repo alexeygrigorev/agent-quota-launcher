@@ -265,16 +265,23 @@ class TestAdapters(unittest.TestCase):
         self.assertEqual(argv[0], "/usr/bin/env")
         self.assertIn(f"ZCODE_NODE={ZCODE_NODE}", argv)
         self.assertIn(f"ZCODE_CJS={ZCODE_CJS}", argv)
+        self.assertIn("ZCODE_WARM=1", argv)
+        self.assertIn("ZCODE_WARM_MODE=yolo", argv)
         z_idx = argv.index(ZCODEX_BIN)
-        self.assertEqual(argv[z_idx + 1:z_idx + 4], ["exec", "--model", "glm-5.3-flash"])
-        self.assertIn("-s", argv)
-        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
-        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertEqual(argv[z_idx + 1:z_idx + 4],
+                         ["--dangerously-bypass-approvals-and-sandbox", "exec", "--model"])
+        self.assertEqual(argv[z_idx + 4], "glm-5.3-flash")
+        self.assertIn("--disable", argv)
+        self.assertEqual(argv[argv.index("--disable") + 1], "shell_snapshot")
+        self.assertNotIn("-s", argv)
+        self.assertNotIn("workspace-write", argv)
         self.assertIn("--json", argv)
         self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_CJS"),
                          ZCODE_CJS)
         self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_NODE"),
                          ZCODE_NODE)
+        self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_WARM"), "1")
+        self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_WARM_MODE"), "yolo")
         self.assertEqual(argv[-1], "goal")
 
     def test_zai_adapter_argv_exact_propagation(self):
@@ -283,12 +290,15 @@ class TestAdapters(unittest.TestCase):
             "/usr/bin/env",
             f"ZCODE_NODE={ZCODE_NODE}",
             f"ZCODE_CJS={ZCODE_CJS}",
+            "ZCODE_WARM=1",
+            "ZCODE_WARM_MODE=yolo",
             ZCODEX_BIN,
+            "--dangerously-bypass-approvals-and-sandbox",
             "exec",
             "--model",
             "glm-5.3-flash",
-            "-s",
-            "workspace-write",
+            "--disable",
+            "shell_snapshot",
             "-c",
             "check_for_update_on_startup=false",
             "--json",
@@ -300,11 +310,18 @@ class TestAdapters(unittest.TestCase):
         argv = build_adapter_argv("zai", "goal", model="custom-zai-model")
         self.assertEqual(argv[argv.index("--model") + 1], "custom-zai-model")
 
-    def test_zai_sandbox_workspace_write_enforced(self):
+    def test_zai_warm_bridge_enforced_no_cold_sandbox(self):
+        # Installed warm bridge owns tool execution exactly once; the cold
+        # -s workspace-write bridge (No permission client) must never appear
+        # here, and inner YOLO must not be enabled on a cold bridge.
         argv = build_adapter_argv("zai", "goal")
-        self.assertIn("-s", argv)
-        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
-        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("-s", argv)
+        self.assertNotIn("workspace-write", argv)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("ZCODE_WARM=1", argv)
+        self.assertIn("ZCODE_WARM_MODE=yolo", argv)
+        self.assertIn("--disable", argv)
+        self.assertEqual(argv[argv.index("--disable") + 1], "shell_snapshot")
 
     def test_zai_no_ask_for_approval_in_exec(self):
         argv = build_adapter_argv("zai", "goal")
