@@ -300,7 +300,11 @@ def probe_native_lifecycle(
         return "unknown", f"aplexer status error: {e}"
 
     if res is not None:
-        out_err = (res.stderr or "") + " " + (res.stdout or "")
+        # Successful stdout is structured status data, including arbitrary
+        # command prose. Only failed commands may report errors on stdout.
+        out_err = res.stderr or ""
+        if res.returncode != 0:
+            out_err += " " + (res.stdout or "")
         out_err_lower = out_err.lower()
         if "stale" in out_err_lower and "socket" in out_err_lower:
             return "unknown", "aplexer status stale socket"
