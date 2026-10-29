@@ -259,6 +259,23 @@ def extract_requested_model(payload, provider=None):
     return None
 
 
+def _hub_host_module(name):
+    """Import a native quota probe from the trusted Agent Hub host path.
+
+    The launcher process carries only its own release on PYTHONPATH; the host
+    package lives at AGENT_HUB_HOST_PATH, resolved exactly as for managed
+    execution. Without this the import failed, the probe reported no quota
+    source, and every managed Claude route was rejected (Hub intake 798f0f8c).
+    """
+    import importlib
+    import sys
+    from launcher.launch import resolve_hub_path
+    hub_path = resolve_hub_path()
+    if hub_path and hub_path not in sys.path:
+        sys.path.insert(0, hub_path)
+    return importlib.import_module("agent_hub_host." + name)
+
+
 def fetch_managed_quse(account_label, provider=None, requested_model=None, config_dir=None, managed_dir=None):
     """Fetch fresh quota context for a named centrally managed account."""
     if managed_dir:
@@ -310,14 +327,14 @@ def fetch_managed_quse(account_label, provider=None, requested_model=None, confi
 
     if prov == "gemini":
         try:
-            from agent_hub_host import native_google_quota
+            native_google_quota = _hub_host_module("native_google_quota")
             return native_google_quota.probe(bundle, dest, model=requested_model)
         except Exception:
             return {"gemini": {"status": "held", "reason": "native_google_probe_failed", "windows": {}}}
 
     if prov == "claude":
         try:
-            from agent_hub_host import native_claude_quota
+            native_claude_quota = _hub_host_module("native_claude_quota")
             return native_claude_quota.probe(bundle, dest, requested_model=requested_model)
         except Exception:
             return {"claude": {"status": "held", "reason": "native_claude_probe_failed", "windows": {}}}

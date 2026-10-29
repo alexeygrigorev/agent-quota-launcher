@@ -1015,3 +1015,37 @@ class TestManagedProfileQualification(unittest.TestCase):
 
 
 
+
+
+class HubHostPathProbeTests(unittest.TestCase):
+    """Hub intake 798f0f8c: the native probe is importable only via AGENT_HUB_HOST_PATH."""
+
+    def test_managed_claude_probe_imports_from_trusted_host_path(self):
+        import json, os, sys, tempfile
+        from pathlib import Path
+        from launcher.admission import fetch_managed_quse
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            pkg = tmp_p / "host" / "agent_hub_host"
+            pkg.mkdir(parents=True)
+            (pkg / "__init__.py").write_text("")
+            (pkg / "native_claude_quota.py").write_text(
+                "def probe(bundle, dest, requested_model=None):\n"
+                "    return {'claude': {'status': 'ok', 'details': {'source': 'native_claude_oauth_usage', 'model': requested_model}, 'windows': {}}}\n")
+            managed = tmp_p / "managed"
+            (managed / "c-rev1").mkdir(parents=True)
+            (managed / "state.json").write_text(json.dumps([{"label": "c", "revision": "rev1", "provider": "claude"}]))
+            (managed / "c-rev1" / "bundle.json").write_text(json.dumps({"provider": "claude"}))
+            saved_path = list(sys.path)
+            saved_mods = {k: sys.modules.pop(k) for k in list(sys.modules) if k == "agent_hub_host" or k.startswith("agent_hub_host.")}
+            try:
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(tmp_p / "host")}):
+                    res = fetch_managed_quse("c", provider="claude", requested_model="opus", managed_dir=managed)
+            finally:
+                sys.path[:] = saved_path
+                for k in [k for k in sys.modules if k == "agent_hub_host" or k.startswith("agent_hub_host.")]:
+                    sys.modules.pop(k)
+                sys.modules.update(saved_mods)
+            self.assertEqual(res["claude"]["status"], "ok")
+            self.assertEqual(res["claude"]["details"]["source"], "native_claude_oauth_usage")
+            self.assertEqual(res["claude"]["details"]["model"], "opus")
