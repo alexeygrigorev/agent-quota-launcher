@@ -481,10 +481,18 @@ class StoreRampTests(unittest.TestCase):
         young = self.store.resource_breakdown(ramp_seconds=3600)
         self.assertEqual(young[0]["basis"], "start-ramp")
         self.assertEqual(young[0]["reserve_mb"], 512)
+        with patch.object(Store, "_task_age_seconds", return_value=300):
+            slow = self.store.resource_breakdown(ramp_seconds=60)
+            self.assertEqual(slow[0]["basis"], "start-ramp")
+            self.assertEqual(slow[0]["reserve_mb"], 512)
         with patch.object(Store, "_task_age_seconds", return_value=9999):
             old = self.store.resource_breakdown(ramp_seconds=60)
-            self.assertEqual(old[0]["basis"], "full-unknown")
-            self.assertEqual(old[0]["reserve_mb"], 1500)
+            self.assertEqual(old[0]["basis"], "stale-start")
+            self.assertEqual(old[0]["reserve_mb"], 0)
+        with patch.object(Store, "_task_age_seconds", return_value=None):
+            unknown = self.store.resource_breakdown(ramp_seconds=60)
+            self.assertEqual(unknown[0]["basis"], "full-unknown")
+            self.assertEqual(unknown[0]["reserve_mb"], 1500)
 
     def test_dead_tasks_settle_without_stopping_live_ones(self):
         self.submit("t1")
@@ -612,8 +620,81 @@ class ResidentSettleTests(unittest.TestCase):
                     p1,p2,p3=self.live(0,age)
                     with p1,p2,p3:
                         row=self.store.resource_breakdown()[0]
-                    self.assertEqual(row["basis"], "start-ramp" if age==10 else "full-unknown")
-                    self.assertEqual(row["reserve_mb"], 512 if age==10 else 1500)
+                    # Intake 63a9ee3a: a live worker past its ramp is already
+                    # in host available memory even without a cgroup credit.
+                    expected = {10: ("start-ramp", 512), 180: ("resident-settled", 0),
+                                9999: ("resident-settled", 0), None: ("full-unknown", 1500)}[age]
+                    self.assertEqual((row["basis"], row["reserve_mb"]), expected)
+
+    def test_unproven_alive_workers_keep_full_reservation(self):
+        self.submit_running()
+        for status in ("unknown", "exiting"):
+            with self.subTest(status=status), \
+                    patch("launcher.store.probe_native_lifecycle", return_value=(status, {})), \
+                    patch.object(Store, "_task_age_seconds", return_value=9999):
+                row = self.store.resource_breakdown()[0]
+                self.assertEqual((row["basis"], row["reserve_mb"]), ("full-unknown", 1500))
+
+
+class LeakedReservationShapeTests(unittest.TestCase):
+    """Intake 63a9ee3a: Tabo held 3 sessions with 4.7 GB free.
+
+    Hours-old unbound starting/launch-uncertain rows and live Windows workers
+    without a cgroup credit each held their full allowance, so 5 GiB of real
+    headroom admitted nothing. Fails on the pre-fix accounting.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        patcher = patch.dict(os.environ,
+                             {"LAUNCHER_HOST_FENCING_DIR": str(self.root / "fencing")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = Store(str(self.root / "state.db"))
+
+    def submit(self, task_id, state, bound):
+        self.store.submit_task(task_id, f"key-{task_id}",
+                               {"goal": "g", "owner": "o",
+                                "cwd": str(self.root), "timeout": 60}, [])
+        if bound:
+            self.store.record_native_binding(
+                task_id, native_id=f"11111111-2222-4333-8444-{task_id:0>12}",
+                tag=f"task-{task_id}", workspace=str(self.root), engine="codex",
+                incarnation=1000)
+        self.store.transition_task(task_id, state, ("queued",))
+
+    def test_stale_starts_and_settled_live_workers_release_headroom(self):
+        self.submit("1", "starting", bound=False)
+        self.submit("2", "launch-uncertain", bound=False)
+        self.submit("3", "stalled", bound=False)
+        self.submit("4", "running", bound=True)
+        self.submit("5", "running", bound=True)
+        with patch("launcher.store.probe_native_lifecycle", return_value=("alive", {})), \
+                patch("launcher.store.resident_credit_mb", return_value=0), \
+                patch.object(Store, "_task_age_seconds", return_value=4 * 3600):
+            mem, _ = self.store.get_active_resources()
+        self.assertEqual(mem, 0)
+        # 4.7 GB free admits a 1500 MiB start over the 2048 MiB floor.
+        with patch("launcher.resources.get_mem_available", return_value=4700 * 1024 * 1024):
+            self.assertTrue(self.check(active_mem_mb=mem))
+
+    def check(self, **kw):
+        owned = self.root / ".local" / "tmp" / "r1"
+        owned.mkdir(parents=True, exist_ok=True)
+        with patch("shutil.disk_usage", return_value=DiskUsage(100 * GiB)):
+            return check_resources(1500, str(self.root), str(owned), repo_root=str(self.root),
+                                   check_cpu=False, **kw)
+
+    def test_refusal_reports_available_reserved_required_floor(self):
+        with patch("launcher.resources.get_mem_available", return_value=4700 * 1024 * 1024):
+            with self.assertRaises(ValueError) as cm:
+                self.check(active_mem_mb=2925)
+        self.assertEqual(str(cm.exception),
+                         "host MemAvailable below 2048MiB floor after reservation "
+                         "(launcher_memory_reserve): available_mb=4700 reserved_mb=2925 "
+                         "required_mb=1500 floor_mb=2048")
 
 
 class ResourceStatusTests(unittest.TestCase):

@@ -231,9 +231,12 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
         req_mem = estimate_mb * 1024 * 1024
         act_mem = active_mem_mb * 1024 * 1024
         if mem_avail - act_mem - req_mem < floor_bytes:
+            mib = 1024 * 1024
             raise ValueError(
                 f"host MemAvailable below {floor_mb}MiB floor after reservation "
-                f"(launcher_memory_reserve)")
+                f"(launcher_memory_reserve): available_mb={mem_avail // mib} "
+                f"reserved_mb={active_mem_mb} required_mb={estimate_mb} "
+                f"floor_mb={floor_mb}")
 
     if check_cpu:
         policy_cpu = dict(cpu_policy or {})

@@ -112,6 +112,10 @@ CREATE TABLE IF NOT EXISTS review_receipts (
 
 # States that hold RAM/disk reservations: live or possibly-live launches.
 RESOURCE_HOLDING_STATES = ("queued", "starting", "launch-uncertain", "stalled", "running")
+# Intake 63a9ee3a: a start that never produced a native binding within this
+# window has no process to hold memory for (a spawned session records its
+# binding at spawn). Matches the Hub's in-flight reservation window.
+STALE_START_SECONDS = 600
 # States that hold path/evidence leases (through completed-awaiting-review).
 LEASED_STATES = ("queued", "starting", "launch-uncertain", "stalled",
                  "running", "completed-awaiting-review")
@@ -1061,23 +1065,28 @@ class Store:
                     continue
                 else:
                     # MemAvailable already excludes verified resident anonymous
-                    # memory. Stable measured residents (past the ramp window)
-                    # hold no additional reserve; young ones hold the estimate
-                    # minus proven current usage, mirroring the Hub headroom
-                    # credit. Unknown holds the full allowance (fail closed).
+                    # memory. Live residents past the ramp window hold no
+                    # additional reserve; young ones hold the estimate minus
+                    # proven current usage, mirroring the Hub headroom credit.
+                    # Unproven-alive holds the full allowance (fail closed).
                     credit = resident_credit_mb(binding, live_info, allowance) if status == "alive" else 0
                     age = self._task_age_seconds(task_id, binding)
-                    if status == "alive" and credit > 0 and age is not None:
+                    if status == "alive" and age is not None and age >= ramp_seconds:
+                        # Intake 63a9ee3a: a proven-live worker past its ramp
+                        # is already inside host available memory, measured
+                        # or not (Windows/macOS have no cgroup credit).
+                        # Charging its allowance again double-counted it.
+                        if credit > 0:
+                            self._record_resident_sample(task_id, binding, credit, dry_run)
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": 0, "disk_mb": disk or 0,
+                                         "basis": "resident-settled"})
+                    elif status == "alive" and credit > 0 and age is not None:
                         self._record_resident_sample(task_id, binding, credit, dry_run)
-                        if age >= ramp_seconds:
-                            rows_out.append({"task_id": task_id, "state": state,
-                                             "reserve_mb": 0, "disk_mb": disk or 0,
-                                             "basis": "resident-settled"})
-                        else:
-                            rows_out.append({"task_id": task_id, "state": state,
-                                             "reserve_mb": max(0, estimate - credit),
-                                             "disk_mb": disk or 0,
-                                             "basis": "start-ramp"})
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": max(0, estimate - credit),
+                                         "disk_mb": disk or 0,
+                                         "basis": "start-ramp"})
                     elif status == "alive" and age is not None and age < ramp_seconds and state in (
                             "starting", "launch-uncertain", "stalled", "running"):
                         # Inflight start (or young running worker) before
@@ -1095,12 +1104,24 @@ class Store:
             else:
                 # No binding even after recovery: starting states are proven
                 # inflight starts by lifecycle state alone, so young ones hold
-                # the ramp estimate. Stale or clock-unknown starts hold the
-                # full allowance (fail closed). Running/legacy rows without
+                # the ramp estimate; starts unbound past STALE_START_SECONDS
+                # release it. Clock-unknown starts hold the full allowance
+                # (fail closed). Running/legacy rows without
                 # proof stay conservative under actual ownership proof.
                 if state in ("starting", "launch-uncertain", "stalled"):
                     age = self._task_age_seconds(task_id, None)
                     if age is not None and age < ramp_seconds:
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": estimate, "disk_mb": disk or 0,
+                                         "basis": "start-ramp"})
+                    elif age is not None and age >= max(ramp_seconds, STALE_START_SECONDS):
+                        # Intake 63a9ee3a: hours-old unbound starts held the
+                        # full allowance forever and refused every launch.
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": 0, "disk_mb": disk or 0,
+                                         "basis": "stale-start"})
+                    elif age is not None:
+                        # Slow spawn under load: hold the measured estimate.
                         rows_out.append({"task_id": task_id, "state": state,
                                          "reserve_mb": estimate, "disk_mb": disk or 0,
                                          "basis": "start-ramp"})
