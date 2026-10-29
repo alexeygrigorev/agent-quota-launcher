@@ -793,7 +793,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         memory_estimate_mb = resolve_memory_estimate_mb(
             payload, measured_p90, policy, cap_mb=requested_mem_mb)
         if hub_memory is not None:
-            memory_estimate_mb = max(memory_estimate_mb, requested_mem_mb)
+            from launcher.task_resource_limits import hub_headless_admission_mb
+            memory_estimate_mb = min(requested_mem_mb,
+                                     hub_headless_admission_mb(payload, memory_estimate_mb))
         record["tasks_max"] = tasks_max_for(requested_mem_mb)
         record["resource_policy"] = policy
         record["memory_estimate_mb"] = memory_estimate_mb

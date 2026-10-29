@@ -42,3 +42,18 @@ def hub_headless_memory_mb(payload):
                 raise ValueError(f"{key} outside bounded range [1, 32768] MiB")
             values.append(value)
     return max(values)
+
+
+def hub_headless_admission_mb(payload, estimate_mb):
+    """Memory charged against host headroom for a starting Hub task.
+
+    Intake 63a9ee3a: the 4096 MiB cold-start floor is the cgroup cap, not a
+    reservation; charging it refused Tabo starts with 4.7 GB free. Admission
+    uses the measured estimate. Cargo workspaces keep their compile floor.
+    """
+    if not is_hub_headless(payload):
+        return estimate_mb
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and (Path(cwd) / "Cargo.toml").is_file():
+        return max(estimate_mb, CARGO_MEMORY_FLOOR_MB)
+    return estimate_mb

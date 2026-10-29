@@ -1016,10 +1016,10 @@ class Store:
                 payload = {}
             estimate = resolve_memory_estimate_mb(
                 payload, measured, mini_policy)
-            from launcher.task_resource_limits import is_hub_headless, HUB_MEMORY_FLOOR_MB
-            if is_hub_headless(payload) and (allowance or 0) >= HUB_MEMORY_FLOOR_MB:
-                # The saved allowance includes compile cold-start headroom.
-                estimate = max(estimate, allowance or 0)
+            from launcher.task_resource_limits import hub_headless_admission_mb
+            # The saved allowance is the cgroup cap; only Cargo builds charge
+            # their compile floor while starting (intake 63a9ee3a).
+            estimate = hub_headless_admission_mb(payload, estimate)
             estimate = min(max(1, estimate), max(1, allowance)) if allowance else estimate
 
             if state == "queued":

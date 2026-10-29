@@ -70,6 +70,25 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(context["expected_cpu_cores"], 2)
         self.assertEqual(check.call_args.kwargs["memory_ceiling_mb"], MAX_TASK_MEMORY_MB)
 
+    def test_non_compile_admission_charges_measured_estimate_not_cap(self):
+        # Intake 63a9ee3a: the 4096 MiB cold-start cap is not a reservation.
+        store = Store(str(self.cwd / "state.db"))
+        store.submit_task("t", "t", self.payload, [])
+        with store.get_conn() as conn:
+            memory = conn.execute("SELECT memory_mb FROM task_resources").fetchone()[0]
+        self.assertEqual(memory, 4096)
+        fake = MagicMock()
+        fake.freeze_cpu_start.return_value = dict(expected_cpu_cores=1, expected_cpu_source="repo_kind")
+        fake.get_active_resources.return_value = (0, 0)
+        args = argparse.Namespace(id="t", cwd=str(self.cwd), tmpdir=None)
+        with patch("launcher.cpu_resources.collect_admission_context", return_value=(None, None)), \
+             patch("launcher.resources.check_resources"):
+            context = task_unit_resource_context(fake, args, self.payload, memory)
+        self.assertEqual(context["memory_estimate_mb"], 512)
+        store.transition_task("t", "starting", ("queued",))
+        row = store.resource_breakdown()[0]
+        self.assertEqual((row["basis"], row["reserve_mb"]), ("start-ramp", 512))
+
     def test_compile_memory_is_charged_before_start(self):
         tmp = self.cwd / ".local" / "tmp"
         tmp.mkdir(parents=True)

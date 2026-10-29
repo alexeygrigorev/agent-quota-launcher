@@ -287,7 +287,8 @@ def task_unit_resource_context(store, args, payload, memory_mb):
     from launcher.task_resource_limits import hub_headless_memory_mb, MAX_TASK_MEMORY_MB
     cap = {}
     if hub_headless_memory_mb(payload) is not None:
-        context["memory_estimate_mb"] = max(estimate, memory_mb)
+        from launcher.task_resource_limits import hub_headless_admission_mb
+        context["memory_estimate_mb"] = min(memory_mb, hub_headless_admission_mb(payload, estimate))
         cap["memory_ceiling_mb"] = MAX_TASK_MEMORY_MB
     check_resources(memory_mb, args.cwd, tmpdir, repo_root=args.cwd, **cap, **context)
     return context
