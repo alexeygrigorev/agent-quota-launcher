@@ -820,6 +820,10 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
 
     record = {
         "task_id": task_id,
+        # Release directory that actually ran (launcher-releases/<commit>).
+        # Intake a10c41b5 r3: probe 2435ad14 was attributed to fc8e8f24 but
+        # its sizing proves dfb33ee ran; record the executing root.
+        "launcher_root": str(Path(__file__).resolve().parent.parent),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "started_at_ts": time.time(),
         "timeout_seconds": timeout_seconds,

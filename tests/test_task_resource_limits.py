@@ -183,6 +183,31 @@ class HubNativeTests(TestDoRunNativeMemoryArgv):
                 self.assertEqual(record["requested_memory_mb"], 1500)
                 self.assertEqual(record["memory_estimate_mb"], 1500)
 
+    def test_live_probe_2435ad14_payload_dispatches_at_1500(self):
+        # Intake a10c41b5 r3: exact stored payload of live launch 2435ad14
+        # (hub start-agent, shared-zai, unmanaged zcodex route, no
+        # account_profile). It ran at 1788870656 bytes under dfb33ee; through
+        # this release's real submit + do_run path every hop must be 1500.
+        payload = dict(
+            owner="hub-fleet", profile="model-task", memory_mb=1500,
+            memory_estimate_mb=1706, expected_cpu_cores=0.625,
+            expected_cpu_source="repo_kind",
+            model_requirements={"models": ["glm-5.3-flash"], "providers": ["zai"]})
+        with patch("launcher.launch.validate_zai_runtime",
+                   return_value=("/usr/bin/node", "/opt/zcode.cjs", None)):
+            cmd = self._run_with_provider("zai", False, payload)
+        self.assertEqual(cmd[cmd.index("--memory") + 1], "1500M")
+        self.assertEqual(cmd[cmd.index("--pids") + 1], "1024")
+        self.assertNotIn("--profile", cmd)
+        with self.store.get_conn() as conn:
+            reserved = conn.execute("SELECT memory_mb FROM task_resources WHERE task_id=?",
+                                    ("t-zai-u",)).fetchone()[0]
+        self.assertEqual(reserved, 1500)
+        record = json.loads((Path(self.dir) / ".local" / "launch-t-zai-u.json").read_text())
+        self.assertEqual(record["requested_memory_mb"], 1500)
+        self.assertEqual(record["memory_estimate_mb"], 1500)
+        self.assertEqual(record["launcher_root"], str(Path(__file__).resolve().parents[1]))
+
     def test_native_hub_measured_estimate_is_not_clamped_to_1500(self):
         cmd = self._run_with_provider("codex", True,
             dict(owner="hub-fleet", profile="model-task", memory_estimate_mb=12288))
