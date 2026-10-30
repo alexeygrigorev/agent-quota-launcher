@@ -18,6 +18,7 @@ from launcher.resources import (
     DEFAULT_NATIVE_MEMORY_MB,
     CODEX_MANAGED_NATIVE_MEMORY_MB,
 )
+from tests.pinned_runtime import pinned_runtime_present
 
 GiB = 1024 * 1024 * 1024
 LOCAL_TMP_DIR = Path(__file__).resolve().parent.parent / ".local" / "tmp"
@@ -305,6 +306,7 @@ class TestDoRunNativeMemoryArgv(unittest.TestCase):
         self.assertNotIn("--timeout", cmd)
         self.assertNotIn("--runtime-timeout-ms", cmd)
 
+    @pinned_runtime_present()
     def test_other_provider_argv_stays_1500(self):
         cmd = self._run_with_provider("opencode", False)
         self.assertEqual(cmd[cmd.index("--memory") + 1], "1500M")

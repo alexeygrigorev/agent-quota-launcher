@@ -14,6 +14,7 @@ from launcher.store import Store
 from launcher.cli import task_unit_resource_context
 from launcher.resources import check_resources
 from tests.test_native_memory_policy import TestDoRunNativeMemoryArgv
+from tests.pinned_runtime import pinned_runtime_present
 
 
 class LimitsTests(unittest.TestCase):
@@ -101,6 +102,7 @@ class LimitsTests(unittest.TestCase):
 
 
 class HubNativeTests(TestDoRunNativeMemoryArgv):
+    @pinned_runtime_present()
     def test_native_hub_compile_receives_same_limits(self):
         (Path(self.dir) / "Cargo.toml").touch()
         cmd = self._run_with_provider("opencode", False,

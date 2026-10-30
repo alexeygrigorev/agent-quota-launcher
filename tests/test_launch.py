@@ -13,6 +13,7 @@ from launcher.launch import (validate_first_action, build_adapter_argv,
                              validate_zai_runtime, ZaiRuntimeError,
                              ZaiRuntimeMissingError, ZaiRuntimeUnexecutableError)
 from launcher.store import Store
+from tests.pinned_runtime import pinned_runtime_present, requires_host_runtime
 
 PAYLOAD = {"goal": "write report", "owner": "head-x", "cwd": ".",
            "timeout": 600,
@@ -260,6 +261,7 @@ class TestAdapters(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Claude provider requires managed profile"):
             build_adapter_argv("claude", "goal text")
 
+    @pinned_runtime_present()
     def test_zai_uses_exact_zcodex_invocation(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/usr/bin/env")
@@ -284,6 +286,7 @@ class TestAdapters(unittest.TestCase):
         self.assertEqual(ADAPTERS["zai"]["env"].get("ZCODE_WARM_MODE"), "yolo")
         self.assertEqual(argv[-1], "goal")
 
+    @pinned_runtime_present()
     def test_zai_adapter_argv_exact_propagation(self):
         argv = build_adapter_argv("zai", "task payload")
         expected = [
@@ -306,10 +309,12 @@ class TestAdapters(unittest.TestCase):
         ]
         self.assertEqual(argv, expected)
 
+    @pinned_runtime_present()
     def test_zai_supports_model_override(self):
         argv = build_adapter_argv("zai", "goal", model="custom-zai-model")
         self.assertEqual(argv[argv.index("--model") + 1], "custom-zai-model")
 
+    @pinned_runtime_present()
     def test_zai_warm_bridge_enforced_no_cold_sandbox(self):
         # Installed warm bridge owns tool execution exactly once; the cold
         # -s workspace-write bridge (No permission client) must never appear
@@ -323,6 +328,7 @@ class TestAdapters(unittest.TestCase):
         self.assertIn("--disable", argv)
         self.assertEqual(argv[argv.index("--disable") + 1], "shell_snapshot")
 
+    @pinned_runtime_present()
     def test_zai_no_ask_for_approval_in_exec(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertNotIn("-a", argv)
@@ -348,6 +354,7 @@ class TestAdapters(unittest.TestCase):
                 self.assertTrue(isinstance(ctx.exception, RuntimeError))
                 self.assertTrue(isinstance(ctx.exception, PermissionError))
 
+    @pinned_runtime_present()
     def test_zai_runtime_missing_cjs_fails_closed(self):
         with patch("launcher.launch.ZCODE_CJS", "/tmp/nonexistent-zcode.cjs"):
             with self.assertRaises(ZaiRuntimeError) as ctx:
@@ -356,6 +363,7 @@ class TestAdapters(unittest.TestCase):
             self.assertTrue(isinstance(ctx.exception, RuntimeError))
             self.assertTrue(isinstance(ctx.exception, FileNotFoundError))
 
+    @pinned_runtime_present()
     def test_zai_runtime_unreadable_cjs_fails_closed(self):
         real_access = os.access
 
@@ -373,6 +381,7 @@ class TestAdapters(unittest.TestCase):
             self.assertIn("not readable", str(ctx.exception).lower())
             self.assertTrue(isinstance(ctx.exception, RuntimeError))
 
+    @pinned_runtime_present()
     def test_zai_runtime_missing_zcodex_bin_fails_closed(self):
         with patch("launcher.launch.ZCODEX_BIN", "/tmp/nonexistent-zcodex"):
             with self.assertRaises(ZaiRuntimeError) as ctx:
@@ -381,6 +390,7 @@ class TestAdapters(unittest.TestCase):
             self.assertTrue(isinstance(ctx.exception, RuntimeError))
             self.assertTrue(isinstance(ctx.exception, FileNotFoundError))
 
+    @pinned_runtime_present()
     def test_zai_runtime_unexecutable_zcodex_bin_fails_closed(self):
         with tempfile.NamedTemporaryFile(mode="w") as f:
             f.write("#!/bin/sh\n")
@@ -393,6 +403,7 @@ class TestAdapters(unittest.TestCase):
                 self.assertTrue(isinstance(ctx.exception, RuntimeError))
                 self.assertTrue(isinstance(ctx.exception, PermissionError))
 
+    @requires_host_runtime(ZCODE_NODE, ZCODE_CJS, ZCODEX_BIN)
     def test_validate_zai_runtime_direct(self):
         node, cjs, zbin = validate_zai_runtime()
         self.assertEqual(node, ZCODE_NODE)

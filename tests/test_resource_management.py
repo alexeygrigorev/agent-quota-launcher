@@ -27,6 +27,7 @@ from launcher.resource_policy import (
 )
 from launcher.resources import check_resources
 from launcher.store import Store
+from tests.pinned_runtime import pinned_runtime_present
 
 GiB = 1024 * 1024 * 1024
 MiB = 1024 * 1024
@@ -813,6 +814,7 @@ class LaunchWiringTests(unittest.TestCase):
         self.lock = str(Path(self.dir) / "launch.lock")
         calm_cpu(self)
 
+    @pinned_runtime_present()
     def test_do_run_records_policy_and_estimate(self):
         import json as _json
         from launcher.launch import do_run

@@ -17,6 +17,7 @@ from launcher.launch import (
     ADAPTERS, OPENCODE_BIN, OPENCODE_MODEL,
     build_adapter_argv, validate_opencode_runtime,
 )
+from tests.pinned_runtime import requires_host_runtime
 
 
 def route(windows, status="ok", error=None, details=None):
@@ -129,6 +130,7 @@ class TestOpencodeAdapter(unittest.TestCase):
             os.chmod(probe, 0o755)
             self.assertEqual(validate_opencode_runtime(probe), probe)
 
+    @requires_host_runtime(OPENCODE_BIN)
     def test_installed_runtime_is_valid(self):
         # Fresh evidence: the exact required binary exists and executes.
         self.assertTrue(os.path.isfile(OPENCODE_BIN))

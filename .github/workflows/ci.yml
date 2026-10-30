@@ -1,0 +1,85 @@
+# Full, unfiltered launcher suite (issue #80). Contract: ci/suite-contract.json.
+# scripts/ci_full_suite.py fails on any failure, error, deselection, shrunken
+# discovery, source mutation, host-registry write, scratch overrun or skip
+# outside the documented host-evidence allowlist. Its report is the evidence
+# the source-release workflow requires for an exact commit.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-suite:
+    name: Full launcher suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Read pinned dependencies from the suite contract
+        id: pins
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          c = json.load(open("src/ci/suite-contract.json"))
+          d = c["dependencies"]
+          print(f"python={c['python']}")
+          print(f"coordination_repo={d['agent-coordination']['repository']}")
+          print(f"coordination_commit={d['agent-coordination']['commit']}")
+          print(f"hub_repo={d['agent-hub']['repository']}")
+          print(f"hub_commit={d['agent-hub']['commit']}")
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.pins.outputs.python }}
+
+      - name: Check out pinned agent-coordination
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pins.outputs.coordination_repo }}
+          ref: ${{ steps.pins.outputs.coordination_commit }}
+          path: deps/agent-coordination
+          persist-credentials: false
+
+      - name: Check out pinned Agent Hub host code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pins.outputs.hub_repo }}
+          ref: ${{ steps.pins.outputs.hub_commit }}
+          path: deps/agent-hub
+          persist-credentials: false
+
+      - name: Install hash-pinned test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-deps --require-hashes \
+            --only-binary :all: --no-compile --target deps/pydeps -r src/ci/requirements-test.txt
+
+      - name: Run the full suite
+        run: |
+          mkdir -p "$RUNNER_TEMP/suite-report"
+          python -I src/scripts/ci_full_suite.py --mode ci \
+            --scratch "$RUNNER_TEMP/suite-scratch" \
+            --coordination deps/agent-coordination \
+            --agent-hub deps/agent-hub \
+            --pydeps deps/pydeps \
+            --report "$RUNNER_TEMP/suite-report/report.json"
+
+      - name: Upload suite report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: suite-report
+          path: ${{ runner.temp }}/suite-report/
+          if-no-files-found: error
+          retention-days: 90

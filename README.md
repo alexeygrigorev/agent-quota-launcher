@@ -10,6 +10,10 @@ A bounded, stdlib-only Python CLI for launching agent processes reliably: quota-
 - `aplexer` and `quse` installed and on `$PATH`
 - No third-party pip installs
 
+## Tests, CI and releases
+
+The full suite is plain unfiltered `python -m pytest` under the contract in `ci/suite-contract.json`: hash-pinned pytest, pinned agent-coordination and Agent Hub host checkouts, and a real OS-account HOME. `scripts/ci_full_suite.py` enforces the contract in GitHub Actions (`.github/workflows/ci.yml`) and on the launcher host (`scripts/host_suite_sandbox.sh host ...`, zero skips). In CI, the two tests that prove the installed host runtime are the only tests that may skip, and they are reported by name. Source releases of one exact CI-tested commit are cut manually with `.github/workflows/release.yml` and verified or staged with `scripts/release_tool.py`. Nothing here activates a release. See [docs/RELEASE.md](docs/RELEASE.md).
+
 ## Commands
 
 All commands accept `--config-dir DIR` (state DB + launch lock live there); it must come **before** the subcommand.

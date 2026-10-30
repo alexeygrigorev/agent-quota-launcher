@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "python": "3.12",
+  "test_requirements": "ci/requirements-test.txt",
+  "dependencies": {
+    "agent-coordination": {
+      "repository": "alexeygrigorev/agent-coordination",
+      "commit": "b41665296f52b116712a5514329df47a05bef1a2",
+      "pythonpath": ".",
+      "purpose": "coordination.role_failover / ql_consumer_fencing for launcher.consumer_fencing; the suite fails if this import is unavailable"
+    },
+    "agent-hub": {
+      "repository": "alexeygrigorev/agent-hub",
+      "commit": "c5c29256e6d46c6f578c2b40a4146d9739b62a15",
+      "host_subdir": "host",
+      "purpose": "trusted Agent Hub host code resolved by launcher.launch.resolve_hub_path (AGENT_HUB_HOST_PATH) for managed-profile argv"
+    }
+  },
+  "min_collected_tests": 801,
+  "min_passed_subtests": 526,
+  "scratch_limit_mib": 512,
+  "timeout_seconds": 1800,
+  "host_runtime_skip_allowlist": {
+    "why": "Host-evidence tests prove the installed pinned runtime (ZCode node/CJS, zcodex, OpenCode) on the launcher host. GitHub-hosted runners do not have that proprietary runtime; staging stand-ins there would fabricate evidence. They may skip only in --ci mode and only with the requires_host_runtime reason; --require-host-runtime (the Hetzner run) allows zero skips.",
+    "tests": [
+      "tests.test_launch.TestAdapters::test_validate_zai_runtime_direct",
+      "tests.test_opencode_route.TestOpencodeAdapter::test_installed_runtime_is_valid"
+    ]
+  }
+}

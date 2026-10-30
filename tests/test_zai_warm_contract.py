@@ -24,6 +24,7 @@ from launcher.launch import (
     ZCODEX_BIN,
     build_adapter_argv,
 )
+from tests.pinned_runtime import pinned_runtime_present
 
 
 class TestZaiWarmContract(unittest.TestCase):
@@ -35,6 +36,7 @@ class TestZaiWarmContract(unittest.TestCase):
         self.assertEqual(env.get("ZCODE_NODE"), ZCODE_NODE)
         self.assertEqual(env.get("ZCODE_CJS"), ZCODE_CJS)
 
+    @pinned_runtime_present()
     def test_argv_emits_warm_env_assignments_before_binary(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[0], "/usr/bin/env")
@@ -45,6 +47,7 @@ class TestZaiWarmContract(unittest.TestCase):
         for key in ("ZCODE_WARM=1", "ZCODE_WARM_MODE=yolo"):
             self.assertLess(argv.index(key), bin_idx)
 
+    @pinned_runtime_present()
     def test_argv_warm_yolo_ordering_single_execution(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv.count(ZCODEX_BIN), 1)
@@ -67,6 +70,7 @@ class TestZaiWarmContract(unittest.TestCase):
         self.assertNotIn("sh", argv)
         self.assertNotIn("bash", argv)
 
+    @pinned_runtime_present()
     def test_cold_bridge_never_reappears(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertNotIn("-s", argv)
@@ -74,6 +78,7 @@ class TestZaiWarmContract(unittest.TestCase):
         self.assertNotIn("-a", argv)
         self.assertNotIn("--ask-for-approval", argv)
 
+    @pinned_runtime_present()
     def test_exact_model_preserved(self):
         argv = build_adapter_argv("zai", "goal")
         self.assertEqual(argv[argv.index("--model") + 1], "glm-5.3-flash")
@@ -100,6 +105,7 @@ class TestZaiWarmContract(unittest.TestCase):
                 self.assertEqual(argv[z_idx + 1], "--dangerously-bypass-approvals-and-sandbox")
                 self.assertNotIn("-s", argv)
 
+    @pinned_runtime_present()
     def test_warm_argv_matches_maintained_adapter_identity(self):
         from launcher.provider_admission import identify_command
         argv = build_adapter_argv("zai", "warm probe")
@@ -107,6 +113,7 @@ class TestZaiWarmContract(unittest.TestCase):
         self.assertEqual(ident.provider, "zai")
         self.assertEqual(ident.model, "glm-5.3-flash")
 
+    @pinned_runtime_present()
     def test_do_run_emits_single_warm_execution_with_warm_env(self):
         from launcher.launch import do_run
         from launcher.store import Store

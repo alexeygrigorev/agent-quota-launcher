@@ -1,0 +1,234 @@
+# Manual immutable source release of one exact, CI-tested commit (issue #80).
+#
+# verify:  the commit is on main, the tag is new, and a successful CI run of
+#          .github/workflows/ci.yml on main for exactly that commit uploaded a
+#          green suite report under the commit's own contract.
+# build:   git-archive tarball + MANIFEST.json + SHA256SUMS from that commit,
+#          verified member by member. Uploaded as a workflow artifact only.
+# publish: only when dispatched with publish=true, gated by the
+#          `source-release` environment, which must require reviewers. It
+#          reserves the tag atomically at the exact commit (fails if it exists),
+#          uploads a draft, verifies the draft, then publishes; never overwrites.
+# Nothing here deploys, activates a host runtime or clears any hold; staging
+# and activation are operator steps (docs/RELEASE.md).
+name: Source release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-hex commit on main to release
+        required: true
+        type: string
+      tag:
+        description: New release tag, e.g. v0.1.0-rc1 (must not exist)
+        required: true
+        type: string
+      publish:
+        description: Publish the GitHub release after source-release environment review
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-release
+  cancel-in-progress: false
+
+env:
+  COMMIT: ${{ inputs.commit }}
+  TAG: ${{ inputs.tag }}
+  GH_REPO: ${{ github.repository }}
+  RELEASE_ENVIRONMENT: source-release
+
+jobs:
+  verify:
+    name: Verify tested commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ci_run_id: ${{ steps.ci.outputs.run_id }}
+      ci_run_url: ${{ steps.ci.outputs.run_url }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full 40-hex SHA"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::tag must look like v1.2.3 or v1.2.3-rc1"; exit 1; }
+
+      - name: Check out main history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the commit on main and a new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git cat-file -e "$COMMIT^{commit}" || { echo "::error::$COMMIT not found"; exit 1; }
+          git merge-base --is-ancestor "$COMMIT" origin/main || { echo "::error::$COMMIT is not on main"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists; releases are immutable"; exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists"; exit 1
+          fi
+
+      - name: Find the successful CI run for exactly this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$COMMIT&status=success&per_page=100" \
+            --jq '[.workflow_runs[] | select(.head_sha == env.COMMIT and .head_branch == "main"
+                    and .conclusion == "success" and .path == ".github/workflows/ci.yml"
+                    and (.event == "push" or .event == "workflow_dispatch"))]
+                  | sort_by(.run_started_at) | last // empty | "\(.id) \(.html_url)"' > ci-run.txt
+          read -r run_id run_url < ci-run.txt || true
+          if [ -z "${run_id:-}" ]; then
+            echo "::error::no successful CI run on main for $COMMIT; run CI first"; exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
+          echo "CI run: $run_url"
+
+      - name: Verify the CI suite report against the commit's contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ steps.ci.outputs.run_id }}" -n suite-report -D "$RUNNER_TEMP/suite-report"
+          git show "$COMMIT:scripts/release_tool.py" > "$RUNNER_TEMP/release_tool.py"
+          python3 -I "$RUNNER_TEMP/release_tool.py" verify-report \
+            --report "$RUNNER_TEMP/suite-report/report.json" --commit "$COMMIT" --repo .
+
+  build:
+    name: Build source artifact
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: src
+          persist-credentials: false
+
+      - name: Build and verify release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ needs.verify.outputs.ci_run_id }}
+          CI_RUN_URL: ${{ needs.verify.outputs.ci_run_url }}
+        run: |
+          [ "$(git -C src rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::checkout is not $COMMIT"; exit 1; }
+          gh run download "$CI_RUN_ID" -n suite-report -D "$RUNNER_TEMP/suite-report"
+          python3 -I src/scripts/release_tool.py build --repo src --repository "$GH_REPO" \
+            --commit "$COMMIT" --tag "$TAG" --ci-run-id "$CI_RUN_ID" --ci-run-url "$CI_RUN_URL" \
+            --suite-report "$RUNNER_TEMP/suite-report/report.json" --out dist
+          python3 -I src/scripts/release_tool.py verify --dir dist --repo src --commit "$COMMIT" --tag "$TAG"
+          {
+            echo "### Source release candidate $TAG"
+            echo "Commit: \`$COMMIT\`  CI: $CI_RUN_URL"
+            echo '```'; cat dist/SHA256SUMS; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source-release-${{ inputs.tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish immutable release
+    needs: [verify, build]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: source-release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Refuse an environment without required reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reviewers=$(gh api "repos/$GH_REPO/environments/$RELEASE_ENVIRONMENT" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length')
+          if [ "${reviewers:-0}" -lt 1 ]; then
+            echo "::error::environment $RELEASE_ENVIRONMENT has no required reviewers; refusing to publish"; exit 1
+          fi
+
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: src
+          persist-credentials: false
+
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: source-release-${{ inputs.tag }}
+          path: dist
+
+      - name: Re-verify the release files against the commit
+        run: |
+          [ "$(git -C src rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::checkout is not $COMMIT"; exit 1; }
+          python3 -I src/scripts/release_tool.py verify --dir dist --repo src --commit "$COMMIT" --tag "$TAG"
+
+      - name: Reserve the tag atomically at the exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Creating the ref fails if the tag exists or appears concurrently;
+          # any API error fails closed before a release exists.
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f ref="refs/tags/$TAG" -f sha="$COMMIT" --jq .object.sha > reserved.txt
+          [ "$(cat reserved.txt)" = "$COMMIT" ] || { echo "::error::reserved $TAG does not point at $COMMIT"; exit 1; }
+
+      - name: Upload a draft release on the reserved tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_URL: ${{ needs.verify.outputs.ci_run_url }}
+        run: |
+          {
+            echo "Immutable source release of \`$COMMIT\`, tested by $CI_RUN_URL."
+            echo
+            echo "Verify against a trusted clone before use: \`python3 scripts/release_tool.py verify --dir <downloaded assets> --repo <clone> --on-ref origin/main --commit $COMMIT --tag $TAG\`."
+            echo "Publishing does not deploy or activate anything; see docs/RELEASE.md for operator staging."
+            echo
+            echo '```'; cat dist/SHA256SUMS; echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "dist/agent-quota-launcher-$TAG.tar" dist/MANIFEST.json dist/suite-report.json dist/SHA256SUMS
+
+      - name: Verify the draft, then publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          check_tag() {
+            tagged=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+            [ "$tagged" = "commit $COMMIT" ] || { echo "::error::$TAG is '$tagged', not commit $COMMIT"; exit 1; }
+          }
+          check_tag
+          mkdir "$RUNNER_TEMP/draft"
+          gh release download "$TAG" -D "$RUNNER_TEMP/draft"
+          assets=$(python3 -I -c 'import os, sys; print(" ".join(sorted(os.listdir(sys.argv[1]))))' "$RUNNER_TEMP/draft")
+          [ "$assets" = "MANIFEST.json SHA256SUMS agent-quota-launcher-$TAG.tar suite-report.json" ] \
+            || { echo "::error::draft assets differ from the release files"; exit 1; }
+          python3 -I src/scripts/release_tool.py verify --dir "$RUNNER_TEMP/draft" --repo src --commit "$COMMIT" --tag "$TAG"
+          gh release edit "$TAG" --draft=false
+          check_tag
