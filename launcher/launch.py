@@ -510,6 +510,31 @@ def native_status(tag, timeout=15):
     return "unknown", f"phase={phase!r}"
 
 
+def clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms, state_dir=None):
+    """Native receipt for a session that finished cleanly before the first-action
+    validator sampled it. Requires a tombstone matching the exact launched
+    identity (id, tag, workspace, incarnation) with cause=finished AND an
+    explicit exit.code == 0 with no signal/OOM. A missing exit record, a
+    non-zero code, a signal or an OOM kill is no proof of success."""
+    from launcher.native_lifecycle import read_tombstone, verify_tombstone
+    if not (isinstance(sess_id, str) and isinstance(sess_tag, str)
+            and isinstance(sess_ws, str) and type(sess_created_at_ms) is int):
+        return None
+    tomb = read_tombstone(sess_id.strip(), state_dir=state_dir)
+    if not isinstance(tomb, dict):
+        return None
+    ok, _ = verify_tombstone(tomb, sess_id, sess_tag, sess_ws, sess_created_at_ms)
+    if not ok:
+        return None
+    ex = tomb.get("exit")
+    if not isinstance(ex, dict) or type(ex.get("code")) is not int or ex["code"] != 0:
+        return None
+    if ex.get("signal") or ex.get("oom_killed"):
+        return None
+    return {"native_id": sess_id, "cause": "finished", "exit_code": 0,
+            "finished_at_ms": tomb.get("finished_at_ms")}
+
+
 def _kill_process_group(proc, grace=10.0):
     """Terminate then kill the child's whole process group."""
     if os.name == "nt":
@@ -1015,6 +1040,19 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         except StateTransitionError:
             pass
         record["outcome"] = "stalled"
+    elif (receipt := clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms)):
+        # Short headless sessions can finish between validator samples; a
+        # verified clean native exit is a success, not a death before work.
+        try:
+            store.transition_task(task_id, "completed-awaiting-review", ("starting",),
+                                  reason="clean native exit before first-action sample "
+                                         f"(exit code 0, finished tombstone): {detail}")
+        except StateTransitionError:
+            pass
+        record["outcome"] = "completed-awaiting-review"
+        record["native_receipt"] = receipt
+        _write_launch_record(cwd, record)
+        return 0
     else:
         try:
             store.transition_task(task_id, "failed", ("starting",),
