@@ -158,11 +158,14 @@ def _run_with_host_hint(args):
     if rc != 0 or backend != "aplexer":
         return rc
     # Narrow native receipt for the maintained aplexer backend (Hub fleet
-    # binding): on success (first-action validated, session running) emit a
-    # JSON receipt with the genuine native UUID so run_json callers can bind
-    # without faking. Files are the do_run-written evidence; missing/invalid
-    # evidence prints nothing (caller treats empty stdout as uncertain, never
-    # as a fake receipt). Exit code and launch-record semantics preserved.
+    # binding): on success emit a JSON receipt with the genuine native UUID
+    # so run_json callers can bind without faking. Success is a validated
+    # first action with the session running, or a fast finish (first action
+    # validated on post-death re-check plus a verified clean native exit)
+    # whose receipt carries the exit code. Files are the do_run-written
+    # evidence; missing/invalid evidence prints nothing (caller treats empty
+    # stdout as uncertain, never as a fake receipt). Exit code and
+    # launch-record semantics preserved.
     try:
         cwd_path = Path(args.cwd).resolve()
         start_doc = json.loads(
@@ -174,13 +177,15 @@ def _run_with_host_hint(args):
         session_id = start_doc.get("id") or record_doc.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             return rc
-        if record_doc.get("outcome") != "running":
+        outcome = record_doc.get("outcome")
+        if outcome not in ("running", "completed-awaiting-review"):
             return rc
         if not record_doc.get("first_action_validated_at"):
             return rc
+        native_receipt = record_doc.get("native_receipt")
         receipt = {
             "session_id": session_id,
-            "state": "running",
+            "state": "running" if outcome == "running" else "exited",
             "first_action_verified": True,
             "model": record_doc.get("observed_model"),
             "requested_model": record_doc.get("requested_model"),
@@ -189,8 +194,20 @@ def _run_with_host_hint(args):
             "tag": start_doc.get("tag"),
             "workspace": start_doc.get("workspace"),
             "engine": start_doc.get("engine"),
-            "phase": start_doc.get("phase"),
         }
+        if outcome == "running":
+            receipt["phase"] = start_doc.get("phase")
+        else:
+            # Fast finish: carry the verified native exit (identity-checked
+            # finished tombstone, exit code 0) so run_json callers record
+            # exited/done instead of mapping empty stdout to
+            # launcher_command_failed.
+            if not isinstance(native_receipt, dict) or type(native_receipt.get("exit_code")) is not int:
+                return rc
+            receipt["exit_code"] = native_receipt["exit_code"]
+            receipt["cause"] = native_receipt.get("cause")
+            if type(native_receipt.get("finished_at_ms")) is int:
+                receipt["finished_at_ms"] = native_receipt["finished_at_ms"]
         if start_doc.get("profile"):
             receipt["profile"] = start_doc["profile"]
         if start_doc.get("account_label") or record_doc.get("account_label"):

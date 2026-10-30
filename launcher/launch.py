@@ -372,11 +372,35 @@ REQUIRED_WHOAMI_FIELDS = {
     "worker_pid",
 }
 
-def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
+def native_workspace_aliases(workspace, payload_cwd):
+    """Workspaces a native whoami/tombstone may report for this launch.
+
+    aplexer records the session workspace as the launched --cwd, so a launch
+    with --cwd under --workspace (e.g. repo root + repo/docs) reports the
+    subdirectory while the start record carries the requested workspace root.
+    Accept the resolved cwd as an identity workspace only when it resolves
+    inside the verified --workspace (or equals it); anything outside the
+    verified workspace stays rejected."""
+    try:
+        ws = Path(workspace).resolve()
+        cwd = Path(payload_cwd).resolve()
+    except Exception:
+        return []
+    if cwd == ws:
+        return []
+    if cwd.is_relative_to(ws):
+        return [str(cwd)]
+    return []
+
+
+def validate_first_action(fa_path, start_json, min_mtime, now_ms=None,
+                          workspace_aliases=None):
     """Content check of the child's first-action artifact against the launch
     start record. Identity must match the launched session: id, tag and
-    workspace equal the start record's, and parent_session must match when
-    the artifact carries it. Identity match is not tool provenance: any
+    workspace equal the start record's — or the workspace equals the launched
+    --cwd when that resolves under the start record's workspace (aplexer
+    reports the session workspace as the cwd) — and parent_session must match
+    when the artifact carries it. Identity match is not tool provenance: any
     record that is the wrapper start JSON itself — byte-identical,
     reformatted, or augmented with timestamp fields or arbitrary extra keys
     (such as dummy=123) while keeping start keys intact — is rejected as a
@@ -412,11 +436,24 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None):
             return False
 
         # 4. Identity match: id, tag, workspace must match the launched session.
+        # The workspace may instead be the launched --cwd when that resolves
+        # under the verified start workspace (native_workspace_aliases);
+        # aliases outside the verified workspace never widen the match.
         if data.get("id") != start_json.get("id"):
             return False
         if data.get("tag") != start_json.get("tag"):
             return False
-        if data.get("workspace") != start_json.get("workspace"):
+        start_ws = start_json.get("workspace")
+        acceptable_ws = {start_ws}
+        if isinstance(start_ws, str) and start_ws.strip():
+            for alias in workspace_aliases or ():
+                if isinstance(alias, str) and alias.strip():
+                    try:
+                        if Path(alias).resolve().is_relative_to(Path(start_ws).resolve()):
+                            acceptable_ws.add(alias)
+                    except Exception:
+                        pass
+        if data.get("workspace") not in acceptable_ws:
             return False
         if "parent_session" in data and \
                 data.get("parent_session") != start_json.get("parent_session"):
@@ -510,12 +547,16 @@ def native_status(tag, timeout=15):
     return "unknown", f"phase={phase!r}"
 
 
-def clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms, state_dir=None):
+def clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms, state_dir=None,
+                       workspace_aliases=None):
     """Native receipt for a session that finished cleanly before the first-action
     validator sampled it. Requires a tombstone matching the exact launched
     identity (id, tag, workspace, incarnation) with cause=finished AND an
-    explicit exit.code == 0 with no signal/OOM. A missing exit record, a
-    non-zero code, a signal or an OOM kill is no proof of success."""
+    explicit exit.code == 0 with no signal/OOM. The tombstone workspace may
+    be the launched --cwd when that resolves under the verified workspace
+    (workspace_aliases); aliases outside the verified workspace never widen
+    the match. A missing exit record, a non-zero code, a signal or an OOM
+    kill is no proof of success."""
     from launcher.native_lifecycle import read_tombstone, verify_tombstone
     if not (isinstance(sess_id, str) and isinstance(sess_tag, str)
             and isinstance(sess_ws, str) and type(sess_created_at_ms) is int):
@@ -524,6 +565,19 @@ def clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms, state_dir
     if not isinstance(tomb, dict):
         return None
     ok, _ = verify_tombstone(tomb, sess_id, sess_tag, sess_ws, sess_created_at_ms)
+    if not ok:
+        verified_ws = Path(sess_ws).resolve()
+        for alias in workspace_aliases or ():
+            if not (isinstance(alias, str) and alias.strip()):
+                continue
+            try:
+                if not Path(alias).resolve().is_relative_to(verified_ws):
+                    continue
+            except Exception:
+                continue
+            ok, _ = verify_tombstone(tomb, sess_id, sess_tag, alias, sess_created_at_ms)
+            if ok:
+                break
     if not ok:
         return None
     ex = tomb.get("exit")
@@ -734,6 +788,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     run_tag = run_tag_for(task_id)
     record["tag"] = run_tag
 
+    # aplexer reports the session workspace as the launched --cwd (whoami and
+    # tombstones), so identity checks accept the resolved payload cwd when it
+    # resolves under the verified --workspace. No other loosening.
+    native_cwd = str(Path(payload["cwd"]).resolve())
+    ws_aliases = native_workspace_aliases(workspace, native_cwd)
+    record["native_workspace_aliases"] = ws_aliases
+
     # First-action artifact path (also recorded below): the child
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
@@ -751,7 +812,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         # the first-action wait below, never the native worker lifetime.
         "--startup-timeout-ms", "30000",
         "--workspace", workspace,
-        "--cwd", str(Path(payload["cwd"]).resolve()),
+        "--cwd", native_cwd,
         "--tag", run_tag,
     ]
     account_profile = payload.get("account_profile") or payload.get("provider_profile")
@@ -939,6 +1000,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     sess_ws = start_json.get("workspace")
     sess_engine = start_json.get("engine")
     sess_created_at_ms = start_json.get("created_at_ms")
+    # Native whoami/tombstones report the --cwd as the session workspace; bind
+    # the observed workspace so later lifecycle probes verify against truth.
+    binding_ws = ws_aliases[0] if ws_aliases else sess_ws
 
     record["session_id"] = sess_id
     record["observed_tag"] = sess_tag
@@ -960,7 +1024,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
                 task_id=task_id,
                 native_id=sess_id,
                 tag=sess_tag,
-                workspace=sess_ws,
+                workspace=binding_ws,
                 engine=sess_engine,
                 incarnation=int(sess_created_at_ms),
                 details={
@@ -990,7 +1054,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     alive, detail = "unknown", "wait started"
     while time.monotonic() < deadline:
         if validate_first_action(str(fa_path), start_json,
-                                 record["started_at_ts"], now_ms=time.time() * 1000):
+                                 record["started_at_ts"], now_ms=time.time() * 1000,
+                                 workspace_aliases=ws_aliases):
             try:
                 store.transition_task(task_id, "running", ("starting",),
                                       reason="genuine first action validated")
@@ -1004,7 +1069,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
                         task_id=task_id,
                         native_id=sess_id,
                         tag=sess_tag,
-                        workspace=sess_ws,
+                        workspace=binding_ws,
                         engine=sess_engine,
                         incarnation=int(sess_created_at_ms),
                         details={
@@ -1040,19 +1105,33 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         except StateTransitionError:
             pass
         record["outcome"] = "stalled"
-    elif (receipt := clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms)):
-        # Short headless sessions can finish between validator samples; a
-        # verified clean native exit is a success, not a death before work.
+    elif validate_first_action(str(fa_path), start_json,
+                               record["started_at_ts"], now_ms=time.time() * 1000,
+                               workspace_aliases=ws_aliases):
+        # Re-check after native death: the session may have written its first
+        # action between validator samples. Success still requires real-work
+        # evidence — a validated first action AND a verified clean native
+        # exit (exit code 0, finished tombstone). A zero-work exit-0 death
+        # and a dirty death both stay failed.
+        if (receipt := clean_exit_receipt(sess_id, sess_tag, sess_ws, sess_created_at_ms,
+                                          workspace_aliases=ws_aliases)):
+            try:
+                store.transition_task(task_id, "completed-awaiting-review", ("starting",),
+                                      reason="first action validated on post-death re-check; "
+                                             f"clean native exit (exit code 0, finished tombstone): {detail}")
+            except StateTransitionError:
+                pass
+            record["outcome"] = "completed-awaiting-review"
+            record["first_action_validated_at"] = datetime.now(timezone.utc).isoformat()
+            record["native_receipt"] = receipt
+            _write_launch_record(cwd, record)
+            return 0
         try:
-            store.transition_task(task_id, "completed-awaiting-review", ("starting",),
-                                  reason="clean native exit before first-action sample "
-                                         f"(exit code 0, finished tombstone): {detail}")
+            store.transition_task(task_id, "failed", ("starting",),
+                                  reason=f"first action validated but native death lacks clean-exit proof: {detail}")
         except StateTransitionError:
             pass
-        record["outcome"] = "completed-awaiting-review"
-        record["native_receipt"] = receipt
-        _write_launch_record(cwd, record)
-        return 0
+        record["outcome"] = "failed"
     else:
         try:
             store.transition_task(task_id, "failed", ("starting",),
