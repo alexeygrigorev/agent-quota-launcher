@@ -73,8 +73,11 @@ jobs:
         run: |
           git cat-file -e "$COMMIT^{commit}" || { echo "::error::$COMMIT not found"; exit 1; }
           git merge-base --is-ancestor "$COMMIT" origin/main || { echo "::error::$COMMIT is not on main"; exit 1; }
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            echo "::error::tag $TAG already exists; releases are immutable"; exit 1
+          # An operator-created tag is allowed only if it points at COMMIT and no
+          # release exists yet (GITHUB_TOKEN cannot create it; see reserve step).
+          existing=$(git ls-remote --tags origin "refs/tags/$TAG" | cut -f1)
+          if [ -n "$existing" ] && [ "$existing" != "$COMMIT" ]; then
+            echo "::error::tag $TAG already exists at $existing, not $COMMIT; releases are immutable"; exit 1
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "::error::release $TAG already exists"; exit 1
