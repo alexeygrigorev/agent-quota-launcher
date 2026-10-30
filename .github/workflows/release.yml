@@ -184,8 +184,13 @@ jobs:
         run: |
           # Creating the ref fails if the tag exists or appears concurrently;
           # any API error fails closed before a release exists.
-          gh api --method POST "repos/$GH_REPO/git/refs" \
-            -f ref="refs/tags/$TAG" -f sha="$COMMIT" --jq .object.sha > reserved.txt
+          # GITHUB_TOKEN cannot create refs on commits whose history touches
+          # .github/workflows (needs `workflows` scope), so the tag may be
+          # pre-created by the operator; accept it only if it points at COMMIT.
+          if ! gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq .object.sha > reserved.txt 2>/dev/null; then
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$COMMIT" --jq .object.sha > reserved.txt
+          fi
           [ "$(cat reserved.txt)" = "$COMMIT" ] || { echo "::error::reserved $TAG does not point at $COMMIT"; exit 1; }
 
       - name: Upload a draft release on the reserved tag
