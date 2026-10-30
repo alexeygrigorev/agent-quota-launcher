@@ -1,5 +1,6 @@
 """Regression coverage for compile workloads launched through Hub."""
 import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,16 @@ class LimitsTests(unittest.TestCase):
         self.assertEqual(resolve_task_bounds(self.payload)["memory_mb"], 8192)
         self.payload["memory_estimate_mb"] = 12000
         self.assertEqual(hub_headless_memory_mb(self.payload), 12000)
+
+    def test_explicit_host_request_is_the_cap_not_the_floor(self):
+        # Intake a10c41b5: Hub sends memory_mb=1500; the 4096 floor must not
+        # override it. A larger measured estimate and Cargo still raise it.
+        self.payload["memory_mb"] = 1500
+        self.assertEqual(hub_headless_memory_mb(self.payload), 1500)
+        self.assertEqual(resolve_task_bounds(self.payload)["memory_mb"], 1500)
+        self.assertEqual(hub_headless_memory_mb(dict(self.payload, memory_estimate_mb=2400)), 2400)
+        (self.cwd / "Cargo.toml").touch()
+        self.assertEqual(hub_headless_memory_mb(self.payload), 8192)
 
     def test_foreign_contract_and_invalid_hints(self):
         self.assertIsNone(hub_headless_memory_mb(dict(self.payload, owner="other")))
@@ -109,6 +120,28 @@ class HubNativeTests(TestDoRunNativeMemoryArgv):
             dict(owner="hub-fleet", profile="model-task", memory_estimate_mb=512))
         self.assertEqual(cmd[cmd.index("--memory") + 1], "8192M")
         self.assertEqual(cmd[cmd.index("--pids") + 1], "2048")
+
+    def _hub_route(self, provider):
+        payload = dict(owner="hub-fleet", profile="model-task", memory_mb=1500,
+                       memory_estimate_mb=848, account_label="acct",
+                       account_profile="hub-acct", provider_profile="hub-acct",
+                       managed_dir=self.dir)
+        with patch("launcher.launch.validate_zai_runtime",
+                   return_value=("/usr/bin/node", "/opt/zcode.cjs", None)):
+            cmd = self._run_with_provider(provider, True, payload)
+        record = json.loads((Path(self.dir) / ".local" / f"launch-t-{provider}-m.json").read_text())
+        return cmd, record
+
+    def test_hub_request_is_honored_for_zai_codex_and_claude(self):
+        # Intake a10c41b5: ZAI/zcodex probe d955fa6e ran at 4096 MiB although
+        # the host payload requested 1500 MiB.
+        for provider in ("zai", "codex", "claude"):
+            with self.subTest(provider=provider):
+                cmd, record = self._hub_route(provider)
+                self.assertEqual(cmd[cmd.index("--memory") + 1], "1500M")
+                self.assertEqual(cmd[cmd.index("--pids") + 1], "1024")
+                self.assertEqual(record["requested_memory_mb"], 1500)
+                self.assertEqual(record["memory_estimate_mb"], 848)
 
     def test_native_hub_measured_estimate_is_not_clamped_to_1500(self):
         cmd = self._run_with_provider("codex", True,
