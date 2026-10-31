@@ -116,6 +116,12 @@ RESOURCE_HOLDING_STATES = ("queued", "starting", "launch-uncertain", "stalled", 
 # window has no process to hold memory for (a spawned session records its
 # binding at spawn). Matches the Hub's in-flight reservation window.
 STALE_START_SECONDS = 600
+
+
+def _native_session_gone(detail):
+    """True when the lifecycle probe says the native session is absent or exiting."""
+    text = detail if isinstance(detail, str) else ""
+    return "no matching session" in text or "terminal phase=" in text
 # States that hold path/evidence leases (through completed-awaiting-review).
 LEASED_STATES = ("queued", "starting", "launch-uncertain", "stalled",
                  "running", "completed-awaiting-review")
@@ -1081,6 +1087,20 @@ class Store:
                         rows_out.append({"task_id": task_id, "state": state,
                                          "reserve_mb": 0, "disk_mb": disk or 0,
                                          "basis": "resident-settled"})
+                    elif status == "unknown" and age is not None \
+                            and age >= max(ramp_seconds, STALE_START_SECONDS) \
+                            and _native_session_gone(detail):
+                        # Intake 63a9ee3a recurrence: aplexer no longer knows
+                        # the session (no matching session, no tombstone) or
+                        # reports an exiting terminal phase. Past the ramp any
+                        # surviving memory is already inside MemAvailable, so
+                        # holding the full allowance forever double-counted
+                        # 11 vanished workers (~19 GiB) and refused every
+                        # start. Transient probe errors (timeout, identity
+                        # mismatch) still fail closed.
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": 0, "disk_mb": disk or 0,
+                                         "basis": "stale-unproven"})
                     elif status == "alive" and credit > 0 and age is not None:
                         self._record_resident_sample(task_id, binding, credit, dry_run)
                         rows_out.append({"task_id": task_id, "state": state,

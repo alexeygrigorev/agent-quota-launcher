@@ -864,3 +864,39 @@ class LaunchWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VanishedWorkerReservationTests(unittest.TestCase):
+    """Intake 63a9ee3a recurrence: running rows aplexer no longer knows."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "state.db"))
+        self.store.submit_task("t1", "k1", {"goal": "g", "owner": "o", "cwd": self.tmp.name,
+                                            "timeout": 60, "memory_estimate_mb": 700}, [])
+        self.store.transition_task("t1", "running", ("queued",))
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE task_resources SET memory_mb=1500 WHERE task_id='t1'")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _row(self, detail, age):
+        binding = {"native_id": "n1", "tag": "t", "workspace": "/w", "engine": "e", "incarnation": 1}
+        with patch.object(Store, "get_native_binding", return_value=binding), \
+                patch("launcher.store.probe_native_lifecycle", return_value=("unknown", detail)), \
+                patch.object(Store, "_task_age_seconds", return_value=age):
+            return self.store.resource_breakdown()[0]
+
+    def test_vanished_session_past_ramp_releases(self):
+        for detail in ("aplexer status rc=1 (a: no matching session); no matching retired tombstone",
+                       "terminal phase=exiting but containment_empty is not explicitly True (got False)"):
+            row = self._row(detail, 9999)
+            self.assertEqual((row["basis"], row["reserve_mb"]), ("stale-unproven", 0))
+
+    def test_young_or_transient_probe_failures_stay_reserved(self):
+        gone = "aplexer status rc=1 (a: no matching session); no matching retired tombstone"
+        self.assertEqual(self._row(gone, 30)["reserve_mb"], 1500)
+        for detail in ("aplexer status timed out after 15.0s", "aplexer status error: boom"):
+            self.assertEqual(self._row(detail, 9999)["reserve_mb"], 1500)
