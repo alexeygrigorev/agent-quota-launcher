@@ -14,6 +14,7 @@ import json
 import math
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -259,21 +260,58 @@ def extract_requested_model(payload, provider=None):
     return None
 
 
-def _hub_host_module(name):
-    """Import a native quota probe from the trusted Agent Hub host path.
+_HUB_HOST_IMPORT_LOCK = threading.Lock()
 
-    The launcher process carries only its own release on PYTHONPATH; the host
-    package lives at AGENT_HUB_HOST_PATH, resolved exactly as for managed
-    execution. Without this the import failed, the probe reported no quota
-    source, and every managed Claude route was rejected (Hub intake 798f0f8c).
+
+def _hub_host_module_origin_ok(module, hub_path, module_name):
+    """True only when a cached module really comes from the validated host path."""
+    module_file = getattr(module, "__file__", None)
+    if not module_file or not hub_path:
+        return False
+    if module_name == "agent_hub_host":
+        expected = Path(hub_path) / "agent_hub_host" / "__init__.py"
+    else:
+        expected = Path(hub_path) / (module_name.replace(".", "/") + ".py")
+    try:
+        return os.path.realpath(module_file) == os.path.realpath(str(expected))
+    except OSError:
+        return False
+
+
+def _hub_host_module(name):
+    """Import a native quota probe from the validated Agent Hub host path.
+
+    The launcher process carries only its own release on PYTHONPATH, so the
+    probe package lives at AGENT_HUB_HOST_PATH. The path is validated strictly
+    (absolute, real directory, user-owned, not group/world-writable, contains
+    an agent_hub_host package; no PATH or well-known fallback, broken value
+    fails closed). The host path is scoped to this single import under a lock
+    and removed from sys.path afterwards — no process-wide sys.path[0]
+    mutation — and a cached agent_hub_host module is accepted only when it
+    provably comes from the validated path (Hub intake 86254a30).
     """
     import importlib
     import sys
-    from launcher.launch import resolve_hub_path
-    hub_path = resolve_hub_path()
-    if hub_path and hub_path not in sys.path:
-        sys.path.insert(0, hub_path)
-    return importlib.import_module("agent_hub_host." + name)
+
+    from launcher.launch import HubHostPathUntrusted, resolve_validated_hub_host_dir
+
+    hub_path = resolve_validated_hub_host_dir()
+    module_name = f"agent_hub_host.{name}"
+    with _HUB_HOST_IMPORT_LOCK:
+        for cached_name in ("agent_hub_host", module_name):
+            cached = sys.modules.get(cached_name)
+            if cached is not None and not _hub_host_module_origin_ok(cached, hub_path, cached_name):
+                raise HubHostPathUntrusted(
+                    f"quota unverified: cached {cached_name!r} module does not come from the validated host path {hub_path}"
+                )
+        inserted = hub_path not in sys.path
+        if inserted:
+            sys.path.insert(0, hub_path)
+        try:
+            return importlib.import_module(module_name)
+        finally:
+            if inserted:
+                sys.path.remove(hub_path)
 
 
 def fetch_managed_quse(account_label, provider=None, requested_model=None, config_dir=None, managed_dir=None):
@@ -326,16 +364,24 @@ def fetch_managed_quse(account_label, provider=None, requested_model=None, confi
         env.update(bundle["env"])
 
     if prov == "gemini":
+        from launcher.launch import HubHostPathUntrusted
+
         try:
             native_google_quota = _hub_host_module("native_google_quota")
             return native_google_quota.probe(bundle, dest, model=requested_model)
+        except HubHostPathUntrusted as e:
+            return {"gemini": {"status": "held", "reason": str(e), "windows": {}}}
         except Exception:
             return {"gemini": {"status": "held", "reason": "native_google_probe_failed", "windows": {}}}
 
     if prov == "claude":
+        from launcher.launch import HubHostPathUntrusted
+
         try:
             native_claude_quota = _hub_host_module("native_claude_quota")
             return native_claude_quota.probe(bundle, dest, requested_model=requested_model)
+        except HubHostPathUntrusted as e:
+            return {"claude": {"status": "held", "reason": str(e), "windows": {}}}
         except Exception:
             return {"claude": {"status": "held", "reason": "native_claude_probe_failed", "windows": {}}}
 

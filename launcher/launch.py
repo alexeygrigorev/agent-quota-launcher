@@ -226,6 +226,71 @@ def resolve_hub_path():
     return None
 
 
+class HubHostPathUntrusted(ValueError):
+    """AGENT_HUB_HOST_PATH is missing, broken or untrusted for in-process import."""
+
+
+def resolve_validated_hub_host_dir():
+    """Strict AGENT_HUB_HOST_PATH resolution for in-process host imports.
+
+    Probe imports run inside the launcher process, so the path must be as
+    trustworthy as the isolated child's for managed execution: an absolute,
+    real (resolved) directory owned by the current user or root, not
+    group/world-writable, containing an agent_hub_host package. Unlike the
+    managed-execution search there is deliberately no PATH, hub-bin or
+    well-known-checkout fallback, and an explicitly set but broken
+    AGENT_HUB_HOST_PATH fails closed (Hub intake 86254a30): quota stays
+    unverified with an explicit reason instead of importing from an ambient
+    path. Raises HubHostPathUntrusted with that reason, or returns the
+    resolved directory.
+    """
+    env_path = os.environ.get("AGENT_HUB_HOST_PATH")
+    if not env_path:
+        raise HubHostPathUntrusted(
+            "quota unverified: AGENT_HUB_HOST_PATH is not set and there is no trusted host path fallback"
+        )
+    if not os.path.isabs(env_path):
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH must be an absolute path, got {env_path!r}"
+        )
+    candidate = Path(env_path)
+    if not candidate.is_dir():
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH is not an existing directory: {env_path!r}"
+        )
+    resolved = candidate.resolve()
+    if not resolved.is_dir():
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH does not resolve to a real directory: {env_path!r}"
+        )
+    st = resolved.stat()
+    if st.st_uid not in (os.getuid(), 0):
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH is owned by uid {st.st_uid}, not the current user: {resolved}"
+        )
+    if st.st_mode & 0o022:
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH is group/world-writable: {resolved}"
+        )
+    package = resolved / "agent_hub_host"
+    if not (package.is_dir() and (package / "__init__.py").is_file()):
+        raise HubHostPathUntrusted(
+            f"quota unverified: AGENT_HUB_HOST_PATH does not contain an agent_hub_host package: {resolved}"
+        )
+    # The probe code lives in the package directory, so it meets the same bar
+    # as the host path itself.
+    pst = package.stat()
+    if pst.st_uid not in (os.getuid(), 0):
+        raise HubHostPathUntrusted(
+            f"quota unverified: the agent_hub_host package is owned by uid {pst.st_uid}, not the current user: {package}"
+        )
+    if pst.st_mode & 0o022:
+        raise HubHostPathUntrusted(
+            f"quota unverified: the agent_hub_host package is group/world-writable: {package}"
+        )
+    return str(resolved)
+
+
 def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=None):
     hub_path = resolve_hub_path()
     if not hub_path:

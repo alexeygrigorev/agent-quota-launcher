@@ -1,6 +1,13 @@
+import contextlib
+import importlib
+import json
+import os
+import sys
+import tempfile
 from unittest.mock import patch
 import unittest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from launcher.admission import validate_quse, codex_gate_reason, fetch_quse
 
 def route(windows, status="ok", error=None, details=None):
@@ -1012,40 +1019,237 @@ class TestManagedProfileQualification(unittest.TestCase):
                 rc = plan(FakeArgs(json.dumps(payload), str(tmp_p)))
                 self.assertEqual(rc, 0)
 
+CLAUDE_PROBE_SOURCE = (
+    "def probe(bundle, dest, requested_model=None):\n"
+    "    return {'claude': {'status': 'ok',\n"
+    "            'details': {'source': 'native_claude_oauth_usage',\n"
+    "                        'model': requested_model, 'origin': __file__},\n"
+    "            'windows': {}}}\n"
+)
+
+GOOGLE_PROBE_SOURCE = (
+    "def probe(bundle, dest, model=None):\n"
+    "    return {'gemini': {'status': 'ok',\n"
+    "            'details': {'source': 'native_google_code_assist',\n"
+    "                        'model': model, 'origin': __file__},\n"
+    "            'windows': {}}}\n"
+)
+
+AMBIENT_PROBE_SOURCE = (
+    "def probe(bundle, dest, requested_model=None, model=None):\n"
+    "    marker = 'ambient_decoy'\n"
+    "    return {'claude': {'status': 'ok', 'details': {'source': marker, 'origin': __file__}, 'windows': {}},\n"
+    "            'gemini': {'status': 'ok', 'details': {'source': marker, 'origin': __file__}, 'windows': {}}}\n"
+)
 
 
+def _write_probe_host(root, name="host"):
+    """A trusted-looking host dir with real importable fixture probes."""
+    import os as _os
+    host = root / name
+    package = host / "agent_hub_host"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "native_claude_quota.py").write_text(CLAUDE_PROBE_SOURCE)
+    (package / "native_google_quota.py").write_text(GOOGLE_PROBE_SOURCE)
+    _os.chmod(host, 0o755)
+    _os.chmod(package, 0o755)
+    return host
 
+
+def _write_ambient_host(root):
+    """A second agent_hub_host that the probe import must never pick up."""
+    import os as _os
+    ambient = root / "ambient"
+    package = ambient / "agent_hub_host"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "native_claude_quota.py").write_text(AMBIENT_PROBE_SOURCE)
+    (package / "native_google_quota.py").write_text(AMBIENT_PROBE_SOURCE)
+    _os.chmod(ambient, 0o755)
+    return ambient
+
+
+def _write_managed(root, provider, label="c"):
+    managed = root / "managed"
+    revision = managed / f"{label}-rev1"
+    revision.mkdir(parents=True, exist_ok=True)
+    (managed / "state.json").write_text(json.dumps([{"label": label, "revision": "rev1", "provider": provider}]))
+    (revision / "bundle.json").write_text(json.dumps({"provider": provider}))
+    return managed
+
+
+@contextlib.contextmanager
+def scrubbed_agent_hub_host_imports():
+    """Snapshot sys.path and evict cached agent_hub_host modules around a probe call."""
+    saved_path = list(sys.path)
+    saved_mods = {k: sys.modules.pop(k) for k in list(sys.modules)
+                  if k == "agent_hub_host" or k.startswith("agent_hub_host.")}
+    try:
+        yield
+    finally:
+        sys.path[:] = saved_path
+        for k in [k for k in sys.modules if k == "agent_hub_host" or k.startswith("agent_hub_host.")]:
+            sys.modules.pop(k, None)
+        sys.modules.update(saved_mods)
 
 
 class HubHostPathProbeTests(unittest.TestCase):
-    """Hub intake 798f0f8c: the native probe is importable only via AGENT_HUB_HOST_PATH."""
+    """Hub intake 86254a30: probes import only from a validated AGENT_HUB_HOST_PATH.
+
+    Every test drives the real import machinery — nothing mocks importlib,
+    _hub_host_module or the probe modules. Only os.getuid is simulated, in the
+    foreign-owner case that cannot be arranged unprivileged.
+    """
+
+    def _probe(self, tmp_p, provider="claude", **kwargs):
+        from launcher.admission import fetch_managed_quse
+        managed = _write_managed(tmp_p, provider)
+        return fetch_managed_quse("c", provider=provider, managed_dir=managed, **kwargs)
+
+    def _origin_under(self, result, provider, host):
+        origin = os.path.realpath(result[provider]["details"]["origin"])
+        return origin.startswith(os.path.realpath(str(host)))
 
     def test_managed_claude_probe_imports_from_trusted_host_path(self):
-        import json, os, sys, tempfile
-        from pathlib import Path
-        from launcher.admission import fetch_managed_quse
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
-            pkg = tmp_p / "host" / "agent_hub_host"
-            pkg.mkdir(parents=True)
-            (pkg / "__init__.py").write_text("")
-            (pkg / "native_claude_quota.py").write_text(
-                "def probe(bundle, dest, requested_model=None):\n"
-                "    return {'claude': {'status': 'ok', 'details': {'source': 'native_claude_oauth_usage', 'model': requested_model}, 'windows': {}}}\n")
-            managed = tmp_p / "managed"
-            (managed / "c-rev1").mkdir(parents=True)
-            (managed / "state.json").write_text(json.dumps([{"label": "c", "revision": "rev1", "provider": "claude"}]))
-            (managed / "c-rev1" / "bundle.json").write_text(json.dumps({"provider": "claude"}))
-            saved_path = list(sys.path)
-            saved_mods = {k: sys.modules.pop(k) for k in list(sys.modules) if k == "agent_hub_host" or k.startswith("agent_hub_host.")}
-            try:
-                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(tmp_p / "host")}):
-                    res = fetch_managed_quse("c", provider="claude", requested_model="opus", managed_dir=managed)
-            finally:
-                sys.path[:] = saved_path
-                for k in [k for k in sys.modules if k == "agent_hub_host" or k.startswith("agent_hub_host.")]:
-                    sys.modules.pop(k)
-                sys.modules.update(saved_mods)
+            host = _write_probe_host(tmp_p)
+            with scrubbed_agent_hub_host_imports():
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                    res = self._probe(tmp_p, requested_model="opus")
+                    # AC2: the scoped import leaves no process-wide sys.path entry.
+                    self.assertNotIn(str(host), sys.path)
+                    self.assertNotIn(os.path.realpath(str(host)), [os.path.realpath(str(p)) for p in sys.path])
+                    # AC2: a cached probe module is re-verified against the path.
+                    res2 = self._probe(tmp_p, requested_model="sonnet")
             self.assertEqual(res["claude"]["status"], "ok")
             self.assertEqual(res["claude"]["details"]["source"], "native_claude_oauth_usage")
             self.assertEqual(res["claude"]["details"]["model"], "opus")
+            self.assertTrue(self._origin_under(res, "claude", host))
+            self.assertEqual(res2["claude"]["status"], "ok")
+            self.assertEqual(res2["claude"]["details"]["model"], "sonnet")
+            self.assertTrue(self._origin_under(res2, "claude", host))
+
+    def test_managed_google_probe_imports_from_trusted_host_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            host = _write_probe_host(tmp_p)
+            with scrubbed_agent_hub_host_imports():
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                    res = self._probe(tmp_p, provider="gemini", requested_model="gemini-2.5-pro")
+                    self.assertNotIn(str(host), sys.path)
+            self.assertEqual(res["gemini"]["status"], "ok")
+            self.assertEqual(res["gemini"]["details"]["source"], "native_google_code_assist")
+            self.assertEqual(res["gemini"]["details"]["model"], "gemini-2.5-pro")
+            self.assertTrue(self._origin_under(res, "gemini", host))
+
+    def test_missing_env_fails_closed_without_ambient_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            ambient = _write_ambient_host(tmp_p)
+            with scrubbed_agent_hub_host_imports():
+                # An ambient agent_hub_host on sys.path must not satisfy the probe.
+                sys.path.insert(0, str(ambient))
+                with patch.dict(os.environ):
+                    os.environ.pop("AGENT_HUB_HOST_PATH", None)
+                    res = self._probe(tmp_p)
+            self.assertEqual(res["claude"]["status"], "held")
+            self.assertIn("quota unverified", res["claude"]["reason"])
+            self.assertIn("AGENT_HUB_HOST_PATH", res["claude"]["reason"])
+            self.assertNotEqual(res["claude"].get("details", {}).get("source"), "ambient_decoy")
+
+    def test_broken_env_paths_fail_closed_without_ambient_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            ambient = _write_ambient_host(tmp_p)
+            plain_file = tmp_p / "not-a-dir"
+            plain_file.write_text("")
+            empty_dir = tmp_p / "empty"
+            empty_dir.mkdir()
+            cases = (
+                ("missing directory", str(tmp_p / "gone")),
+                ("relative path", "relative/host"),
+                ("file instead of directory", str(plain_file)),
+                ("directory without the package", str(empty_dir)),
+            )
+            for name, value in cases:
+                with self.subTest(case=name):
+                    with scrubbed_agent_hub_host_imports():
+                        sys.path.insert(0, str(ambient))
+                        with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": value}):
+                            res = self._probe(tmp_p)
+                    self.assertEqual(res["claude"]["status"], "held")
+                    self.assertIn("quota unverified", res["claude"]["reason"])
+                    self.assertIn("AGENT_HUB_HOST_PATH", res["claude"]["reason"])
+                    self.assertNotEqual(res["claude"].get("details", {}).get("source"), "ambient_decoy")
+
+    def test_group_or_world_writable_host_path_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            for mode, label in ((0o757, "world-writable"), (0o730, "group-writable")):
+                with self.subTest(mode=label):
+                    host = _write_probe_host(tmp_p, name=f"host-{oct(mode)}")
+                    os.chmod(host, mode)
+                    with scrubbed_agent_hub_host_imports():
+                        with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                            res = self._probe(tmp_p)
+                    self.assertEqual(res["claude"]["status"], "held")
+                    self.assertIn("group/world-writable", res["claude"]["reason"])
+
+    def test_writable_package_dir_fails_closed(self):
+        import os as _os
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            host = _write_probe_host(tmp_p)
+            _os.chmod(host / "agent_hub_host", 0o777)
+            with scrubbed_agent_hub_host_imports():
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                    res = self._probe(tmp_p)
+            self.assertEqual(res["claude"]["status"], "held")
+            self.assertIn("group/world-writable", res["claude"]["reason"])
+
+    def test_foreign_owned_host_path_fails_closed(self):
+        # Another user's directory cannot be arranged unprivileged; the uid
+        # comparison is simulated, the import machinery stays real.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            host = _write_probe_host(tmp_p)
+            foreign_uid = os.getuid() + 1
+            with scrubbed_agent_hub_host_imports():
+                with patch("os.getuid", return_value=foreign_uid):
+                    with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                        res = self._probe(tmp_p)
+            self.assertEqual(res["claude"]["status"], "held")
+            self.assertIn("owned by uid", res["claude"]["reason"])
+
+    def test_ambient_sys_path_entry_not_used_when_env_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            host = _write_probe_host(tmp_p)
+            ambient = _write_ambient_host(tmp_p)
+            with scrubbed_agent_hub_host_imports():
+                # Ambient entry sits ahead of the trusted path.
+                sys.path.insert(0, str(ambient))
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                    res = self._probe(tmp_p, requested_model="opus")
+            self.assertEqual(res["claude"]["status"], "ok")
+            self.assertEqual(res["claude"]["details"]["source"], "native_claude_oauth_usage")
+            self.assertTrue(self._origin_under(res, "claude", host))
+            self.assertNotEqual(res["claude"].get("details", {}).get("source"), "ambient_decoy")
+
+    def test_cached_module_from_foreign_path_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            host = _write_probe_host(tmp_p)
+            ambient = _write_ambient_host(tmp_p)
+            with scrubbed_agent_hub_host_imports():
+                # Really import the decoy first so agent_hub_host sits in
+                # sys.modules from an untrusted path.
+                sys.path.insert(0, str(ambient))
+                importlib.import_module("agent_hub_host.native_claude_quota")
+                sys.path.remove(str(ambient))
+                with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
+                    res = self._probe(tmp_p)
+            self.assertEqual(res["claude"]["status"], "held")
+            self.assertIn("does not come from the validated host path", res["claude"]["reason"])
