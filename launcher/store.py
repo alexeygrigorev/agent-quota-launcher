@@ -186,6 +186,9 @@ def get_host_registry_conn():
 # (never started) the lease is dropped so stale rows cannot block launches.
 STALE_QUEUED_DISK_LEASE_S = 6 * 3600
 
+# Unbound uncertain launches get the same six-hour grace as queued launches.
+STALE_UNCERTAIN_RETIRE_S = STALE_QUEUED_DISK_LEASE_S
+
 class StateTransitionError(ValueError):
     pass
 
@@ -1030,6 +1033,60 @@ class Store:
                 return False
         return True
 
+    def stale_uncertain_launch_absent(self, task_id, payload):
+        """Conservative local proof of an abandoned, never-bound Hub launch.
+
+        Require the Hub workspace to be removed, no saved spawn artifact,
+        no native session in that exact workspace, and no active controller.
+        An existing workspace or any failed/ambiguous probe keeps the row.
+        No remote credentials or state mutations are used by this probe.
+        """
+        cwd = payload.get("cwd")
+        if not task_id.startswith("hub-") or payload.get("owner") != "hub-fleet":
+            return False
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return False
+        root = Path(cwd)
+        try:
+            root.stat()
+            return False  # a launch into an existing workspace may still proceed
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        # Includes the launcher record: a partial/malformed record is uncertain,
+        # never proof that spawn did not happen. Check dangling symlinks too.
+        for directory in (root / ".local", Path(self.db_path).parent):
+            for name in (f"launch-{task_id}-start.json", f"launch-{task_id}.json",
+                         f"first-action-{task_id}.json"):
+                try:
+                    (directory / name).lstat()
+                    return False
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return False
+        try:
+            result = subprocess.run(
+                ["aplexer", "status", "--workspace", cwd,
+                 "--tag", run_tag_for(task_id), "--json"],
+                capture_output=True, text=True, timeout=15)
+            # Only the CLI's explicit absence error proves absence. A successful
+            # status (even terminal) or transport failure needs exact binding.
+            if result.returncode != 1 or result.stderr.strip() != "a: no matching session":
+                return False
+            safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in task_id)
+            for prefix in ("agent-task-", "ql-ctl-"):
+                unit = subprocess.run(
+                    ["systemctl", "--user", "is-active", f"{prefix}{safe}.service"],
+                    capture_output=True, text=True, timeout=5)
+                if unit.returncode not in (3, 4) or unit.stdout.strip() not in (
+                        "inactive", "failed", "unknown"):
+                    return False
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return True
+
     def resource_breakdown(self, exclude_task_id=None, *, dry_run=False,
                            reconciliation=None, ramp_reserve_mb=512,
                            estimate_percentile=90, ramp_seconds=180,
@@ -1039,7 +1096,8 @@ class Store:
         Each row is {task_id, state, reserve_mb, disk_mb, basis, allowance_mb}
         where basis is one of: queued-estimate, queued-stale,
         queued-stale-retired, start-ramp, resident-settled, full-unknown,
-        stale-unproven, retired-stale-unproven, stale-start, settled-dead.
+        stale-unproven, retired-stale-unproven, stale-start, settled-dead,
+        retired-stale-uncertain.
         ``allowance_mb`` is the recorded bookkeeping cap (task_resources
         .memory_mb), NOT what admission subtracts; ``reserve_mb`` is the
         per-row admission hold. Queued tasks hold no RAM before starting
@@ -1055,7 +1113,10 @@ class Store:
         rows whose native session is definitively absent (no matching live
         session, no retired tombstone) past STALE_UNPROVEN_RETIRE_S
         transition running -> completed-awaiting-review/failed by result
-        evidence. Retirements are state changes with a recorded reason; no
+        evidence. Unbound Hub launch-uncertain rows past STALE_UNCERTAIN_RETIRE_S
+        retire only with a removed workspace, no spawn artifacts/native session,
+        and inactive controllers; ambiguous probes keep the row.
+        Retirements are state changes with a recorded reason; no
         rows, bindings or payloads are ever deleted. dry_run reports the
         would-be retirements in ``reconciliation`` without transitioning.
         """
@@ -1162,6 +1223,31 @@ class Store:
                     binding = self.recover_binding_from_artifacts(task_id, payload)
                 except Exception:
                     binding = None
+
+            uncertain_age = (self._task_age_seconds(task_id)
+                             if state == "launch-uncertain" and not binding else None)
+            if (state == "launch-uncertain" and not binding
+                    and age_s is not None and age_s > STALE_UNCERTAIN_RETIRE_S
+                    and uncertain_age is not None and uncertain_age > STALE_UNCERTAIN_RETIRE_S
+                    and self.stale_uncertain_launch_absent(task_id, payload)):
+                reason = ("stale launch-uncertain retired: Hub workspace absent; "
+                          "no native binding, native session, spawn artifact or active "
+                          "controller; row kept for audit")
+                if reconciliation is not None:
+                    reconciliation.append({"task_id": task_id, "previous_state": state,
+                                           "action": "retired-stale-uncertain",
+                                           "reason": reason, "memory_mb": allowance,
+                                           "disk_mb": 0})
+                if not dry_run:
+                    try:
+                        self.transition_task(task_id, "failed", (state,), reason=reason,
+                                             reviewer="resource-reconciler")
+                    except StateTransitionError:
+                        pass
+                rows_out.append({"task_id": task_id, "state": state,
+                                 "reserve_mb": 0, "disk_mb": 0,
+                                 "basis": "retired-stale-uncertain"})
+                continue
 
             if binding:
                 live_info = {}

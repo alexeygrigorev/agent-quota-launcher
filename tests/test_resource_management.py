@@ -1244,3 +1244,94 @@ class ReconcileAbsentSessionCliTests(unittest.TestCase):
         self.assertEqual(self.store.get_task("t1")["state"], "running")
 
 
+
+
+class RetireStaleUncertainTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        fencing = patch.dict(os.environ, {"LAUNCHER_HOST_FENCING_DIR": str(self.root / "fencing")})
+        fencing.start()
+        self.addCleanup(fencing.stop)
+        self.store = Store(str(self.root / "state.db"))
+        self.task_id = "hub-uncertain"
+        self.cwd = self.root / "removed-workspace"
+        self.store.submit_task(self.task_id, "uncertain-key", {
+            "goal": "g", "owner": "hub-fleet", "cwd": str(self.cwd), "timeout": 60}, [])
+        self.store.transition_task(self.task_id, "launch-uncertain", ("queued",))
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE tasks SET created_at=datetime('now','-8 hours'), "
+                         "updated_at=datetime('now','-8 hours') WHERE id=?", (self.task_id,))
+
+    def probe(self, argv, **kwargs):
+        import subprocess
+        if argv[0] == "aplexer":
+            self.assertEqual(argv, ["aplexer", "status", "--workspace", str(self.cwd),
+                                    "--tag", "task-" + self.task_id, "--json"])
+            return subprocess.CompletedProcess(argv, 1, "", "a: no matching session\n")
+        return subprocess.CompletedProcess(argv, 3, "inactive\n", "")
+
+    def scan(self, **kwargs):
+        with patch("launcher.store.subprocess.run", side_effect=self.probe):
+            return self.store.resource_breakdown(**kwargs)
+
+    def test_abandoned_uncertain_retires_with_reason_no_delete_and_readonly_preview(self):
+        changes = []
+        rows = self.scan(dry_run=True, reconciliation=changes)
+        self.assertEqual(rows[0]["basis"], "retired-stale-uncertain")
+        self.assertEqual((rows[0]["reserve_mb"], rows[0]["disk_mb"]), (0, 0))
+        self.assertEqual(changes[0]["previous_state"], "launch-uncertain")
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+        self.scan()
+        task = {t["id"]: t for t in self.store.list_tasks()}[self.task_id]
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["reviewer"], "resource-reconciler")
+        self.assertIn("Hub workspace absent", task["reason"])
+
+    def test_existing_workspace_keeps_uncertain_launch(self):
+        self.cwd.mkdir()
+        self.assertEqual(self.scan()[0]["basis"], "stale-start")
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+
+    def test_spawn_record_even_malformed_keeps_uncertain_launch(self):
+        (self.root / f"launch-{self.task_id}.json").write_text("{")
+        self.assertEqual(self.scan()[0]["basis"], "stale-start")
+
+    def test_young_or_recently_updated_row_is_kept(self):
+        for field in ("created_at", "updated_at"):
+            with self.subTest(field=field):
+                with self.store.get_conn() as conn:
+                    conn.execute(f"UPDATE tasks SET {field}=datetime('now') WHERE id=?", (self.task_id,))
+                self.assertNotEqual(self.scan()[0]["basis"], "retired-stale-uncertain")
+                with self.store.get_conn() as conn:
+                    conn.execute(f"UPDATE tasks SET {field}=datetime('now','-8 hours') WHERE id=?", (self.task_id,))
+
+    def test_native_alive_terminal_and_uncertain_errors_are_kept(self):
+        import subprocess
+        for result in (subprocess.CompletedProcess([], 0, '{"phase":"running"}', ''),
+                       subprocess.CompletedProcess([], 0, '{"phase":"exiting"}', ''),
+                       subprocess.CompletedProcess([], 1, '', 'transport failure'),
+                       subprocess.CompletedProcess([], 1, '', 'stale socket'),
+                       subprocess.TimeoutExpired([], 15)):
+            with self.subTest(result=result):
+                with patch("launcher.store.subprocess.run", side_effect=[result]):
+                    self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+                self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+
+    def test_active_or_unknown_controller_is_kept(self):
+        import subprocess
+        for unit in (subprocess.CompletedProcess([], 0, 'active', ''),
+                     subprocess.CompletedProcess([], 1, '', 'cannot connect bus')):
+            with self.subTest(unit=unit):
+                with patch("launcher.store.subprocess.run", side_effect=[self.probe(
+                        ["aplexer", "status", "--workspace", str(self.cwd),
+                         "--tag", "task-" + self.task_id, "--json"]), unit]):
+                    self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+
+    def test_bound_live_session_is_kept(self):
+        binding = RetireStaleUnprovenTests.BINDING
+        with patch.object(Store, "get_native_binding", return_value=binding), \
+                patch("launcher.store.probe_native_lifecycle", return_value=("alive", "running")):
+            self.assertEqual(self.scan()[0]["basis"], "resident-settled")
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
