@@ -336,6 +336,14 @@ def build_managed_profile_argv(provider, goal, label, model=None, managed_dir=No
     elif provider == "claude":
         m = model or "sonnet"
         return cmd + ["--dangerously-skip-permissions", "--model", str(m), "-p", str(goal)]
+    elif provider == "antigravity":
+        # Same non-interactive contract as the unmanaged antigravity adapter,
+        # run through Hub's managed wrapper (isolated HOME, Hub-central token;
+        # no GEMINI/GOOGLE API keys reach the child). Hub intake 454f3476.
+        from launcher.admission import ADAPTER_MODELS
+        m = model or ADAPTER_MODELS["antigravity"]
+        return cmd + ["--model", str(m), "--effort", "high", "--dangerously-skip-permissions",
+                      "--print-timeout", "0", "--output-format", "stream-json", "-p", str(goal)]
     else:
         raise ValueError(f"Provider {provider!r} is not supported for managed headless execution")
 
