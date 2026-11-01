@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import subprocess
@@ -18,6 +19,11 @@ from tests.pinned_runtime import pinned_runtime_present, requires_host_runtime
 PAYLOAD = {"goal": "write report", "owner": "head-x", "cwd": ".",
            "timeout": 600,
            "model_requirements": {"providers": ["zai"], "models": ["glm-5.3-flash"]}}
+
+
+# Quota fixtures need a reset that is always in the future: a fixed
+# 2026-11-01 reset turned these tests red at the month rollover.
+FUTURE_RESET = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
 class TestFirstActionValidator(unittest.TestCase):
     def setUp(self):
@@ -758,7 +764,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         (managed_dir / "state.json").write_text(json.dumps([{"label": "acc1", "revision": "rev1", "provider": "zai"}]))
 
         captured_env = {}
-        fake_quse_out = json.dumps({"zai": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}}}})
+        fake_quse_out = json.dumps({"zai": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": FUTURE_RESET}}}})
 
         def fake_subprocess_run(cmd, env=None, **kwargs):
             captured_env.update(env or {})
@@ -803,7 +809,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
         ]))
 
         envs = {}
-        fake_quse_out = json.dumps({"codex": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}}}})
+        fake_quse_out = json.dumps({"codex": {"status": "ok", "windows": {"weekly": {"percent_remaining": 80.0, "reset_at": FUTURE_RESET}}}})
 
         def fake_subprocess_run(cmd, env=None, **kwargs):
             h = env.get("HOME", "")
@@ -847,7 +853,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
             "go": {
                 "status": "ok",
                 "windows": {
-                    "monthly": {"percent_remaining": 80.0, "reset_at": "2026-11-01T00:00:00+00:00"}
+                    "monthly": {"percent_remaining": 80.0, "reset_at": FUTURE_RESET}
                 }
             }
         }
@@ -969,7 +975,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
                 "go": {
                     "status": "ok",
                     "windows": {
-                        "monthly": {"percent_remaining": perc, "reset_at": "2026-11-01T00:00:00+00:00"}
+                        "monthly": {"percent_remaining": perc, "reset_at": FUTURE_RESET}
                     }
                 }
             }
@@ -998,7 +1004,7 @@ class TestDoRunWaitLoop(unittest.TestCase):
                 "go": {
                     "status": "ok",
                     "windows": {
-                        "monthly": {"percent_remaining": perc, "reset_at": "2026-11-01T00:00:00+00:00"}
+                        "monthly": {"percent_remaining": perc, "reset_at": FUTURE_RESET}
                     }
                 }
             }
