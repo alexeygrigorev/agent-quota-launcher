@@ -158,6 +158,11 @@ def get_host_registry_conn():
         conn.close()
 
 
+
+# Queued launcher tasks keep their disk lease while fresh; after this bound
+# (never started) the lease is dropped so stale rows cannot block launches.
+STALE_QUEUED_DISK_LEASE_S = 6 * 3600
+
 class StateTransitionError(ValueError):
     pass
 
@@ -993,7 +998,8 @@ class Store:
         with self.get_conn() as conn:
             placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
             query = f"""
-                SELECT t.id, tr.memory_mb, tr.disk_mb, t.payload, t.state
+                SELECT t.id, tr.memory_mb, tr.disk_mb, t.payload, t.state,
+                       CAST((julianday('now') - julianday(t.created_at)) * 86400 AS INTEGER)
                 FROM task_resources tr
                 JOIN tasks t ON t.id = tr.task_id
                 WHERE t.state IN ({placeholders})
@@ -1008,7 +1014,7 @@ class Store:
         # Connection is CLOSED before performing recovery writes or probes
         # to prevent SQLite deadlocks.
         for row in rows:
-            task_id, mem, disk, raw_payload, state = row
+            task_id, mem, disk, raw_payload, state, age_s = row
             allowance = mem or 0
             payload = None
             if isinstance(raw_payload, str):
@@ -1031,6 +1037,15 @@ class Store:
             if state == "queued":
                 # Queued tasks hold no RAM before starting: only active
                 # starting ramps gate placement (Hub headroom contract).
+                if age_s is not None and age_s > STALE_QUEUED_DISK_LEASE_S:
+                    # A queued task that never started within the bound is
+                    # stale: its disk lease must not keep blocking every new
+                    # launch on the disk floor (intake 0a34b9ea). The row is
+                    # left for reconcile to retire; only the lease is dropped.
+                    rows_out.append({"task_id": task_id, "state": state,
+                                     "reserve_mb": 0, "disk_mb": 0,
+                                     "basis": "queued-stale"})
+                    continue
                 rows_out.append({"task_id": task_id, "state": state,
                                  "reserve_mb": 0, "disk_mb": disk or 0,
                                  "basis": "queued-estimate"})

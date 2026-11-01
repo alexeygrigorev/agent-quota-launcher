@@ -467,6 +467,24 @@ class StoreRampTests(unittest.TestCase):
         self.assertEqual(by_id["t2"]["reserve_mb"], 1125)
         self.assertEqual(by_id["t2"]["basis"], "start-ramp")
 
+    def test_stale_queued_task_drops_its_disk_lease(self):
+        # Fresh queued tasks keep their disk lease; a queued task older than
+        # STALE_QUEUED_DISK_LEASE_S (never started) holds no disk (0a34b9ea).
+        from launcher import store as store_mod
+        self.submit("fresh")
+        self.submit("stale")
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE tasks SET created_at = datetime('now', ?) WHERE id = ?",
+                         (f"-{store_mod.STALE_QUEUED_DISK_LEASE_S + 60} seconds", "stale"))
+        by_id = {r["task_id"]: r for r in self.store.resource_breakdown()}
+        self.assertEqual(by_id["fresh"]["basis"], "queued-estimate")
+        self.assertGreater(by_id["fresh"]["disk_mb"], 0)
+        self.assertEqual(by_id["stale"]["basis"], "queued-stale")
+        self.assertEqual(by_id["stale"]["disk_mb"], 0)
+        self.assertEqual(by_id["stale"]["reserve_mb"], 0)
+        mem, disk = self.store.get_active_resources()
+        self.assertEqual((mem, disk), (0, by_id["fresh"]["disk_mb"]))
+
     def test_empty_samples_falls_back_to_ramp_default(self):
         self.assertIsNone(self.store.memory_samples_p90())
         self.submit("t1")
