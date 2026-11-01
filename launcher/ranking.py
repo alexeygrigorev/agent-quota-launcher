@@ -28,11 +28,21 @@ def reset_multiplier(remaining_fraction, hours_to_reset):
 
 
 def calculate_weight(task_fit, health, remaining_fraction, hours_to_reset, promo_multiplier,
-                     provider=None):
+                     provider=None, hub_authorized=False):
     """Returns (weight, reason). weight 0.0 means not selectable; the reason
-    says whether that is unknown evidence, exhaustion or a computed 0."""
+    says whether that is unknown evidence, exhaustion or a computed 0.
+
+    hub_authorized: a managed route admitted by Hub's fresh verdict carries no
+    local quota (remaining/reset stay None, never invented) and is weighted by
+    task fit and health only."""
     if task_fit is None or health is None:
         return 0.0, "unknown task_fit/health (no fabricated 1.0)"
+    if hub_authorized:
+        if remaining_fraction is not None or hours_to_reset is not None:
+            return 0.0, "hub-authorized route must not carry local quota"
+        if task_fit <= 0 or health <= 0:
+            return 0.0, "task fit or health is zero"
+        return task_fit * health, "hub_admission_authorized"
     if remaining_fraction is None or not math.isfinite(remaining_fraction) or remaining_fraction <= 0:
         return 0.0, "no known remaining quota"
     if task_fit <= 0 or health <= 0:
@@ -72,6 +82,7 @@ def select_candidate(candidates, seed=None):
             c.get("hours_to_reset"),
             c.get("promo_multiplier", 1.0),
             provider=c.get("provider"),
+            hub_authorized=c.get("hub_authorized") is True,
         )
         entries.append({
             "name": c.get("name"),

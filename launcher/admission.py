@@ -11,6 +11,7 @@ remaining does not prove those routes. GLM models never route to opencode
 (enforced in launcher.launch.build_adapter_argv).
 """
 import json
+import re
 import math
 import os
 import subprocess
@@ -314,6 +315,61 @@ def _hub_host_module(name):
                 sys.path.remove(hub_path)
 
 
+HUB_ADMISSION_SOURCE = "hub_admission"
+HUB_ADMISSION_MAX_AGE_S = 30.0
+HUB_ADMISSION_MAX_FUTURE_S = 5.0
+_HUB_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _hub_admission_held(reason, details=None):
+    return {"gemini": {"status": "held", "error": reason,
+                       "details": dict(details or {}, source=HUB_ADMISSION_SOURCE), "windows": {}}}
+
+
+def fetch_hub_admission_route(account_label, requested_model=None, request=None, now=None):
+    """Managed Antigravity admission from Hub's own verdict (Hub intake 454f3476).
+
+    Hub holds managed Antigravity quota and credential state; probing it
+    locally runs `agy -p /quota`, which opens OAuth browser tabs (agent-hub
+    09e74d4). The managed path therefore never runs quse/agy: it asks Hub
+    through the validated host package (no environment bypass) for a fresh
+    verdict and preserves every refusal, stale or missing evidence as a held
+    route.
+    """
+    from launcher.launch import HubHostPathUntrusted
+
+    details = {"account_label": account_label, "model": requested_model}
+    if not requested_model or requested_model not in ADAPTER_SUPPORTED_MODELS.get("antigravity", ()):
+        return _hub_admission_held("hub_admission_model_unsupported", details)
+    try:
+        if request is None:
+            request = _hub_host_module("native_admission").hub_request
+        verdict = request("POST", "/api/engines/admission", {"label": account_label})
+    except HubHostPathUntrusted as e:
+        return _hub_admission_held("hub_admission_host_untrusted", dict(details, detail=str(e)[:200]))
+    except Exception:
+        return _hub_admission_held("hub_admission_unavailable", details)
+    if not isinstance(verdict, dict) or verdict.get("account_label") != account_label:
+        return _hub_admission_held("hub_admission_account_mismatch", details)
+    raw_at = verdict.get("observed_at")
+    observed = parse_iso(raw_at) if isinstance(raw_at, str) else None
+    if observed is None:
+        return _hub_admission_held("hub_admission_timestamp_missing", details)
+    details["observed_at"] = raw_at
+    age = ((now or datetime.now(timezone.utc)) - observed).total_seconds()
+    if not -HUB_ADMISSION_MAX_FUTURE_S <= age <= HUB_ADMISSION_MAX_AGE_S:
+        return _hub_admission_held("hub_admission_stale", details)
+    warning = verdict.get("quota_warning")
+    if isinstance(warning, str) and _HUB_REASON_RE.fullmatch(warning):
+        details["quota_warning"] = warning
+    if verdict.get("launch_allowed") is not True or verdict.get("profile_supported") is not True:
+        reason = verdict.get("reason")
+        slug = reason if isinstance(reason, str) and _HUB_REASON_RE.fullmatch(reason) else "refused"
+        return _hub_admission_held("hub_admission_" + slug, details)
+    return {"gemini": {"status": "ok", "error": None, "windows": {},
+                       "details": dict(details, source=HUB_ADMISSION_SOURCE, limit_reached=False)}}
+
+
 def fetch_managed_quse(account_label, provider=None, requested_model=None, config_dir=None, managed_dir=None):
     """Fetch fresh quota context for a named centrally managed account."""
     if managed_dir:
@@ -373,6 +429,10 @@ def fetch_managed_quse(account_label, provider=None, requested_model=None, confi
             return {"gemini": {"status": "held", "reason": str(e), "windows": {}}}
         except Exception:
             return {"gemini": {"status": "held", "reason": "native_google_probe_failed", "windows": {}}}
+
+    if prov == "antigravity":
+        # Never quse/agy for a managed Antigravity account (OAuth tab loop).
+        return fetch_hub_admission_route(account_label, requested_model=requested_model)
 
     if prov == "claude":
         from launcher.launch import HubHostPathUntrusted
@@ -559,6 +619,47 @@ def _validate_route(name, route, now, task_requirements, check_capacity=False, c
         requested_model = (task_requirements or {}).get("model")
         if requested_model and details.get("model") and details.get("model") != requested_model:
             return None, f"Managed Claude model mismatch: observed {details.get('model')} != requested {requested_model}"
+
+    if provider == "antigravity":
+        is_managed = isinstance(task_requirements, dict) and bool(
+            task_requirements.get("is_managed")
+            and task_requirements.get("account_label")
+            and task_requirements.get("account_profile") == f"hub-{task_requirements.get('account_label')}"
+            and task_requirements.get("managed_dir")
+        )
+        details = route.get("details") if isinstance(route.get("details"), dict) else {}
+        if details.get("source") == HUB_ADMISSION_SOURCE and not is_managed:
+            return None, "Hub admission evidence is valid only for a managed Antigravity profile"
+        if is_managed:
+            # Managed Antigravity is admitted by Hub's fresh verdict alone; it has
+            # no local quota windows and is never ranked on invented quota.
+            if details.get("source") != HUB_ADMISSION_SOURCE:
+                return None, "Managed Antigravity route requires hub_admission evidence"
+            if details.get("account_label") != task_requirements.get("account_label"):
+                return None, "Managed Antigravity Hub verdict account mismatch"
+            requested_model = task_requirements.get("model")
+            models = task_requirements.get("models")
+            if not requested_model and isinstance(models, (list, tuple)) and len(models) == 1:
+                requested_model = models[0]
+            if not isinstance(requested_model, str) or not requested_model or details.get("model") != requested_model:
+                return None, ("Managed Antigravity model mismatch: verdict "
+                              f"{details.get('model')} != requested {requested_model}")
+            if route.get("error"):
+                return None, f"Error: {route.get('error')}"
+            if route.get("status") != "ok" or details.get("limit_reached"):
+                return None, f"Status not ok: {route.get('status')}"
+            task_fit, model = _eval_task_fit(provider, task_requirements)
+            return {
+                "name": name,
+                "provider": provider,
+                "model": model,
+                "health": 1.0,
+                "remaining_fraction": None,
+                "hours_to_reset": None,
+                "task_fit": task_fit,
+                "promo_multiplier": PROMO_MULTIPLIER,
+                "hub_authorized": True,
+            }, None
 
     if provider not in ADAPTER_ROUTES:
         return None, "Unsupported route explicitly blocked"
