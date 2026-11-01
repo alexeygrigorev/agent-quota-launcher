@@ -8,11 +8,44 @@ from contextlib import contextmanager
 import re
 import time
 import math
+import uuid
+import stat
 
 from launcher.memory_accounting import resident_credit_mb
 from launcher.tags import run_tag_for
 from launcher.review_receipt import ReviewValidationError
 from launcher.native_lifecycle import validate_native_binding, probe_native_lifecycle
+
+
+def _decode_evidence_json(raw):
+    """Reject duplicate fields and non-JSON constants in safety evidence."""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate evidence key")
+            value[key] = item
+        return value
+
+    def invalid_constant(_):
+        raise ValueError("invalid evidence constant")
+
+    return json.loads(raw, object_pairs_hook=unique_object,
+                      parse_constant=invalid_constant)
+
+
+def _read_evidence_file(path):
+    """Bounded regular-file read without following the final symlink."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 65536:
+            raise ValueError("unsupported evidence file")
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("oversized evidence file")
+    return _decode_evidence_json(raw), raw
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1033,59 +1066,277 @@ class Store:
                 return False
         return True
 
-    def stale_uncertain_launch_absent(self, task_id, payload):
-        """Conservative local proof of an abandoned, never-bound Hub launch.
+    @staticmethod
+    def _native_census_absent(task_id):
+        """Require a successful complete native census, including tombstones.
 
-        Require the Hub workspace to be removed, no saved spawn artifact,
-        no native session in that exact workspace, and no active controller.
-        An existing workspace or any failed/ambiguous probe keeps the row.
-        No remote credentials or state mutations are used by this probe.
+        Workspace-scoped status cannot prove this when an ancestor is missing:
+        aplexer then returns ENOENT before consulting its session registry.
+        Global exact-tag absence covers both Hub tag spellings and every
+        workspace; malformed or partial evidence keeps the reservation.
         """
-        cwd = payload.get("cwd")
-        if not task_id.startswith("hub-") or payload.get("owner") != "hub-fleet":
-            return False
-        if not isinstance(cwd, str) or not os.path.isabs(cwd):
-            return False
-        root = Path(cwd)
         try:
-            root.stat()
-            return False  # a launch into an existing workspace may still proceed
+            result = subprocess.run(
+                ["aplexer", "list", "--all", "--json"],
+                capture_output=True, text=True, timeout=15)
+            if (result.returncode != 0 or result.stderr.strip()
+                    or len(result.stdout) > 16 * 1024 * 1024):
+                return False
+            census = _decode_evidence_json(result.stdout)
+            if not isinstance(census, list):
+                return False
+            seen_ids = set()
+            tags = set()
+            for session in census:
+                if not isinstance(session, dict):
+                    return False
+                native_id = session.get("id")
+                if not isinstance(native_id, str) or str(uuid.UUID(native_id)) != native_id:
+                    return False
+                if native_id in seen_ids:
+                    return False
+                seen_ids.add(native_id)
+                if type(session.get("schema_version")) is not int or session["schema_version"] != 1:
+                    return False
+                if not isinstance(session.get("tag"), str):
+                    return False
+                if not isinstance(session.get("workspace"), str) or not os.path.isabs(session["workspace"]):
+                    return False
+                if session.get("state") not in ("running", "exiting", "exited"):
+                    return False
+                if session.get("phase") not in ("starting", "running", "exiting", "exited"):
+                    return False
+                if session.get("warning") is not None:
+                    return False
+                tags.add(session["tag"])
+            return not tags.intersection((task_id, run_tag_for(task_id)))
+        except (ValueError, TypeError, OSError, subprocess.SubprocessError):
+            return False
+
+    def _uncertain_fleet_record(self, task_id, payload):
+        """Read positive host-journal evidence for this exact fleet launch.
+
+        Maintained Hub layout: launcher/state.db and journal/fleet-launches
+        are siblings under the host runtime directory. Missing/unsupported
+        journals keep the row. A not_started record alone is never death proof.
+        """
+        if not isinstance(payload, dict) or payload.get("owner") != "hub-fleet":
+            return None
+        if not isinstance(task_id, str) or not task_id.startswith("hub-"):
+            return None
+        launch_id = task_id[4:]
+        try:
+            if str(uuid.UUID(launch_id)) != launch_id:
+                return None
+            cwd = payload.get("cwd")
+            if not isinstance(cwd, str) or not os.path.isabs(cwd):
+                return None
+            journal_dir = Path(self.db_path).parent.parent / "journal" / "fleet-launches"
+            # Do not follow a journal directory/file replaced with a symlink.
+            if journal_dir.resolve(strict=True) != journal_dir:
+                return None
+            path = journal_dir / f"{launch_id}.json"
+            record, raw = _read_evidence_file(path)
+            if not isinstance(record, dict):
+                return None
+            if (record.get("offer_id") != launch_id or record.get("task_id") != task_id
+                    or record.get("mode") != "headless"
+                    or record.get("state") != "not_started"
+                    or record.get("reason") != "launcher_command_failed"
+                    or type(record.get("settled")) is not bool):
+                return None
+            for key in ("native_id", "tag", "native_tag", "session_id", "native_session_id"):
+                if record.get(key):
+                    return None
+            target = record.get("target_cwd")
+            workspace = record.get("workspace")
+            if not isinstance(target, str) or not os.path.isabs(target):
+                return None
+            if not isinstance(workspace, str) or not os.path.isabs(workspace):
+                return None
+            if Path(target).resolve() != Path(cwd).resolve():
+                return None
+            # Preserve exact bytes too: a concurrent journal rewrite invalidates
+            # the first observation even when its decoded fields are identical.
+            return record, raw
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+            return None
+
+    @staticmethod
+    def _failed_scope_start_record(path, task_id, fleet):
+        """Allow only the recorded, correlated pre-receipt scope-start failure.
+
+        This artifact is supporting evidence, never native death proof. All
+        successful/ambiguous receipts, partial records and mismatched journal
+        diagnostics keep the row; native censuses/controllers are still required.
+        """
+        try:
+            record, _ = _read_evidence_file(path)
+            if not isinstance(record, dict):
+                return False
+            native_fields = ("wrapper_start_json", "session_id", "observed_tag", "model_verified",
+                             "native_binding_error", "native_binding_unbound_reason",
+                             "first_action_path", "first_action_validated_at", "native_receipt",
+                             "native_status_at_deadline", "native_id", "native_session_id",
+                             "native_binding", "observed_workspace", "observed_engine")
+            if any(key in record for key in native_fields) or record.get("observed_model"):
+                return False
+            if (record.get("task_id") != task_id or record.get("tag") != run_tag_for(task_id)
+                    or record.get("outcome") != "launch-uncertain"
+                    or record.get("native_workspace_aliases") != [fleet["target_cwd"]]):
+                return False
+            failure = ("a: worker startup failed: spawn systemd-run workload scope; "
+                       "limits fail closed: No such file or directory (os error 2)")
+            stderr = record.get("aplexer_stderr")
+            if not isinstance(stderr, str) or stderr.strip() != failure:
+                return False
+            reason = "aplexer start rc=1: " + failure
+            if record.get("reason") != reason:
+                return False
+            diagnostic = fleet.get("diagnostic")
+            if (not isinstance(diagnostic, dict)
+                    or diagnostic.get("reason") != "launcher_command_failed"
+                    or diagnostic.get("stage") != "dispatch_headless"
+                    or diagnostic.get("tail") != reason
+                    or diagnostic.get("stderr_tail") != stderr.strip()):
+                return False
+            from datetime import datetime, timezone
+            stamp = datetime.fromisoformat(record["started_at"])
+            if stamp.tzinfo is None:
+                return False
+            age = (datetime.now(timezone.utc) - stamp).total_seconds()
+            return age > STALE_UNCERTAIN_RETIRE_S
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return False
+
+    def _uncertain_local_absent(self, task_id, payload, record):
+        root = Path(payload["cwd"])
+        try:
+            root.lstat()
+            return False  # Existing workspaces and dangling links keep the row.
         except FileNotFoundError:
             pass
         except OSError:
             return False
-        # Includes the launcher record: a partial/malformed record is uncertain,
-        # never proof that spawn did not happen. Check dangling symlinks too.
-        for directory in (root / ".local", Path(self.db_path).parent):
+        # Fleet can put native artifacts in its workspace, separate from cwd.
+        directories = {root / ".local", Path(record["workspace"]) / ".local",
+                       Path(self.db_path).parent}
+        for directory in directories:
+            try:
+                if directory.is_symlink() or directory.parent.is_symlink():
+                    return False
+            except OSError:
+                return False
             for name in (f"launch-{task_id}-start.json", f"launch-{task_id}.json",
                          f"first-action-{task_id}.json"):
                 try:
-                    (directory / name).lstat()
+                    artifact = directory / name
+                    artifact.lstat()
+                    if (name == f"launch-{task_id}.json"
+                            and directory == Path(record["workspace"]) / ".local"
+                            and self._failed_scope_start_record(artifact, task_id, record)):
+                        continue
                     return False
                 except FileNotFoundError:
                     pass
                 except OSError:
                     return False
+        return True
+
+    def stale_uncertain_launch_absent(self, task_id, payload):
+        """Positive exact fleet identity plus independent local absence proof.
+
+        A missing workspace, native ENOENT or remote 404/transport error never
+        establishes that a launch stopped. Unknown records and tombstones keep
+        the row. Final retirement repeats this proof while fencing launch/DB
+        writers, including same-state updates and late native bindings.
+        """
+        fleet = self._uncertain_fleet_record(task_id, payload)
+        if not fleet or not self._uncertain_local_absent(task_id, payload, fleet[0]):
+            return False
+        if not self._native_census_absent(task_id):
+            return False
         try:
-            result = subprocess.run(
-                ["aplexer", "status", "--workspace", cwd,
-                 "--tag", run_tag_for(task_id), "--json"],
-                capture_output=True, text=True, timeout=15)
-            # Only the CLI's explicit absence error proves absence. A successful
-            # status (even terminal) or transport failure needs exact binding.
-            if result.returncode != 1 or result.stderr.strip() != "a: no matching session":
-                return False
             safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in task_id)
             for prefix in ("agent-task-", "ql-ctl-"):
                 unit = subprocess.run(
                     ["systemctl", "--user", "is-active", f"{prefix}{safe}.service"],
                     capture_output=True, text=True, timeout=5)
                 if unit.returncode not in (3, 4) or unit.stdout.strip() not in (
-                        "inactive", "failed", "unknown"):
+                        "inactive", "failed", "unknown") or unit.stderr.strip():
                     return False
         except (OSError, subprocess.SubprocessError):
             return False
-        return True
+        return (self._uncertain_fleet_record(task_id, payload) == fleet
+                and self._uncertain_local_absent(task_id, payload, fleet[0]))
+
+    def _retire_stale_uncertain(self, task_id, payload, snapshot, *, dry_run):
+        """Nonblocking launch fence plus fresh exclusive row/binding checks."""
+        if not self.stale_uncertain_launch_absent(task_id, payload):
+            return None
+        fleet = self._uncertain_fleet_record(task_id, payload)
+        if not fleet:
+            return None
+        try:
+            import fcntl
+            lock_path = Path(self.db_path).parent / "launch.lock"
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as held:
+                # Admission may already own this lock. Skip rather than block
+                # or weaken the same exclusion that fences native spawn.
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with self.transaction() as conn:
+                        row = conn.execute(
+                            "SELECT t.payload, t.state, t.created_at, t.updated_at, "
+                            "tr.memory_mb, tr.disk_mb FROM tasks t JOIN task_resources tr "
+                            "ON tr.task_id=t.id WHERE t.id=?", (task_id,)).fetchone()
+                        if row != snapshot:
+                            return None
+                        ages = conn.execute(
+                            "SELECT (julianday('now')-julianday(created_at))*86400, "
+                            "(julianday('now')-julianday(updated_at))*86400, idempotency_key "
+                            "FROM tasks WHERE id=?", (task_id,)).fetchone()
+                        if (not ages or ages[2] != task_id
+                                or any(age is None or age <= STALE_UNCERTAIN_RETIRE_S
+                                       for age in ages[:2])):
+                            return None
+                        if conn.execute("SELECT 1 FROM task_native_bindings WHERE task_id=?",
+                                        (task_id,)).fetchone():
+                            return None
+                        if (self._uncertain_fleet_record(task_id, payload) != fleet
+                                or not self.stale_uncertain_launch_absent(task_id, payload)
+                                or self._uncertain_fleet_record(task_id, payload) != fleet):
+                            return None
+                        reason = ("stale launch-uncertain retired: exact Hub fleet journal "
+                                  "not_started; Hub workspace absent; complete native census "
+                                  "has no matching live session or tombstone; no native "
+                                  "binding, successful-start/first-action artifact or active "
+                                  "controller; failure records and row kept for audit")
+                        if not dry_run:
+                            evidence = False
+                            for (owned_path,) in conn.execute(
+                                    "SELECT path FROM task_paths WHERE task_id=?", (task_id,)):
+                                try:
+                                    path = Path(owned_path)
+                                    if path.is_file() and path.stat().st_size > 0:
+                                        evidence = True
+                                        break
+                                except OSError:
+                                    pass
+                            changed = conn.execute(
+                                "UPDATE tasks SET state=?, reason=?, reviewer=?, "
+                                "updated_at=CURRENT_TIMESTAMP WHERE id=? AND state=? "
+                                "AND NOT EXISTS (SELECT 1 FROM task_native_bindings WHERE task_id=?)",
+                                ("completed-awaiting-review" if evidence else "failed", reason,
+                                 "resource-reconciler", task_id, "launch-uncertain", task_id)).rowcount
+                            if changed != 1:
+                                return None
+                        return reason
+                finally:
+                    fcntl.flock(held, fcntl.LOCK_UN)
+        except (ImportError, OSError, sqlite3.Error):
+            return None
 
     def resource_breakdown(self, exclude_task_id=None, *, dry_run=False,
                            reconciliation=None, ramp_reserve_mb=512,
@@ -1114,8 +1365,10 @@ class Store:
         session, no retired tombstone) past STALE_UNPROVEN_RETIRE_S
         transition running -> completed-awaiting-review/failed by result
         evidence. Unbound Hub launch-uncertain rows past STALE_UNCERTAIN_RETIRE_S
-        retire only with a removed workspace, no spawn artifacts/native session,
-        and inactive controllers; ambiguous probes keep the row.
+        retire only with an exact positive not_started Hub fleet journal, removed
+        workspace, no successful-start/first-action artifacts or native sessions
+        (including tombstones), and inactive controllers, fenced by launch.lock and a fresh exclusive
+        row/binding check; ambiguous or contended probes keep the row.
         Retirements are state changes with a recorded reason; no
         rows, bindings or payloads are ever deleted. dry_run reports the
         would-be retirements in ``reconciliation`` without transitioning.
@@ -1137,7 +1390,8 @@ class Store:
             placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
             query = f"""
                 SELECT t.id, tr.memory_mb, tr.disk_mb, t.payload, t.state,
-                       CAST((julianday('now') - julianday(t.created_at)) * 86400 AS INTEGER)
+                       CAST((julianday('now') - julianday(t.created_at)) * 86400 AS INTEGER),
+                       t.created_at, t.updated_at
                 FROM task_resources tr
                 JOIN tasks t ON t.id = tr.task_id
                 WHERE t.state IN ({placeholders})
@@ -1152,7 +1406,7 @@ class Store:
         # Connection is CLOSED before performing recovery writes or probes
         # to prevent SQLite deadlocks.
         for row in rows:
-            task_id, mem, disk, raw_payload, state, age_s = row
+            task_id, mem, disk, raw_payload, state, age_s, created_at, updated_at = row
             allowance = mem or 0
             allowances[task_id] = allowance
             payload = None
@@ -1226,24 +1480,19 @@ class Store:
 
             uncertain_age = (self._task_age_seconds(task_id)
                              if state == "launch-uncertain" and not binding else None)
+            uncertain_reason = None
             if (state == "launch-uncertain" and not binding
                     and age_s is not None and age_s > STALE_UNCERTAIN_RETIRE_S
-                    and uncertain_age is not None and uncertain_age > STALE_UNCERTAIN_RETIRE_S
-                    and self.stale_uncertain_launch_absent(task_id, payload)):
-                reason = ("stale launch-uncertain retired: Hub workspace absent; "
-                          "no native binding, native session, spawn artifact or active "
-                          "controller; row kept for audit")
+                    and uncertain_age is not None and uncertain_age > STALE_UNCERTAIN_RETIRE_S):
+                uncertain_reason = self._retire_stale_uncertain(
+                    task_id, payload,
+                    (raw_payload, state, created_at, updated_at, mem, disk), dry_run=dry_run)
+            if uncertain_reason:
                 if reconciliation is not None:
                     reconciliation.append({"task_id": task_id, "previous_state": state,
                                            "action": "retired-stale-uncertain",
-                                           "reason": reason, "memory_mb": allowance,
+                                           "reason": uncertain_reason, "memory_mb": allowance,
                                            "disk_mb": 0})
-                if not dry_run:
-                    try:
-                        self.transition_task(task_id, "failed", (state,), reason=reason,
-                                             reviewer="resource-reconciler")
-                    except StateTransitionError:
-                        pass
                 rows_out.append({"task_id": task_id, "state": state,
                                  "reserve_mb": 0, "disk_mb": 0,
                                  "basis": "retired-stale-uncertain"})

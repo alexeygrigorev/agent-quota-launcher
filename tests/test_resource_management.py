@@ -1247,34 +1247,63 @@ class ReconcileAbsentSessionCliTests(unittest.TestCase):
 
 
 class RetireStaleUncertainTests(unittest.TestCase):
+    TASK_ID = "hub-11111111-2222-4333-8444-555555555555"
+
     def setUp(self):
+        LOCAL_TMP_DIR.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         fencing = patch.dict(os.environ, {"LAUNCHER_HOST_FENCING_DIR": str(self.root / "fencing")})
         fencing.start()
         self.addCleanup(fencing.stop)
-        self.store = Store(str(self.root / "state.db"))
-        self.task_id = "hub-uncertain"
-        self.cwd = self.root / "removed-workspace"
-        self.store.submit_task(self.task_id, "uncertain-key", {
+        self.store = Store(str(self.root / "launcher" / "state.db"))
+        self.task_id = self.TASK_ID
+        self.cwd = self.root / "missing-parent" / "removed-workspace"
+        self.fleet_workspace = self.root / "fleet-workspace"
+        (self.fleet_workspace / ".local").mkdir(parents=True)
+        self.journal = self.root / "journal" / "fleet-launches" / f"{self.task_id[4:]}.json"
+        self.journal.parent.mkdir(parents=True)
+        self.record = {"offer_id": self.task_id[4:], "task_id": self.task_id,
+                       "mode": "headless", "state": "not_started", "settled": False,
+                       "reason": "launcher_command_failed", "workspace": str(self.fleet_workspace),
+                       "target_cwd": str(self.cwd)}
+        self.write_journal()
+        self.store.submit_task(self.task_id, self.task_id, {
             "goal": "g", "owner": "hub-fleet", "cwd": str(self.cwd), "timeout": 60}, [])
         self.store.transition_task(self.task_id, "launch-uncertain", ("queued",))
         with self.store.get_conn() as conn:
             conn.execute("UPDATE tasks SET created_at=datetime('now','-8 hours'), "
                          "updated_at=datetime('now','-8 hours') WHERE id=?", (self.task_id,))
 
+    def write_journal(self):
+        self.journal.write_text(json.dumps(self.record))
+
     def probe(self, argv, **kwargs):
-        import subprocess
         if argv[0] == "aplexer":
-            self.assertEqual(argv, ["aplexer", "status", "--workspace", str(self.cwd),
-                                    "--tag", "task-" + self.task_id, "--json"])
-            return subprocess.CompletedProcess(argv, 1, "", "a: no matching session\n")
+            self.assertEqual(argv, ["aplexer", "list", "--all", "--json"])
+            self.assertEqual(kwargs["timeout"], 15)
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        self.assertIn(argv, (["systemctl", "--user", "is-active", f"{prefix}{self.task_id}.service"]
+                             for prefix in ("agent-task-", "ql-ctl-")))
         return subprocess.CompletedProcess(argv, 3, "inactive\n", "")
 
     def scan(self, **kwargs):
         with patch("launcher.store.subprocess.run", side_effect=self.probe):
             return self.store.resource_breakdown(**kwargs)
+
+    def assert_kept(self):
+        rows = self.scan()
+        self.assertNotEqual(rows[0]["basis"], "retired-stale-uncertain")
+        self.assertEqual(rows[0]["disk_mb"], 512)
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+
+    def census_session(self, tag, **updates):
+        row = {"schema_version": 1, "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+               "tag": tag, "workspace": "/some/other/workspace", "state": "running",
+               "phase": "running", "warning": None}
+        row.update(updates)
+        return row
 
     def test_abandoned_uncertain_retires_with_reason_no_delete_and_readonly_preview(self):
         changes = []
@@ -1287,47 +1316,261 @@ class RetireStaleUncertainTests(unittest.TestCase):
         task = {t["id"]: t for t in self.store.list_tasks()}[self.task_id]
         self.assertEqual(task["state"], "failed")
         self.assertEqual(task["reviewer"], "resource-reconciler")
-        self.assertIn("Hub workspace absent", task["reason"])
+        self.assertIn("exact Hub fleet journal not_started", task["reason"])
+        self.assertTrue(self.journal.exists())
 
-    def test_existing_workspace_keeps_uncertain_launch(self):
-        self.cwd.mkdir()
-        self.assertEqual(self.scan()[0]["basis"], "stale-start")
-        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+    def test_existing_workspace_and_dangling_workspace_link_keep_row(self):
+        self.cwd.mkdir(parents=True)
+        self.assert_kept()
+        self.cwd.rmdir()
+        self.cwd.symlink_to(self.root / "missing-link-target")
+        self.assert_kept()
 
-    def test_spawn_record_even_malformed_keeps_uncertain_launch(self):
-        (self.root / f"launch-{self.task_id}.json").write_text("{")
-        self.assertEqual(self.scan()[0]["basis"], "stale-start")
+    def test_any_spawn_artifact_in_either_workspace_or_launcher_keeps_row(self):
+        for directory in (self.cwd / ".local", self.fleet_workspace / ".local",
+                          Path(self.store.db_path).parent):
+            for name in (f"launch-{self.task_id}-start.json", f"launch-{self.task_id}.json",
+                         f"first-action-{self.task_id}.json"):
+                # A cwd artifact necessarily recreates cwd; other roots exercise
+                # the separate Hub/native workspace and launcher-config cases.
+                with self.subTest(directory=directory, name=name):
+                    directory.mkdir(parents=True, exist_ok=True)
+                    artifact = directory / name
+                    artifact.write_text("{")
+                    self.assert_kept()
+                    artifact.unlink()
+            if directory == self.cwd / ".local":
+                directory.rmdir()
+                self.cwd.rmdir()
 
-    def test_young_or_recently_updated_row_is_kept(self):
+    def failed_start_artifact(self):
+        from datetime import datetime, timedelta, timezone
+        failure = ("a: worker startup failed: spawn systemd-run workload scope; "
+                   "limits fail closed: No such file or directory (os error 2)")
+        artifact = {"task_id": self.task_id, "tag": "task-" + self.task_id,
+                    "outcome": "launch-uncertain", "aplexer_stderr": failure + "\n",
+                    "reason": "aplexer start rc=1: " + failure,
+                    "native_workspace_aliases": [str(self.cwd)],
+                    "started_at": (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()}
+        self.record["diagnostic"] = {"reason": "launcher_command_failed", "stage": "dispatch_headless",
+                                     "tail": artifact["reason"], "stderr_tail": failure}
+        self.write_journal()
+        path = self.fleet_workspace / ".local" / f"launch-{self.task_id}.json"
+        path.write_text(json.dumps(artifact))
+        return path, artifact
+
+    def test_correlated_failed_scope_start_artifact_is_preserved_and_can_retire(self):
+        path, artifact = self.failed_start_artifact()
+        self.assertEqual(self.scan()[0]["basis"], "retired-stale-uncertain")
+        self.assertEqual(json.loads(path.read_text()), artifact)
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "failed")
+
+    def test_failed_start_missing_identity_or_any_native_receipt_key_keeps_row(self):
+        path, original = self.failed_start_artifact()
+        for key in ("wrapper_start_json", "session_id", "observed_tag", "native_binding_error",
+                    "native_binding_unbound_reason", "first_action_path", "first_action_validated_at",
+                    "native_receipt", "native_status_at_deadline", "native_id", "model_verified"):
+            with self.subTest(key=key):
+                artifact = dict(original, **{key: None})
+                path.write_text(json.dumps(artifact))
+                self.assert_kept()
+        for key in ("task_id", "tag", "outcome", "native_workspace_aliases", "started_at",
+                    "reason", "aplexer_stderr"):
+            with self.subTest(missing_key=key):
+                artifact = original.copy()
+                artifact.pop(key)
+                path.write_text(json.dumps(artifact))
+                self.assert_kept()
+
+    def test_failed_start_needs_exact_journal_correlation_and_startup_error(self):
+        path, original = self.failed_start_artifact()
+        diagnostic = self.record["diagnostic"].copy()
+        for key in diagnostic:
+            with self.subTest(diagnostic=key):
+                self.record["diagnostic"] = dict(diagnostic, **{key: "mismatch"})
+                self.write_journal()
+                self.assert_kept()
+        self.record["diagnostic"] = diagnostic
+        self.write_journal()
+        for key, value in (("aplexer_stderr", "a: No such file or directory (os error 2)"),
+                           ("outcome", "completed"), ("native_workspace_aliases", ["/other"]),
+                           ("started_at", "2030-01-01T00:00:00+00:00"),
+                           ("started_at", "2000-01-01T00:00:00")):
+            with self.subTest(key=key, value=value):
+                path.write_text(json.dumps(dict(original, **{key: value})))
+                self.assert_kept()
+
+    def test_dangling_artifact_and_local_directory_symlinks_keep_row(self):
+        local = self.fleet_workspace / ".local"
+        artifact = local / f"launch-{self.task_id}.json"
+        artifact.symlink_to(self.root / "missing")
+        self.assert_kept()
+        artifact.unlink()
+        local.rmdir()
+        local.symlink_to(self.root / "missing")
+        self.assert_kept()
+
+    def test_missing_malformed_or_symlinked_journal_is_not_absence(self):
+        self.journal.unlink()
+        self.assert_kept()
+        self.journal.write_text("{")
+        self.assert_kept()
+        encoded = json.dumps(self.record)
+        self.journal.write_text('{"offer_id":"duplicate",' + encoded[1:])
+        self.assert_kept()
+        self.journal.unlink()
+        self.journal.symlink_to(self.root / "unknown-record")
+        self.assert_kept()
+
+    def test_exact_launch_identity_and_positive_not_started_evidence_required(self):
+        for key, value in (("offer_id", "00000000-0000-4000-8000-000000000000"),
+                           ("task_id", "hub-some-session-id"), ("mode", "interactive"),
+                           ("state", "running"), ("state", "unknown"),
+                           ("reason", "transport failure"), ("reason", "404"),
+                           ("target_cwd", "/other/workspace"), ("workspace", "relative"),
+                           ("settled", None), ("native_id", "native-session"),
+                           ("tag", "task-" + self.task_id)):
+            with self.subTest(key=key, value=value):
+                original = self.record.copy()
+                self.record[key] = value
+                self.write_journal()
+                self.assert_kept()
+                self.record = original
+        self.write_journal()
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE tasks SET idempotency_key='some-session-id' WHERE id=?", (self.task_id,))
+        self.assert_kept()
+
+    def test_full_canonical_fleet_uuid_required(self):
+        payload = self.store.get_task(self.task_id)["payload"]
+        for task_id in ("hub-uncertain", "hub-10e5e357", self.task_id.upper()):
+            with self.subTest(task_id=task_id):
+                with patch("launcher.store.subprocess.run") as probe:
+                    self.assertFalse(self.store.stale_uncertain_launch_absent(task_id, payload))
+                    probe.assert_not_called()
+
+    def test_young_recent_or_invalid_timestamps_keep_row(self):
         for field in ("created_at", "updated_at"):
-            with self.subTest(field=field):
-                with self.store.get_conn() as conn:
-                    conn.execute(f"UPDATE tasks SET {field}=datetime('now') WHERE id=?", (self.task_id,))
-                self.assertNotEqual(self.scan()[0]["basis"], "retired-stale-uncertain")
-                with self.store.get_conn() as conn:
-                    conn.execute(f"UPDATE tasks SET {field}=datetime('now','-8 hours') WHERE id=?", (self.task_id,))
+            for value in ("2030-01-01 00:00:00", "not-a-time", None):
+                with self.subTest(field=field, value=value):
+                    with self.store.get_conn() as conn:
+                        conn.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, self.task_id))
+                    self.assert_kept()
+                    with self.store.get_conn() as conn:
+                        conn.execute(f"UPDATE tasks SET {field}=datetime('now','-8 hours') WHERE id=?",
+                                     (self.task_id,))
 
-    def test_native_alive_terminal_and_uncertain_errors_are_kept(self):
-        import subprocess
-        for result in (subprocess.CompletedProcess([], 0, '{"phase":"running"}', ''),
-                       subprocess.CompletedProcess([], 0, '{"phase":"exiting"}', ''),
-                       subprocess.CompletedProcess([], 1, '', 'transport failure'),
-                       subprocess.CompletedProcess([], 1, '', 'stale socket'),
-                       subprocess.TimeoutExpired([], 15)):
+    def test_native_both_tag_spellings_and_tombstones_keep_row_in_any_workspace(self):
+        for tag in (self.task_id, "task-" + self.task_id):
+            for phase in ("running", "exiting", "exited"):
+                with self.subTest(tag=tag, phase=phase):
+                    data = [self.census_session(tag, state=phase, phase=phase)]
+                    with patch("launcher.store.subprocess.run", return_value=
+                               subprocess.CompletedProcess([], 0, json.dumps(data), "")):
+                        self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+                    self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+
+    def test_unrelated_valid_census_session_allows_positive_proof(self):
+        data = json.dumps([self.census_session("unrelated")])
+        def probe(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, data, "") if argv[0] == "aplexer" else self.probe(argv, **kwargs)
+        with patch("launcher.store.subprocess.run", side_effect=probe):
+            self.assertEqual(self.store.resource_breakdown()[0]["basis"], "retired-stale-uncertain")
+
+    def test_failed_partial_or_malformed_census_is_not_absence(self):
+        valid = self.census_session("unrelated")
+        malformed = ("{}", "null", '[null]', '[{}]', '{"sessions":[]}',
+                     json.dumps([dict(valid, id="bad")]),
+                     json.dumps([dict(valid, workspace="relative")]),
+                     json.dumps([dict(valid, phase="unknown")]),
+                     json.dumps([dict(valid, warning="partial census")]),
+                     json.dumps([dict(valid, schema_version=True)]),
+                     json.dumps([valid, valid]),
+                     '[{"id":"a","id":"b"}]', '[NaN]')
+        results = [subprocess.CompletedProcess([], 0, value, "") for value in malformed]
+        results += [subprocess.CompletedProcess([], 1, "", message) for message in
+                    ("a: No such file or directory (os error 2)", "a: no matching session",
+                     "transport failure", "404", "stale socket")]
+        results += [subprocess.CompletedProcess([], 0, "[]", "partial census"),
+                    subprocess.TimeoutExpired([], 15), OSError("unavailable")]
+        for result in results:
             with self.subTest(result=result):
                 with patch("launcher.store.subprocess.run", side_effect=[result]):
                     self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
                 self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
 
-    def test_active_or_unknown_controller_is_kept(self):
-        import subprocess
-        for unit in (subprocess.CompletedProcess([], 0, 'active', ''),
-                     subprocess.CompletedProcess([], 1, '', 'cannot connect bus')):
-            with self.subTest(unit=unit):
-                with patch("launcher.store.subprocess.run", side_effect=[self.probe(
-                        ["aplexer", "status", "--workspace", str(self.cwd),
-                         "--tag", "task-" + self.task_id, "--json"]), unit]):
-                    self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+    def test_active_unknown_or_unreachable_controller_keeps_row(self):
+        for unit in (subprocess.CompletedProcess([], 0, "active", ""),
+                     subprocess.CompletedProcess([], 1, "", "cannot connect bus"),
+                     subprocess.CompletedProcess([], 3, "inactive", "failed to query")):
+            for active_index in (1, 2):
+                with self.subTest(unit=unit, active_index=active_index):
+                    calls = 0
+                    def probe(argv, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        return unit if calls == active_index + 1 else self.probe(argv, **kwargs)
+                    with patch("launcher.store.subprocess.run", side_effect=probe):
+                        self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+
+    def test_second_census_observing_new_session_keeps_row(self):
+        censuses = 0
+        def probe(argv, **kwargs):
+            nonlocal censuses
+            if argv[0] == "aplexer":
+                censuses += 1
+                if censuses == 2:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([
+                        self.census_session(self.task_id)]), "")
+            return self.probe(argv, **kwargs)
+        with patch("launcher.store.subprocess.run", side_effect=probe):
+            self.assertEqual(self.store.resource_breakdown()[0]["basis"], "stale-start")
+        self.assertEqual(censuses, 2)
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "launch-uncertain")
+
+    def test_same_state_update_or_late_binding_invalidates_snapshot(self):
+        for mutation in ("timestamp", "payload", "binding"):
+            with self.subTest(mutation=mutation):
+                with self.store.get_conn() as conn:
+                    original = conn.execute("SELECT payload, updated_at FROM tasks WHERE id=?",
+                                            (self.task_id,)).fetchone()
+                real_probe = self.store.stale_uncertain_launch_absent
+                calls = 0
+                def raced(*args):
+                    nonlocal calls
+                    result = real_probe(*args)
+                    calls += 1
+                    if calls == 1:
+                        with self.store.get_conn() as conn:
+                            if mutation == "timestamp":
+                                conn.execute("UPDATE tasks SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                                             (self.task_id,))
+                            elif mutation == "payload":
+                                conn.execute("UPDATE tasks SET payload=payload || ' ' WHERE id=?", (self.task_id,))
+                            else:
+                                conn.execute("INSERT INTO task_native_bindings "
+                                    "(task_id,native_id,tag,workspace,engine,incarnation) VALUES (?,?,?,?,?,?)",
+                                    (self.task_id,"late-native","task-"+self.task_id,str(self.cwd),"codex",1))
+                    return result
+                with patch.object(self.store, "stale_uncertain_launch_absent", side_effect=raced):
+                    self.assert_kept()
+                with self.store.get_conn() as conn:
+                    conn.execute("UPDATE tasks SET payload=?,updated_at=? WHERE id=?", (*original,self.task_id))
+                    conn.execute("DELETE FROM task_native_bindings WHERE task_id=?", (self.task_id,))
+
+    def test_launch_lock_contention_including_nested_admission_is_nonblocking(self):
+        from launcher.store import launch_lock
+        with launch_lock(str(Path(self.store.db_path).parent / "launch.lock")):
+            self.assert_kept()
+        self.assertEqual(self.scan()[0]["basis"], "retired-stale-uncertain")
+
+    def test_result_evidence_moves_to_review_and_never_accepts(self):
+        result = self.root / "owned-result.txt"
+        result.write_text("existing result")
+        with self.store.get_conn() as conn:
+            conn.execute("INSERT INTO task_paths(task_id,path) VALUES (?,?)", (self.task_id,str(result)))
+        self.assertEqual(self.scan()[0]["basis"], "retired-stale-uncertain")
+        self.assertEqual(self.store.get_task(self.task_id)["state"], "completed-awaiting-review")
 
     def test_bound_live_session_is_kept(self):
         binding = RetireStaleUnprovenTests.BINDING
