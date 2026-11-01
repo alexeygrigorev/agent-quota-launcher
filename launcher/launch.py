@@ -263,15 +263,23 @@ def resolve_validated_hub_host_dir():
         raise HubHostPathUntrusted(
             f"quota unverified: AGENT_HUB_HOST_PATH does not resolve to a real directory: {env_path!r}"
         )
-    st = resolved.stat()
-    if st.st_uid not in (os.getuid(), 0):
-        raise HubHostPathUntrusted(
-            f"quota unverified: AGENT_HUB_HOST_PATH is owned by uid {st.st_uid}, not the current user: {resolved}"
-        )
-    if st.st_mode & 0o022:
-        raise HubHostPathUntrusted(
-            f"quota unverified: AGENT_HUB_HOST_PATH is group/world-writable: {resolved}"
-        )
+    if os.name == "nt":
+        # Windows has no uid/mode bits: the same owner/write bar is checked on
+        # the resolved directory's SID owner and DACL (Hub intake 86254a30 AC5).
+        from launcher import win_trust
+        reason = win_trust.check_trusted_directory(resolved, "AGENT_HUB_HOST_PATH")
+        if reason:
+            raise HubHostPathUntrusted(f"quota unverified: {reason}")
+    else:
+        st = resolved.stat()
+        if st.st_uid not in (os.getuid(), 0):
+            raise HubHostPathUntrusted(
+                f"quota unverified: AGENT_HUB_HOST_PATH is owned by uid {st.st_uid}, not the current user: {resolved}"
+            )
+        if st.st_mode & 0o022:
+            raise HubHostPathUntrusted(
+                f"quota unverified: AGENT_HUB_HOST_PATH is group/world-writable: {resolved}"
+            )
     package = resolved / "agent_hub_host"
     if not (package.is_dir() and (package / "__init__.py").is_file()):
         raise HubHostPathUntrusted(
@@ -279,6 +287,12 @@ def resolve_validated_hub_host_dir():
         )
     # The probe code lives in the package directory, so it meets the same bar
     # as the host path itself.
+    if os.name == "nt":
+        from launcher import win_trust
+        reason = win_trust.check_trusted_directory(package, "the agent_hub_host package")
+        if reason:
+            raise HubHostPathUntrusted(f"quota unverified: {reason}")
+        return str(resolved)
     pst = package.stat()
     if pst.st_uid not in (os.getuid(), 0):
         raise HubHostPathUntrusted(

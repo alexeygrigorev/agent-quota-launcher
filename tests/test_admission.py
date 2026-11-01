@@ -1094,6 +1094,15 @@ def scrubbed_agent_hub_host_imports():
         sys.modules.update(saved_mods)
 
 
+def _make_writable_by_others(path, grant):
+    """POSIX: chmod to `grant` (mode). Windows: add the icacls `grant` ACE."""
+    if os.name == "nt":
+        import subprocess as _sp
+        _sp.run(["icacls", str(path), "/grant", grant], check=True, capture_output=True)
+    else:
+        os.chmod(path, grant)
+
+
 class HubHostPathProbeTests(unittest.TestCase):
     """Hub intake 86254a30: probes import only from a validated AGENT_HUB_HOST_PATH.
 
@@ -1185,43 +1194,54 @@ class HubHostPathProbeTests(unittest.TestCase):
                     self.assertNotEqual(res["claude"].get("details", {}).get("source"), "ambient_decoy")
 
     def test_group_or_world_writable_host_path_fails_closed(self):
+        # POSIX: mode bits. Windows (86254a30 AC5): a write-class allow ACE for
+        # Everyone / Authenticated Users on the real DACL, granted with icacls.
+        cases = ((("*S-1-1-0:(OI)(CI)(W)", "world-writable"), ("*S-1-5-11:(OI)(CI)(M)", "group-writable"))
+                 if os.name == "nt" else ((0o757, "world-writable"), (0o730, "group-writable")))
+        expected = "writable by" if os.name == "nt" else "group/world-writable"
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
-            for mode, label in ((0o757, "world-writable"), (0o730, "group-writable")):
+            for index, (grant, label) in enumerate(cases):
                 with self.subTest(mode=label):
-                    host = _write_probe_host(tmp_p, name=f"host-{oct(mode)}")
-                    os.chmod(host, mode)
+                    host = _write_probe_host(tmp_p, name=f"host-{index}")
+                    _make_writable_by_others(host, grant)
                     with scrubbed_agent_hub_host_imports():
                         with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
                             res = self._probe(tmp_p)
                     self.assertEqual(res["claude"]["status"], "held")
-                    self.assertIn("group/world-writable", res["claude"]["reason"])
+                    self.assertIn(expected, res["claude"]["reason"])
 
     def test_writable_package_dir_fails_closed(self):
-        import os as _os
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
             host = _write_probe_host(tmp_p)
-            _os.chmod(host / "agent_hub_host", 0o777)
+            _make_writable_by_others(host / "agent_hub_host", "*S-1-1-0:(OI)(CI)(W)" if os.name == "nt" else 0o777)
             with scrubbed_agent_hub_host_imports():
                 with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
                     res = self._probe(tmp_p)
             self.assertEqual(res["claude"]["status"], "held")
-            self.assertIn("group/world-writable", res["claude"]["reason"])
+            self.assertIn("writable by" if os.name == "nt" else "group/world-writable", res["claude"]["reason"])
+            self.assertIn("agent_hub_host", res["claude"]["reason"])
 
     def test_foreign_owned_host_path_fails_closed(self):
-        # Another user's directory cannot be arranged unprivileged; the uid
-        # comparison is simulated, the import machinery stays real.
+        # Another user's directory cannot be arranged unprivileged; the current
+        # identity (POSIX uid, Windows user SID) is simulated, the import
+        # machinery and the real owner/DACL read stay real.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
             host = _write_probe_host(tmp_p)
-            foreign_uid = os.getuid() + 1
+            if os.name == "nt":
+                identity = patch("launcher.win_trust.current_user_sid", return_value="S-1-5-21-1-2-3-4242")
+                expected = "owned by S-1-5-21"
+            else:
+                identity = patch("os.getuid", return_value=os.getuid() + 1)
+                expected = "owned by uid"
             with scrubbed_agent_hub_host_imports():
-                with patch("os.getuid", return_value=foreign_uid):
+                with identity:
                     with patch.dict(os.environ, {"AGENT_HUB_HOST_PATH": str(host)}):
                         res = self._probe(tmp_p)
             self.assertEqual(res["claude"]["status"], "held")
-            self.assertIn("owned by uid", res["claude"]["reason"])
+            self.assertIn(expected, res["claude"]["reason"])
 
     def test_ambient_sys_path_entry_not_used_when_env_is_valid(self):
         with tempfile.TemporaryDirectory() as tmp:
