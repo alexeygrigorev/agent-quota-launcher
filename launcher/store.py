@@ -122,6 +122,29 @@ def _native_session_gone(detail):
     """True when the lifecycle probe says the native session is absent or exiting."""
     text = detail if isinstance(detail, str) else ""
     return "no matching session" in text or "terminal phase=" in text
+
+
+def _native_session_absent(detail):
+    """True when the probe definitively says the session no longer exists.
+
+    Stricter than _native_session_gone: requires aplexer to report no
+    matching session AND no retired tombstone to have matched. Exiting
+    terminal phases (processes may still be finishing) and every transient
+    probe failure (timeout, stale socket, transport, identity mismatch)
+    stay False, so reconciliation only retires on definitive evidence.
+    """
+    text = detail if isinstance(detail, str) else ""
+    return ("no matching session" in text
+            and "no matching retired tombstone" in text)
+
+
+# Intake 0a34b9ea: a running row whose native session is provably absent
+# (aplexer has no matching session and no retired tombstone) stays stale-
+# unproven for this long before reconcile retires it. No Hub headless run
+# is bounded this long, so no live owner can exist; the extra hour over
+# STALE_START_SECONDS keeps retirement strictly slower than lease release.
+STALE_UNPROVEN_RETIRE_S = 6 * STALE_START_SECONDS
+
 # States that hold path/evidence leases (through completed-awaiting-review).
 LEASED_STATES = ("queued", "starting", "launch-uncertain", "stalled",
                  "running", "completed-awaiting-review")
@@ -967,21 +990,74 @@ class Store:
         import time as _time
         return max(0.0, _time.time() - dt.timestamp())
 
+    def task_result_evidence(self, task_id):
+        """True when at least one owned path holds a non-empty file."""
+        for path in self.get_task_paths(task_id):
+            try:
+                if Path(path).is_file() and Path(path).stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def stale_queued_launch_absent(self, task_id, payload):
+        """Evidence that a queued task's Hub launch is terminal or absent.
+
+        The payload workspace is gone (the owning session ended), or no
+        spawn artifact exists in it, mirroring hub-fleet's settle_unstarted
+        never-crossed-spawn proof. A start record or first-action artifact
+        means a launch was attempted, so the row is kept for its owner.
+        Unresolvable evidence keeps the row (fail closed).
+        """
+        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        if not isinstance(cwd, str) or not cwd.strip():
+            return True  # nothing to launch into
+        try:
+            root = Path(cwd).resolve(strict=True)
+        except OSError:
+            return True  # workspace removed: the launch is over
+        if not root.is_dir():
+            return True
+        local = root / ".local"
+        if local.is_symlink():
+            return False  # cannot prove absence; keep the row
+        for name in (f"launch-{task_id}-start.json", f"first-action-{task_id}.json"):
+            artifact = local / name
+            try:
+                if artifact.exists() or artifact.is_symlink():
+                    return False  # a spawn record exists: not absent
+            except OSError:
+                return False
+        return True
+
     def resource_breakdown(self, exclude_task_id=None, *, dry_run=False,
                            reconciliation=None, ramp_reserve_mb=512,
                            estimate_percentile=90, ramp_seconds=180,
                            estimate_multiplier=1.25):
         """Per-task reservation rows under the placement policy.
 
-        Each row is {task_id, state, reserve_mb, basis} where basis is one
-        of: queued-estimate, start-ramp, resident-settled, full-unknown,
-        settled-dead. Queued tasks hold no RAM before starting (reserve 0;
-        the gate only counts active starting ramps). Live residents with an
-        exact measurement past the ramp window hold no additional RAM (their
-        usage is already inside MemAvailable); young ones hold the measured
-        estimate minus proven current usage, mirroring the Hub headroom
-        credit. Unknown measurements hold the full allowance (fail
-        closed). Dead tasks settle (dry_run only reports them).
+        Each row is {task_id, state, reserve_mb, disk_mb, basis, allowance_mb}
+        where basis is one of: queued-estimate, queued-stale,
+        queued-stale-retired, start-ramp, resident-settled, full-unknown,
+        stale-unproven, retired-stale-unproven, stale-start, settled-dead.
+        ``allowance_mb`` is the recorded bookkeeping cap (task_resources
+        .memory_mb), NOT what admission subtracts; ``reserve_mb`` is the
+        per-row admission hold. Queued tasks hold no RAM before starting
+        (reserve 0; the gate only counts active starting ramps). Live
+        residents with an exact measurement past the ramp window hold no
+        additional RAM (their usage is already inside MemAvailable); young
+        ones hold the measured estimate minus proven current usage, mirroring
+        the Hub headroom credit. Unknown measurements hold the full allowance
+        (fail closed). Dead tasks settle (dry_run only reports them).
+        Stale rows whose launch is provably over are retired by reconcile
+        (intake 0a34b9ea): queued rows past STALE_QUEUED_DISK_LEASE_S with a
+        terminal/absent Hub launch transition queued -> failed, and running
+        rows whose native session is definitively absent (no matching live
+        session, no retired tombstone) past STALE_UNPROVEN_RETIRE_S
+        transition running -> completed-awaiting-review/failed by result
+        evidence. Retirements are state changes with a recorded reason; no
+        rows, bindings or payloads are ever deleted. dry_run reports the
+        would-be retirements in ``reconciliation`` without transitioning.
         """
         from launcher.resource_policy import resolve_memory_estimate_mb
         if type(ramp_reserve_mb) is not int or ramp_reserve_mb <= 0:
@@ -995,6 +1071,7 @@ class Store:
                        "estimate_multiplier": estimate_multiplier}
         measured = self.memory_samples_p90(estimate_percentile)
         rows_out = []
+        allowances = {}
         with self.get_conn() as conn:
             placeholders = ",".join("?" for _ in RESOURCE_HOLDING_STATES)
             query = f"""
@@ -1016,6 +1093,7 @@ class Store:
         for row in rows:
             task_id, mem, disk, raw_payload, state, age_s = row
             allowance = mem or 0
+            allowances[task_id] = allowance
             payload = None
             if isinstance(raw_payload, str):
                 try:
@@ -1038,10 +1116,37 @@ class Store:
                 # Queued tasks hold no RAM before starting: only active
                 # starting ramps gate placement (Hub headroom contract).
                 if age_s is not None and age_s > STALE_QUEUED_DISK_LEASE_S:
-                    # A queued task that never started within the bound is
-                    # stale: its disk lease must not keep blocking every new
-                    # launch on the disk floor (intake 0a34b9ea). The row is
-                    # left for reconcile to retire; only the lease is dropped.
+                    if self.stale_queued_launch_absent(task_id, payload):
+                        # Intake 0a34b9ea: the queued task outlived the lease
+                        # bound and its Hub launch is terminal or absent (no
+                        # native binding, no spawn artifact, workspace gone
+                        # or launch-free). Reconcile retires it with a state
+                        # change and reason; the row and its payload are kept
+                        # for audit, never deleted.
+                        reason = (f"stale queued retired: no Hub launch within "
+                                  f"{STALE_QUEUED_DISK_LEASE_S}s (terminal or "
+                                  "absent: no native binding, no spawn artifact)")
+                        if reconciliation is not None:
+                            reconciliation.append({"task_id": task_id,
+                                                   "previous_state": state,
+                                                   "action": "retired-stale-queued",
+                                                   "reason": reason,
+                                                   "memory_mb": allowance,
+                                                   "disk_mb": 0})
+                        if not dry_run:
+                            try:
+                                self.transition_task(task_id, "failed", ("queued",),
+                                                     reason=reason,
+                                                     reviewer="resource-reconciler")
+                            except StateTransitionError:
+                                pass  # A concurrent lifecycle writer owns the newer state.
+                        rows_out.append({"task_id": task_id, "state": state,
+                                         "reserve_mb": 0, "disk_mb": 0,
+                                         "basis": "queued-stale-retired"})
+                        continue
+                    # Stale, but a spawn record exists: a launch was attempted,
+                    # so the row stays queued for its owner. Its disk lease
+                    # stays dropped (9abe134).
                     rows_out.append({"task_id": task_id, "state": state,
                                      "reserve_mb": 0, "disk_mb": 0,
                                      "basis": "queued-stale"})
@@ -1068,12 +1173,7 @@ class Store:
                         reconciliation.append({"task_id": task_id, "native_id": binding["native_id"],
                                                "previous_state": state, "native_status": status, "memory_mb": allowance})
                     if not dry_run:
-                        evidence = False
-                        for path in self.get_task_paths(task_id):
-                            try:
-                                evidence |= Path(path).is_file() and Path(path).stat().st_size > 0
-                            except OSError:
-                                pass
+                        evidence = self.task_result_evidence(task_id)
                         try:
                             self.transition_task(task_id, "completed-awaiting-review" if evidence else "failed", (state,),
                                 reason="resource reconciliation: confirmed native exit; no acceptance inferred",
@@ -1113,9 +1213,47 @@ class Store:
                         # 11 vanished workers (~19 GiB) and refused every
                         # start. Transient probe errors (timeout, identity
                         # mismatch) still fail closed.
-                        rows_out.append({"task_id": task_id, "state": state,
-                                         "reserve_mb": 0, "disk_mb": disk or 0,
-                                         "basis": "stale-unproven"})
+                        if (state == "running" and age >= STALE_UNPROVEN_RETIRE_S
+                                and _native_session_absent(detail)):
+                            # Intake 0a34b9ea: the running row's native session
+                            # is definitively gone and it stayed stale-unproven
+                            # past the retire bound, so no owner can exist.
+                            # Reconcile retires the row with a state change and
+                            # reason; the row, binding and payload are kept
+                            # (no deletes). Exiting terminal phases and every
+                            # transient probe failure never reach this branch.
+                            reason = ("stale-unproven row retired: native session "
+                                      "absent (no matching live session, no retired "
+                                      "tombstone); row kept for audit")
+                            if reconciliation is not None:
+                                reconciliation.append({"task_id": task_id,
+                                                       "native_id": binding["native_id"],
+                                                       "previous_state": state,
+                                                       "action": "retired-stale-unproven",
+                                                       "reason": reason,
+                                                       "memory_mb": allowance,
+                                                       "disk_mb": 0})
+                            if not dry_run:
+                                evidence = self.task_result_evidence(task_id)
+                                try:
+                                    self.transition_task(
+                                        task_id,
+                                        "completed-awaiting-review" if evidence else "failed",
+                                        (state,),
+                                        reason=("resource reconciliation: native session "
+                                                "absent; "
+                                                + ("result evidence preserved"
+                                                   if evidence else "no result evidence")),
+                                        reviewer="resource-reconciler")
+                                except StateTransitionError:
+                                    pass  # A concurrent lifecycle writer owns the newer state.
+                            rows_out.append({"task_id": task_id, "state": state,
+                                             "reserve_mb": 0, "disk_mb": 0,
+                                             "basis": "retired-stale-unproven"})
+                        else:
+                            rows_out.append({"task_id": task_id, "state": state,
+                                             "reserve_mb": 0, "disk_mb": disk or 0,
+                                             "basis": "stale-unproven"})
                     elif status == "alive" and credit > 0 and age is not None:
                         self._record_resident_sample(task_id, binding, credit, dry_run)
                         rows_out.append({"task_id": task_id, "state": state,
@@ -1170,6 +1308,12 @@ class Store:
                     rows_out.append({"task_id": task_id, "state": state,
                                      "reserve_mb": allowance, "disk_mb": disk or 0,
                                      "basis": "full-unknown"})
+
+        # Intake 0a34b9ea: report the recorded bookkeeping allowance next to
+        # the admission hold on every row, so the resource-status aggregate
+        # of allowances is never confused with what admission subtracts.
+        for entry in rows_out:
+            entry["allowance_mb"] = allowances.get(entry["task_id"], 0)
 
         return rows_out
 

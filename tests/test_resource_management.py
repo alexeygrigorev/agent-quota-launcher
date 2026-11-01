@@ -13,6 +13,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from launcher.resource_policy import (
@@ -470,6 +471,8 @@ class StoreRampTests(unittest.TestCase):
     def test_stale_queued_task_drops_its_disk_lease(self):
         # Fresh queued tasks keep their disk lease; a queued task older than
         # STALE_QUEUED_DISK_LEASE_S (never started) holds no disk (0a34b9ea).
+        # With no spawn record its Hub launch is terminal/absent, so the
+        # reconcile pass also retires the row (queued -> failed).
         from launcher import store as store_mod
         self.submit("fresh")
         self.submit("stale")
@@ -479,9 +482,14 @@ class StoreRampTests(unittest.TestCase):
         by_id = {r["task_id"]: r for r in self.store.resource_breakdown()}
         self.assertEqual(by_id["fresh"]["basis"], "queued-estimate")
         self.assertGreater(by_id["fresh"]["disk_mb"], 0)
-        self.assertEqual(by_id["stale"]["basis"], "queued-stale")
+        self.assertEqual(by_id["stale"]["basis"], "queued-stale-retired")
         self.assertEqual(by_id["stale"]["disk_mb"], 0)
         self.assertEqual(by_id["stale"]["reserve_mb"], 0)
+        stale = {t["id"]: t for t in self.store.list_tasks()}["stale"]
+        self.assertEqual(stale["state"], "failed")
+        self.assertIn("stale queued retired", stale["reason"])
+        self.assertEqual(stale["reviewer"], "resource-reconciler")
+        self.assertIsNotNone(self.store.get_task("stale"))  # kept, never deleted
         mem, disk = self.store.get_active_resources()
         self.assertEqual((mem, disk), (0, by_id["fresh"]["disk_mb"]))
 
@@ -761,6 +769,35 @@ class ResourceStatusTests(unittest.TestCase):
         self.assertIsNone(doc["reason"])
         self.assertTrue(doc["cpu"]["allowed"])
 
+    def test_reports_admission_and_allowance_aggregates(self):
+        # Intake 0a34b9ea: the recorded-allowance aggregate (224,536 MB in
+        # the field) must never be confusable with what admission subtracts.
+        # resource-status reports both, with per-row parts and notes.
+        from launcher.store import Store as _Store
+        store = _Store(str(self.cfg / "state.db"))
+        store.submit_task("t1", "k1", {"goal": "g", "owner": "hub-fleet",
+                                       "cwd": str(self.cfg), "timeout": 60}, [])
+        doc = self.status()
+        self.assertEqual(doc["reservation_mem_mb"], 1500)
+        self.assertEqual(doc["allowance_mem_mb"], doc["reservation_mem_mb"])
+        # Queued rows hold no RAM: the admission aggregate differs from the
+        # bookkeeping aggregate, and the per-row rows show why.
+        self.assertEqual(doc["admission_mem_mb"], doc["active_mem_mb"])
+        self.assertEqual(doc["admission_disk_mb"], doc["active_disk_mb"])
+        self.assertEqual(doc["admission_mem_mb"],
+                         sum(r["reserve_mb"] for r in doc["breakdown"]))
+        self.assertEqual(doc["admission_disk_mb"],
+                         sum(r["disk_mb"] for r in doc["breakdown"]))
+        self.assertEqual(doc["admission_mem_mb"], 0)
+        self.assertEqual(doc["admission_disk_mb"], 512)
+        row = doc["breakdown"][0]
+        self.assertEqual(row["allowance_mb"], 1500)
+        self.assertEqual(row["reserve_mb"], 0)
+        for key in ("reservation_mem_mb", "allowance_mem_mb",
+                    "admission_mem_mb", "admission_disk_mb",
+                    "estimate_vs_reservation"):
+            self.assertIn(key, doc["field_notes"], key)
+
     def test_tight_host_reports_launcher_memory_reserve(self):
         import json as _json
         from launcher.cli import resource_status
@@ -908,13 +945,302 @@ class VanishedWorkerReservationTests(unittest.TestCase):
             return self.store.resource_breakdown()[0]
 
     def test_vanished_session_past_ramp_releases(self):
-        for detail in ("aplexer status rc=1 (a: no matching session); no matching retired tombstone",
-                       "terminal phase=exiting but containment_empty is not explicitly True (got False)"):
-            row = self._row(detail, 9999)
-            self.assertEqual((row["basis"], row["reserve_mb"]), ("stale-unproven", 0))
+        # Definitively absent sessions past the retire bound retire the row
+        # (0a34b9ea); exiting terminal phases only release the reservation.
+        row = self._row("aplexer status rc=1 (a: no matching session); no matching retired tombstone",
+                        9999)
+        self.assertEqual((row["basis"], row["reserve_mb"]), ("retired-stale-unproven", 0))
+        self.assertEqual(self.store.get_task("t1")["state"], "failed")
+
+    def test_exiting_terminal_phase_releases_without_retiring(self):
+        row = self._row("terminal phase=exiting but containment_empty is not explicitly True (got False)",
+                        9999)
+        self.assertEqual((row["basis"], row["reserve_mb"]), ("stale-unproven", 0))
+        self.assertEqual(self.store.get_task("t1")["state"], "running")
 
     def test_young_or_transient_probe_failures_stay_reserved(self):
         gone = "aplexer status rc=1 (a: no matching session); no matching retired tombstone"
         self.assertEqual(self._row(gone, 30)["reserve_mb"], 1500)
         for detail in ("aplexer status timed out after 15.0s", "aplexer status error: boom"):
             self.assertEqual(self._row(detail, 9999)["reserve_mb"], 1500)
+
+
+GONE_SESSION_DETAIL = ("aplexer status rc=1 (a: no matching session); "
+                       "no matching retired tombstone")
+EXITING_SESSION_DETAIL = ("terminal phase=exiting but containment_empty "
+                          "is not explicitly True (got False)")
+
+
+class StaleQueuedRetireTests(unittest.TestCase):
+    """Intake 0a34b9ea: queued rows past the lease bound whose Hub launch is
+    terminal or absent are retired by reconcile (state change with reason,
+    no deletes). Rows with a spawn record stay queued for their owner."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        patcher = patch.dict(os.environ,
+                             {"LAUNCHER_HOST_FENCING_DIR": str(self.root / "fencing")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = Store(str(self.root / "state.db"))
+
+    def submit(self, task_id="t1", cwd=None):
+        payload = {"goal": "g", "owner": "hub-fleet", "timeout": 60,
+                   "cwd": cwd if cwd is not None else str(self.root / "gone-wt")}
+        self.store.submit_task(task_id, f"key-{task_id}", payload, [])
+        return payload
+
+    def backdate(self, task_id, seconds):
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE tasks SET created_at = datetime('now', ?) WHERE id = ?",
+                         (f"-{int(seconds)} seconds", task_id))
+
+    def test_stale_queued_with_gone_workspace_retires(self):
+        from launcher import store as store_mod
+        self.submit("t1", cwd=str(self.root / "removed-wt"))
+        self.backdate("t1", store_mod.STALE_QUEUED_DISK_LEASE_S + 60)
+        changes = []
+        rows = self.store.resource_breakdown(dry_run=True, reconciliation=changes)
+        row = rows[0]
+        self.assertEqual(row["basis"], "queued-stale-retired")
+        self.assertEqual((row["reserve_mb"], row["disk_mb"]), (0, 0))
+        self.assertEqual(row["allowance_mb"], 1500)
+        self.assertEqual(changes[0]["action"], "retired-stale-queued")
+        self.assertEqual(changes[0]["previous_state"], "queued")
+        self.assertIn("stale queued retired", changes[0]["reason"])
+        # dry_run reports the retirement without performing it.
+        self.assertEqual(self.store.get_task("t1")["state"], "queued")
+        # Non-dry-run performs the state change and keeps the row.
+        self.store.resource_breakdown()
+        tasks = {t["id"]: t for t in self.store.list_tasks()}
+        task = tasks["t1"]
+        self.assertIsNotNone(self.store.get_task("t1"))
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["reviewer"], "resource-reconciler")
+        self.assertIn("stale queued retired", task["reason"])
+        self.assertIn("terminal or absent", task["reason"])
+
+    def test_stale_queued_existing_workspace_without_spawn_records_retires(self):
+        from launcher import store as store_mod
+        self.submit("t1", cwd=str(self.root))  # exists, no spawn records
+        self.backdate("t1", store_mod.STALE_QUEUED_DISK_LEASE_S + 60)
+        rows = self.store.resource_breakdown()
+        self.assertEqual(rows[0]["basis"], "queued-stale-retired")
+        self.assertEqual(self.store.get_task("t1")["state"], "failed")
+
+    def test_stale_queued_with_spawn_record_is_kept_queued(self):
+        from launcher import store as store_mod
+        self.submit("t1", cwd=str(self.root))
+        local = self.root / ".local"
+        local.mkdir(parents=True)
+        (local / "launch-t1-start.json").write_text("{}")
+        self.backdate("t1", store_mod.STALE_QUEUED_DISK_LEASE_S + 60)
+        changes = []
+        rows = self.store.resource_breakdown(reconciliation=changes)
+        self.assertEqual(rows[0]["basis"], "queued-stale")
+        self.assertEqual((rows[0]["reserve_mb"], rows[0]["disk_mb"]), (0, 0))
+        self.assertEqual(changes, [])
+        self.assertEqual(self.store.get_task("t1")["state"], "queued")
+
+    def test_fresh_queued_keeps_row_and_disk_lease(self):
+        self.submit("t1", cwd=str(self.root / "removed-wt"))  # absent even so
+        rows = self.store.resource_breakdown()
+        self.assertEqual(rows[0]["basis"], "queued-estimate")
+        self.assertGreater(rows[0]["disk_mb"], 0)
+        self.assertEqual(self.store.get_task("t1")["state"], "queued")
+
+    def test_retire_bound_matches_stale_queued_lease_bound(self):
+        from launcher import store as store_mod
+        self.submit("old")
+        self.submit("young")
+        self.backdate("old", store_mod.STALE_QUEUED_DISK_LEASE_S + 60)
+        self.backdate("young", store_mod.STALE_QUEUED_DISK_LEASE_S - 60)
+        rows = self.store.resource_breakdown()
+        by_id = {r["task_id"]: r for r in rows}
+        self.assertEqual(by_id["old"]["basis"], "queued-stale-retired")
+        self.assertEqual(by_id["young"]["basis"], "queued-estimate")
+
+
+class RetireStaleUnprovenTests(unittest.TestCase):
+    """Intake 0a34b9ea: running rows whose native session is definitively
+    absent retire past STALE_UNPROVEN_RETIRE_S. Young rows, exiting terminal
+    phases, and transient probe failures never retire (fail closed)."""
+
+    BINDING = {"native_id": "11111111-2222-4333-8444-555555555555",
+               "tag": "t", "workspace": "/w", "engine": "e", "incarnation": 1}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(LOCAL_TMP_DIR))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        patcher = patch.dict(os.environ,
+                             {"LAUNCHER_HOST_FENCING_DIR": str(self.root / "fencing")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = Store(str(self.root / "state.db"))
+        self.submit_running("t1")
+
+    def submit_running(self, task_id="t1", state="running", paths=()):
+        payload = {"goal": "g", "owner": "hub-fleet", "cwd": str(self.root),
+                   "timeout": 60, "memory_estimate_mb": 700}
+        self.store.submit_task(task_id, f"key-{task_id}", payload, list(paths))
+        self.store.transition_task(task_id, state, ("queued",))
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE task_resources SET memory_mb=1500 WHERE task_id=?", (task_id,))
+
+    def _breakdown(self, detail, age, dry_run=False):
+        changes = []
+        with patch.object(Store, "get_native_binding", return_value=self.BINDING), \
+                patch("launcher.store.probe_native_lifecycle",
+                      return_value=("unknown", detail)), \
+                patch.object(Store, "_task_age_seconds", return_value=age):
+            rows = self.store.resource_breakdown(dry_run=dry_run,
+                                                 reconciliation=changes)
+        return rows, changes
+
+    def test_absent_session_past_bound_retires_failed(self):
+        rows, changes = self._breakdown(GONE_SESSION_DETAIL, 7200)
+        row = rows[0]
+        self.assertEqual(row["basis"], "retired-stale-unproven")
+        self.assertEqual((row["reserve_mb"], row["disk_mb"]), (0, 0))
+        self.assertEqual(row["allowance_mb"], 1500)
+        self.assertEqual(changes[0]["action"], "retired-stale-unproven")
+        self.assertEqual(changes[0]["previous_state"], "running")
+        self.assertIn("native session", changes[0]["reason"].lower())
+        task = {t["id"]: t for t in self.store.list_tasks()}["t1"]
+        self.assertIsNotNone(self.store.get_task("t1"))  # kept, never deleted
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["reviewer"], "resource-reconciler")
+        self.assertIn("absent", task["reason"])
+
+    def test_absent_session_with_result_evidence_completes_for_review(self):
+        evidence = self.root / "result.json"
+        evidence.write_text('{"status": "ok"}')
+        self.store.submit_task("t-ev", "key-ev", {"goal": "g", "owner": "hub-fleet",
+                                                  "cwd": str(self.root), "timeout": 60},
+                               [str(evidence)])
+        self.store.transition_task("t-ev", "running", ("queued",))
+        with self.store.get_conn() as conn:
+            conn.execute("UPDATE task_resources SET memory_mb=1500 WHERE task_id='t-ev'")
+        changes = []
+        with patch.object(Store, "get_native_binding", return_value=self.BINDING), \
+                patch("launcher.store.probe_native_lifecycle",
+                      return_value=("unknown", GONE_SESSION_DETAIL)), \
+                patch.object(Store, "_task_age_seconds", return_value=7200):
+            rows = self.store.resource_breakdown(reconciliation=changes)
+        by_id = {r["task_id"]: r for r in rows}
+        self.assertEqual(by_id["t-ev"]["basis"], "retired-stale-unproven")
+        task = {t["id"]: t for t in self.store.list_tasks()}["t-ev"]
+        self.assertEqual(task["state"], "completed-awaiting-review")
+        self.assertIn("result evidence preserved", task["reason"])
+
+    def test_young_absent_session_stays_stale_unproven(self):
+        rows, changes = self._breakdown(GONE_SESSION_DETAIL, 700)
+        self.assertEqual((rows[0]["basis"], rows[0]["reserve_mb"]),
+                         ("stale-unproven", 0))
+        self.assertEqual(changes, [])
+        self.assertEqual(self.store.get_task("t1")["state"], "running")
+
+    def test_exiting_terminal_phase_never_retires(self):
+        rows, changes = self._breakdown(EXITING_SESSION_DETAIL, 7200)
+        self.assertEqual((rows[0]["basis"], rows[0]["reserve_mb"]),
+                         ("stale-unproven", 0))
+        self.assertEqual(rows[0]["disk_mb"], 512)  # disk lease kept
+        self.assertEqual(changes, [])
+        self.assertEqual(self.store.get_task("t1")["state"], "running")
+
+    def test_transient_probe_failures_never_retire(self):
+        for detail in ("aplexer status timed out after 15.0s",
+                       "aplexer status stale socket",
+                       "aplexer status transport failure",
+                       "aplexer status returned mismatched tag: 'x' != 't'"):
+            with self.subTest(detail=detail):
+                fresh_store = Store(str(self.root / f"state-{abs(hash(detail))}.db"))
+                fresh_store.submit_task("t1", "k1", {"goal": "g", "owner": "hub-fleet",
+                                                     "cwd": str(self.root), "timeout": 60}, [])
+                fresh_store.transition_task("t1", "running", ("queued",))
+                changes = []
+                with patch.object(Store, "get_native_binding", return_value=self.BINDING), \
+                        patch("launcher.store.probe_native_lifecycle",
+                              return_value=("unknown", detail)), \
+                        patch.object(Store, "_task_age_seconds", return_value=7200):
+                    rows = fresh_store.resource_breakdown(reconciliation=changes)
+                self.assertEqual((rows[0]["basis"], rows[0]["reserve_mb"]),
+                                 ("full-unknown", 1500))
+                self.assertEqual(changes, [])
+                self.assertEqual(fresh_store.get_task("t1")["state"], "running")
+
+    def test_non_running_state_does_not_retire(self):
+        self.submit_running("t-start", state="starting")
+        changes = []
+        with patch.object(Store, "get_native_binding", return_value=self.BINDING), \
+                patch("launcher.store.probe_native_lifecycle",
+                      return_value=("unknown", GONE_SESSION_DETAIL)), \
+                patch.object(Store, "_task_age_seconds", return_value=7200):
+            rows = self.store.resource_breakdown(reconciliation=changes)
+        by_id = {r["task_id"]: r for r in rows}
+        self.assertEqual(by_id["t-start"]["basis"], "stale-unproven")
+        # Only the running row (t1 from setUp) retires; starting rows never do.
+        self.assertEqual([c["task_id"] for c in changes], ["t1"])
+        self.assertEqual(self.store.get_task("t-start")["state"], "starting")
+
+
+class ReconcileAbsentSessionCliTests(unittest.TestCase):
+    """Targeted reconcile treats a definitively absent native session as a
+    confirmed exit (0a34b9ea); transient probe failures hold resources."""
+
+    def setUp(self):
+        import shutil
+        LOCAL_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        self.dir = tempfile.mkdtemp(dir=str(LOCAL_TMP_DIR))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.cfg = Path(self.dir) / "cfg"
+        self.cfg.mkdir()
+        self.store = Store(str(self.cfg / "state.db"))
+        self.artifact = Path(self.dir) / "result.json"
+        self.store.submit_task("t1", "k1", {"goal": "g", "owner": "hub-fleet",
+                                            "cwd": str(Path(self.dir) / "wt"), "timeout": 60},
+                               [str(self.artifact)])
+        self.store.transition_task("t1", "running", ("queued",))
+        self.store.record_native_binding(
+            "t1", native_id="11111111-2222-4333-8444-555555555555",
+            tag="task-t1", workspace=str(Path(self.dir) / "wt"),
+            engine="codex", incarnation=1000)
+        self.args = SimpleNamespace(config_dir=str(self.cfg), id="t1",
+                                    reviewer="reconciler", json=True)
+
+    def _reconcile(self, detail):
+        from launcher.cli import reconcile
+        with patch("launcher.native_lifecycle.probe_native_lifecycle",
+                   return_value=("unknown", detail)), \
+                patch("builtins.print") as pr:
+            rc = reconcile(self.args)
+            return rc, json.loads(pr.call_args.args[0])
+
+    def test_absent_session_without_evidence_fails_row(self):
+        rc, doc = self._reconcile(GONE_SESSION_DETAIL)
+        self.assertEqual(rc, 0)
+        self.assertEqual(doc["reconciled_action"], "failed")
+        self.assertFalse(doc["resources_reserved"])
+        self.assertIsNotNone(self.store.get_task("t1"))
+        task = {t["id"]: t for t in self.store.list_tasks()}["t1"]
+        self.assertEqual(task["state"], "failed")
+        self.assertIn("native session absent", task["reason"])
+
+    def test_absent_session_with_evidence_completes_for_review(self):
+        self.artifact.write_text('{"status": "ok"}')
+        rc, doc = self._reconcile(GONE_SESSION_DETAIL)
+        self.assertEqual(rc, 0)
+        self.assertEqual(doc["reconciled_action"], "completed-awaiting-review")
+        self.assertEqual(self.store.get_task("t1")["state"], "completed-awaiting-review")
+
+    def test_transient_probe_failure_holds_resources(self):
+        rc, doc = self._reconcile("aplexer status timed out after 15.0s")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(doc["reconciled_action"])
+        self.assertTrue(doc["resources_reserved"])
+        self.assertEqual(self.store.get_task("t1")["state"], "running")
+
+

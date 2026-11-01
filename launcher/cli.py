@@ -801,6 +801,15 @@ def resource_status(args):
     Dry-run never transitions tasks, never writes CPU samples, OOM baselines,
     or choking events. CPU admission here is choking-only (t1511u): busy and
     predicted load are advisory only.
+
+    Admission holds vs bookkeeping (intake 0a34b9ea): admission_mem_mb /
+    admission_disk_mb are what the gates actually use (per-row reserve_mb /
+    disk_mb sums); reservation_mem_mb / allowance_mem_mb only sum recorded
+    task_resources.memory_mb caps and are never subtracted from the host.
+    Non-dry-run additionally retires stale rows whose launch is provably
+    over: queued past STALE_QUEUED_DISK_LEASE_S with a terminal/absent Hub
+    launch, and running rows whose native session is definitively absent
+    past STALE_UNPROVEN_RETIRE_S (state change with reason, no deletes).
     """
     from launcher.resources import (
         get_mem_available,
@@ -911,6 +920,9 @@ def resource_status(args):
     codex_allowed = codex_headroom and allowed
     print(json.dumps({"active_mem_mb": memory, "active_disk_mb": disk,
                       "active_tasks": count, "reservation_mem_mb": reserved,
+                      "allowance_mem_mb": reserved,
+                      "admission_mem_mb": memory,
+                      "admission_disk_mb": disk,
                       "mem_available_mb": available,
                       "memory_floor_mb": floor_mb,
                       "ramp_reserve_mb": ramp_total,
@@ -938,12 +950,44 @@ def resource_status(args):
                           "launcher_memory_reserve" if not codex_headroom else cpu_reason),
                       "default_memory_mb": DEFAULT_NATIVE_MEMORY_MB,
                       "codex_managed_memory_mb": CODEX_MANAGED_NATIVE_MEMORY_MB,
+                      "field_notes": {
+                          "reservation_mem_mb": (
+                              "sum of recorded per-task memory allowances "
+                              "(task_resources.memory_mb) across holding states; "
+                              "submit-time bookkeeping caps, never subtracted "
+                              "from MemAvailable (use admission_mem_mb)"),
+                          "allowance_mem_mb": (
+                              "same value as reservation_mem_mb under its honest "
+                              "name; per-row parts are breakdown[*].allowance_mb"),
+                          "admission_mem_mb": (
+                              "what the memory gate actually subtracts: "
+                              "sum of breakdown[*].reserve_mb, plus "
+                              "estimate_new_mb for the launch being admitted; "
+                              "gate is mem_available_mb - admission_mem_mb - "
+                              "estimate_new_mb >= memory_floor_mb"),
+                          "admission_disk_mb": (
+                              "what the disk gate actually adds: "
+                              "sum of breakdown[*].disk_mb; gate requires "
+                              "free >= 20 GiB floor + admission_disk_mb + "
+                              "the task's disk + one 512 MiB spike"),
+                          "estimate_vs_reservation": (
+                              "estimate_new_mb is the measured per-launch "
+                              "admission estimate for the NEXT start; "
+                              "reservation/allowance sums describe existing "
+                              "rows only"),
+                      },
                       "dry_run": args.dry_run, "reconciled": changes}))
     return 0
 
 
 def reconcile(args):
-    """Targeted reconciliation of a specific task or session without dispatching queued work."""
+    """Targeted reconciliation of a specific task or session without dispatching queued work.
+
+    A definitively absent native session (aplexer reports no matching
+    session and no retired tombstone matched) counts as a confirmed exit,
+    so the row retires by result evidence like a dead session (intake
+    0a34b9ea). Transient probe failures still hold resources.
+    """
     store = get_store(args)
     task_id = store.resolve_task_id(args.id) or args.id
     task = store.get_task(task_id)
@@ -977,7 +1021,12 @@ def reconcile(args):
     evidence = _result_evidence(store, task_id)
     reconciled_action = None
 
-    if status in ("dead", "retired-finished"):
+    from launcher.store import _native_session_absent
+    exit_confirmed = status in ("dead", "retired-finished") or (
+        status == "unknown" and _native_session_absent(detail))
+    exit_basis = ("native exit confirmed" if status in ("dead", "retired-finished")
+                  else "native session absent (no matching session, no tombstone)")
+    if exit_confirmed:
         if evidence:
             if state in ("running", "starting", "stalled", "launch-uncertain"):
                 try:
@@ -985,7 +1034,7 @@ def reconcile(args):
                         task_id,
                         "completed-awaiting-review",
                         (state,),
-                        reason=f"reconciled: native exit confirmed ({detail}); result evidence: {', '.join(evidence)}",
+                        reason=f"reconciled: {exit_basis} ({detail}); result evidence: {', '.join(evidence)}",
                         reviewer=getattr(args, "reviewer", "reconcile"),
                     )
                     reconciled_action = "completed-awaiting-review"
@@ -998,7 +1047,7 @@ def reconcile(args):
                     task_id,
                     "failed",
                     (state,),
-                    reason=f"reconciled: native exit confirmed ({detail}); no result evidence",
+                    reason=f"reconciled: {exit_basis} ({detail}); no result evidence",
                     reviewer=getattr(args, "reviewer", "reconcile"),
                 )
                 reconciled_action = "failed"
@@ -1008,7 +1057,7 @@ def reconcile(args):
 
     resources_held = (
         state in ("queued", "starting", "launch-uncertain", "stalled", "running")
-        and status not in ("dead", "retired-finished")
+        and not exit_confirmed
     )
 
     res_doc = {
