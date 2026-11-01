@@ -540,7 +540,16 @@ def validate_first_action(fa_path, start_json, min_mtime, now_ms=None,
                             acceptable_ws.add(alias)
                     except Exception:
                         pass
-        if data.get("workspace") not in acceptable_ws:
+        # On Windows the native session workspace is observed and mutable
+        # (aplexer 0.1.23 reports the daemon's initial cwd, e.g. %TEMP%, in
+        # whoami; Hub bootstrap_control.MATCH_KEYS drops it for the same
+        # reason). Identity there rests on the exact UUID id + tag above.
+        observed_ws = data.get("workspace")
+        windows_observed_ws = (sys.platform == "win32" and isinstance(observed_ws, str)
+                               and len(observed_ws) >= 3 and observed_ws[0].isascii()
+                               and observed_ws[0].isalpha() and observed_ws[1] == ":"
+                               and observed_ws[2] in ("\\", "/"))
+        if data.get("workspace") not in acceptable_ws and not windows_observed_ws:
             return False
         if "parent_session" in data and \
                 data.get("parent_session") != start_json.get("parent_session"):
