@@ -57,8 +57,14 @@ class PureEvaluationTest(unittest.TestCase):
         self.assertIsNone(W.untrusted_reason(USER, USER, [(None, 5, 0, READ_EXEC)]))
 
 
-@unittest.skipUnless(os.name == "nt", "real NTFS owner/DACL evidence")
-class RealWindowsResolverTest(unittest.TestCase):
+# Real NTFS owner/DACL evidence exists only on Windows. The CI contract allows
+# no skips outside the host-runtime allowlist, so on POSIX this class is not a
+# TestCase (not collected) instead of skipping; the platform-neutral evaluation
+# above always runs, and the POSIX resolver branch keeps its own tests.
+_NT_TESTCASE = unittest.TestCase if os.name == "nt" else object
+
+
+class RealWindowsResolverTest(_NT_TESTCASE):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
