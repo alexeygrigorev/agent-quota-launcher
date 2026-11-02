@@ -39,6 +39,7 @@ test/fixtures/cpu-admission-v2.json sha256
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -49,6 +50,7 @@ CPU_REASONS = ("cpu_pressure", "memory_pressure", "host_oom", "host_runtime_chok
 CHOKING_REASONS = ("host_oom", "host_runtime_choking")
 EXPECTED_SOURCES = ("project_engine_model", "repo_kind", "repo", "global",
                     "default")
+logger = logging.getLogger(__name__)
 
 CPU_DEFAULTS = {
     "cpu_target_utilization": 1.0,
@@ -338,8 +340,9 @@ def resolve_expected_cpu(payload=None, policy=None):
 
     Payload ``expected_cpu_cores`` + ``expected_cpu_source`` (project_engine_model/
     repo_kind/repo/global/default) comes from the Hub estimator. Missing payload falls back
-    to ``cpu_default_cores`` (default 1.0) with source ``default``. Present
-    but invalid payload fails closed.
+    to ``cpu_default_cores`` (default 1.0) with source ``default``. Invalid CPU
+    estimates fail closed. Unknown source labels are warned about and normalized
+    to ``default`` so a newly introduced Hub label cannot prevent a launch.
     """
     default = (policy or CPU_DEFAULTS).get("cpu_default_cores",
                                            CPU_DEFAULTS["cpu_default_cores"])
@@ -351,7 +354,9 @@ def resolve_expected_cpu(payload=None, policy=None):
                 or not math.isfinite(cores) or not (0.05 <= cores <= 1024):
             raise ValueError(f"invalid expected_cpu_cores: {cores!r}")
         if source not in EXPECTED_SOURCES:
-            raise ValueError(f"invalid expected_cpu_source: {source!r}")
+            logger.warning(
+                "Unknown expected_cpu_source %r; treating as 'default'", source)
+            source = "default"
         return float(cores), source
     return float(default), "default"
 

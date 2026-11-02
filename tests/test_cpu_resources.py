@@ -213,17 +213,19 @@ class ExpectedCpuTests(unittest.TestCase):
         cores, src = resolve_expected_cpu(None, policy=policy())
         self.assertEqual((cores, src), (1.0, "default"))
 
-    def test_invalid_payload_fails_closed(self):
+    def test_invalid_cpu_estimate_fails_closed(self):
         with self.assertRaises(ValueError):
             resolve_expected_cpu({"expected_cpu_cores": -1,
                                   "expected_cpu_source": "repo"})
-        with self.assertRaises(ValueError):
-            resolve_expected_cpu({"expected_cpu_cores": 2,
-                                  "expected_cpu_source": "guess"})
+
+    def test_unknown_source_defaults_with_warning(self):
         for bad in ("", None, "measured", "PROJECT_ENGINE_MODEL", 7):
-            with self.assertRaises(ValueError):
-                resolve_expected_cpu({"expected_cpu_cores": 2,
-                                      "expected_cpu_source": bad})
+            with self.subTest(source=bad):
+                with self.assertLogs("launcher.cpu_resources", level="WARNING") as logs:
+                    result = resolve_expected_cpu({"expected_cpu_cores": 2,
+                                                   "expected_cpu_source": bad})
+                self.assertEqual(result, (2.0, "default"))
+                self.assertIn("treating as 'default'", logs.output[0])
 
 
 class RampingTests(unittest.TestCase):
