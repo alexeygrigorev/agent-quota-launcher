@@ -47,7 +47,8 @@ from pathlib import Path
 
 CPU_REASONS = ("cpu_pressure", "memory_pressure", "host_oom", "host_runtime_choking")
 CHOKING_REASONS = ("host_oom", "host_runtime_choking")
-EXPECTED_SOURCES = ("repo_kind", "repo", "global", "default")
+EXPECTED_SOURCES = ("project_engine_model", "repo_kind", "repo", "global",
+                    "default")
 
 CPU_DEFAULTS = {
     "cpu_target_utilization": 1.0,
@@ -335,8 +336,8 @@ def cpu_verdict(raw_usage, cores, expected_cpu_cores, ramping_cpu_cores,
 def resolve_expected_cpu(payload=None, policy=None):
     """Authoritative expected CPU: payload wins, else conservative default.
 
-    Payload ``expected_cpu_cores`` + ``expected_cpu_source`` (repo_kind/repo/
-    global/default) comes from the Hub estimator. Missing payload falls back
+    Payload ``expected_cpu_cores`` + ``expected_cpu_source`` (project_engine_model/
+    repo_kind/repo/global/default) comes from the Hub estimator. Missing payload falls back
     to ``cpu_default_cores`` (default 1.0) with source ``default``. Present
     but invalid payload fails closed.
     """

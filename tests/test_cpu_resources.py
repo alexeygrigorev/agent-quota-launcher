@@ -201,7 +201,8 @@ class ChokingGateTests(unittest.TestCase):
 
 class ExpectedCpuTests(unittest.TestCase):
     def test_payload_authoritative_all_sources(self):
-        for source in ("repo_kind", "repo", "global", "default"):
+        for source in ("project_engine_model", "repo_kind", "repo", "global",
+                       "default"):
             cores, src = resolve_expected_cpu(
                 {"expected_cpu_cores": 2.5, "expected_cpu_source": source})
             self.assertEqual((cores, src), (2.5, source))
@@ -219,6 +220,10 @@ class ExpectedCpuTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_expected_cpu({"expected_cpu_cores": 2,
                                   "expected_cpu_source": "guess"})
+        for bad in ("", None, "measured", "PROJECT_ENGINE_MODEL", 7):
+            with self.assertRaises(ValueError):
+                resolve_expected_cpu({"expected_cpu_cores": 2,
+                                      "expected_cpu_source": bad})
 
 
 class RampingTests(unittest.TestCase):
