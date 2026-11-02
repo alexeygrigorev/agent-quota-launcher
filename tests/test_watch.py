@@ -436,7 +436,7 @@ class WatchRefillTests(unittest.TestCase):
             self.assertEqual(episode_state["episode_id"], 2)
             self.assertIsNotNone(store.get_task("disk-pressure-cleanup-2"))
 
-    def test_disk_pressure_hard_floor_rejection_below_20_gib(self):
+    def test_disk_pressure_hard_floor_rejection_below_15_gib(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = Path(tmp_dir)
             store = Store(str(cfg / "state.db"))
@@ -444,7 +444,7 @@ class WatchRefillTests(unittest.TestCase):
             os.makedirs(task_cwd, exist_ok=True)
             store.submit_task(
                 "t-floor", "k-floor",
-                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "must not dispatch under 20GiB"},
+                {"owner": "ql", "cwd": task_cwd, "timeout": 60, "goal": "must not dispatch under 15GiB"},
                 [str(cfg / "pfloor")],
             )
 
@@ -463,8 +463,8 @@ class WatchRefillTests(unittest.TestCase):
 
             GiB = 1024 * 1024 * 1024
 
-            # 19 GiB (< 20 GiB hard floor)
-            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 19 * GiB})()), \
+            # 14 GiB (< 15 GiB hard floor)
+            with patch("shutil.disk_usage", return_value=type("DiskUsage", (), {"free": 14 * GiB})()), \
                  patch("launcher.cli.spawn_ql_controller", side_effect=fake_spawn):
                 rc = watch_loop(args, max_passes=1)
 

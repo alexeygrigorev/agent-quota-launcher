@@ -28,7 +28,37 @@ CODEX_MANAGED_PROVIDERS = ("codex", "openai")
 # Configurable per launch via memory_floor_mb; this constant is the default.
 MIN_MEM_AVAILABLE_BYTES = RESOURCE_DEFAULTS["memory_floor_mb"] * 1024 * 1024
 DEFAULT_MEMORY_FLOOR_MB = RESOURCE_DEFAULTS["memory_floor_mb"]
-MIN_DISK_FREE_BYTES = 20 * 1024 * 1024 * 1024
+# Absolute free-space floor (intake a5464408): block below min(disk floor,
+# 5% of the filesystem). 15 GiB default; AGENT_DISK_FLOOR_GB overrides. A
+# percentage-only or fixed 20 GiB floor plus per-session promises blocked a
+# 436 GiB host at 52 GiB free.
+DEFAULT_DISK_FLOOR_GB = 15
+DISK_FLOOR_FS_FRACTION = 0.05
+# Active-session disk promises are capped: most of an active session's disk is
+# already written and thus already missing from `free` (AGENT_ACTIVE_DISK_RESERVE_CAP_MB).
+DEFAULT_ACTIVE_DISK_RESERVE_CAP_MB = 8192
+MIN_DISK_FREE_BYTES = DEFAULT_DISK_FLOOR_GB * 1024 * 1024 * 1024
+
+
+def _env_number(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+        return value if math.isfinite(value) and value >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def disk_floor_bytes(stat=None):
+    floor = int(_env_number("AGENT_DISK_FLOOR_GB", DEFAULT_DISK_FLOOR_GB) * 1024 ** 3)
+    total = getattr(stat, "total", None)
+    if isinstance(total, (int, float)) and total > 0:
+        floor = min(floor, int(total * DISK_FLOOR_FS_FRACTION))
+    return floor
+
+
+def active_disk_reserve_bytes(active_disk_mb):
+    cap = _env_number("AGENT_ACTIVE_DISK_RESERVE_CAP_MB", DEFAULT_ACTIVE_DISK_RESERVE_CAP_MB)
+    return int(min(max(float(active_disk_mb or 0), 0.0), cap) * 1024 * 1024)
 WARN_DISK_FREE_BYTES = 30 * 1024 * 1024 * 1024
 MAX_DISK_SPIKE_BYTES = 512 * 1024 * 1024
 
@@ -304,13 +334,11 @@ def check_resources(requested_memory_mb, requested_cwd, requested_tmpdir,
     tmp_stat = _get_disk_usage(requested_tmpdir)
 
     task_disk = min(int(requested_disk_mb or 0) * 1024 * 1024, MAX_DISK_SPIKE_BYTES)
-    required_free = MIN_DISK_FREE_BYTES + (active_disk_mb * 1024 * 1024) + task_disk
-
-    if cwd_stat.free < required_free:
-        raise ValueError(f"cwd filesystem free < 20GiB floor + required disk ({required_free} B)")
-
-    if tmp_stat.free < required_free:
-        raise ValueError(f"tmpdir filesystem free < 20GiB floor + required disk ({required_free} B)")
+    reserve = active_disk_reserve_bytes(active_disk_mb) + task_disk
+    for label, stat in (("cwd", cwd_stat), ("tmpdir", tmp_stat)):
+        required_free = disk_floor_bytes(stat) + reserve
+        if stat.free < required_free:
+            raise ValueError(f"{label} filesystem free < disk floor + required disk ({required_free} B)")
 
     return True
 
@@ -321,7 +349,7 @@ def check_disk_pressure(cwd, tmpdir, episode_state=None) -> dict:
     tmp_stat = _get_disk_usage(tmpdir)
     free = min(cwd_stat.free, tmp_stat.free)
 
-    if free < MIN_DISK_FREE_BYTES:
+    if free < min(disk_floor_bytes(cwd_stat), disk_floor_bytes(tmp_stat)):
         return {
             "status": "hard_floor_exceeded",
             "pressure": True,

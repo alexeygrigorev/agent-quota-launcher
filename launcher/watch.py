@@ -435,7 +435,7 @@ def watch_loop(args, max_passes=None):
         pressure_info = check_disk_pressure(check_cwd, check_tmp, episode_state=episode_state)
 
         if not pressure_info.get("eligible_continue", True):
-            print(f"watcher: hard disk floor exceeded ({pressure_info.get('free_bytes')} B < 20GiB); dispatch blocked")
+            print(f"watcher: hard disk floor exceeded ({pressure_info.get('free_bytes')} B < disk floor); dispatch blocked")
             if once:
                 return 0
             time.sleep(interval)

@@ -232,17 +232,35 @@ class TestResources(unittest.TestCase):
                 self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, target_stage=50))
 
     def test_disk_floor(self):
-        with patch('shutil.disk_usage', return_value=DiskUsage(21 * GiB)):
-            with self.assertRaisesRegex(ValueError, "free < 20GiB"):
+        with patch('shutil.disk_usage', return_value=DiskUsage(16 * GiB)):
+            with self.assertRaisesRegex(ValueError, "free < disk floor"):
                 check_resources(1000, self.repo, str(self.owned_tmp),
                                 active_disk_mb=1500, repo_root=self.repo)
 
+    def test_disk_floor_is_absolute_and_active_reserve_capped(self):
+        # a5464408: 436 GiB host, 52.6 GiB free, 51 active sessions x 512 MiB.
+        class Usage:
+            def __init__(self, free, total): self.free, self.total = free, total
+        with patch('shutil.disk_usage', return_value=Usage(int(52.6 * GiB), 436 * GiB)):
+            self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp),
+                                            active_disk_mb=26112, repo_root=self.repo, ignore_ram=True))
+        # Small disk: 5% of 100 GiB (5 GiB) beats the 15 GiB default.
+        with patch('shutil.disk_usage', return_value=Usage(7 * GiB, 100 * GiB)):
+            self.assertTrue(check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, ignore_ram=True))
+        with patch('shutil.disk_usage', return_value=Usage(4 * GiB, 100 * GiB)):
+            with self.assertRaisesRegex(ValueError, "free < disk floor"):
+                check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, ignore_ram=True)
+        with patch.dict('os.environ', {"AGENT_DISK_FLOOR_GB": "60"}), \
+             patch('shutil.disk_usage', return_value=Usage(int(52.6 * GiB), 2000 * GiB)):
+            with self.assertRaisesRegex(ValueError, "free < disk floor"):
+                check_resources(1000, self.repo, str(self.owned_tmp), repo_root=self.repo, ignore_ram=True)
+
     def test_disk_pressure_hard_floor_exceeded(self):
-        with patch('shutil.disk_usage', return_value=DiskUsage(19 * GiB)):
+        with patch('shutil.disk_usage', return_value=DiskUsage(14 * GiB)):
             res = check_disk_pressure(self.repo, str(self.owned_tmp))
             self.assertEqual(res["status"], "hard_floor_exceeded")
             self.assertTrue(res["pressure"])
-            self.assertEqual(res["free_bytes"], 19 * GiB)
+            self.assertEqual(res["free_bytes"], 14 * GiB)
             self.assertFalse(res["eligible_continue"])
 
     def test_disk_pressure_at_29_gib(self):

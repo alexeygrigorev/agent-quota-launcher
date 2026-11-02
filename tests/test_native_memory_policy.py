@@ -140,8 +140,8 @@ class TestCodexAdmissionRoom(unittest.TestCase):
     def test_disk_and_tmp_gates_preserved_for_codex(self):
         import launcher.resources as res
         with patch.object(res, "get_mem_available", return_value=30 * GiB), \
-             patch("shutil.disk_usage", return_value=DiskUsage(21 * GiB)):
-            with self.assertRaisesRegex(ValueError, "free < 20GiB"):
+             patch("shutil.disk_usage", return_value=DiskUsage(16 * GiB)):
+            with self.assertRaisesRegex(ValueError, "free < disk floor"):
                 check_resources(4096, self.repo, str(self.owned), repo_root=self.repo,
                                 provider="codex", is_managed=True,
                                 active_disk_mb=1500)
