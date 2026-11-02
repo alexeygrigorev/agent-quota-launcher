@@ -929,15 +929,18 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex", "gemini": "gemini", "claude": "claude"}.get(provider)
     if native_engine and not account_profile:
         cmd.extend(["--engine", native_engine])
-    if provider == "opencode":
+    if provider == "opencode" and not account_profile:
         validate_opencode_runtime()
-    child_env = dict(ADAPTERS.get(provider, {}).get("env", {}))
-    if provider == "zai":
+    child_env = {} if account_profile else dict(ADAPTERS.get(provider, {}).get("env", {}))
+    if provider == "zai" and not account_profile:
         node, cjs, _ = validate_zai_runtime()
         child_env["ZCODE_NODE"] = node
         child_env["ZCODE_CJS"] = cjs
         # Installed warm bridge: inner YOLO loop owns tool execution exactly
         # once; the outer harness must not re-execute emitted Bash calls.
+        child_env["ZCODE_WARM"] = "1"
+        child_env["ZCODE_WARM_MODE"] = "yolo"
+    elif provider == "zai":
         child_env["ZCODE_WARM"] = "1"
         child_env["ZCODE_WARM_MODE"] = "yolo"
     child_env["TMPDIR"] = tmpdir_resolved
