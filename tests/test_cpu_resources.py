@@ -198,6 +198,57 @@ class ChokingGateTests(unittest.TestCase):
                     "memory_psi_full_avg10", "oom_kills_delta", "observed_at"):
             self.assertIn(key, body)
 
+    def test_unknown_cores_preserves_refusal_and_format_succeeds(self):
+        # Finding 2 regression: when core count is unknown (cores=None / os.cpu_count() -> None),
+        # choking refusals (PSI pressure and trusted choking hints) must preserve
+        # fail-closed refusal and format_cpu_refusal must succeed with limit_cpu_cores=None.
+        with patch("os.cpu_count", return_value=None):
+            # 1. Trusted choking hint refusal with unknown cores
+            hint = {"reason": "host_oom", "observed_at": now_iso()}
+            allowed, reason, admission = check_cpu_choking(
+                cpu_usage=None, policy=policy(), cores=None,
+                expected_cpu_cores=1.5, ramping_cpu_cores=0.5,
+                trusted_choking=hint)
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "host_oom")
+            self.assertIsNotNone(admission)
+            self.assertIsNone(admission["limit_cpu_cores"])
+            text = format_cpu_refusal(reason, admission)
+            lines = text.split("\n")
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0], "host_oom")
+            body = json.loads(lines[1].split("CPU_ADMISSION_JSON ", 1)[1])
+            self.assertIsNone(body["limit_cpu_cores"])
+            self.assertEqual(body["expected_cpu_cores"], 1.5)
+            self.assertEqual(body["ramping_cpu_cores"], 0.5)
+
+            # 2. CPU PSI pressure refusal with unknown cores
+            u = usage(psi_full=8.0)
+            allowed_psi, reason_psi, admission_psi = check_cpu_choking(
+                cpu_usage=u, policy=policy(), cores=None,
+                expected_cpu_cores=2.0, ramping_cpu_cores=1.0)
+            self.assertFalse(allowed_psi)
+            self.assertEqual(reason_psi, "cpu_pressure")
+            self.assertIsNotNone(admission_psi)
+            self.assertIsNone(admission_psi["limit_cpu_cores"])
+            text_psi = format_cpu_refusal(reason_psi, admission_psi)
+            self.assertTrue(text_psi.startswith("cpu_pressure\nCPU_ADMISSION_JSON "))
+            body_psi = json.loads(text_psi.split("CPU_ADMISSION_JSON ", 1)[1])
+            self.assertIsNone(body_psi["limit_cpu_cores"])
+
+            # 3. Explicit non-positive cores (e.g. cores=0) with trusted choking
+            runtime_hint = {"reason": "host_runtime_choking", "observed_at": now_iso()}
+            allowed_rt, reason_rt, admission_rt = check_cpu_choking(
+                cpu_usage=None, policy=policy(), cores=0,
+                expected_cpu_cores=1.0, ramping_cpu_cores=0.0,
+                trusted_choking=runtime_hint)
+            self.assertFalse(allowed_rt)
+            self.assertEqual(reason_rt, "host_runtime_choking")
+            self.assertIsNotNone(admission_rt)
+            self.assertIsNone(admission_rt["limit_cpu_cores"])
+            text_rt = format_cpu_refusal(reason_rt, admission_rt)
+            self.assertTrue(text_rt.startswith("host_runtime_choking\nCPU_ADMISSION_JSON "))
+
 
 class ExpectedCpuTests(unittest.TestCase):
     def test_payload_authoritative_all_sources(self):
@@ -404,6 +455,19 @@ class SanitizeTests(unittest.TestCase):
                 "psi_full_avg10": 0.0, "memory_psi_full_avg10": 0.0,
                 "oom_kills_delta": 0, "observed_at": now_iso()}
         self.assertIsNotNone(sanitize_cpu_admission(good))
+        # Unknown core count allows limit_cpu_cores=None while preserving the key
+        good_null_limit = dict(good, limit_cpu_cores=None)
+        sanitized = sanitize_cpu_admission(good_null_limit)
+        self.assertIsNotNone(sanitized)
+        self.assertIsNone(sanitized["limit_cpu_cores"])
+        missing_limit = {k: v for k, v in good.items() if k != "limit_cpu_cores"}
+        self.assertIsNone(sanitize_cpu_admission(missing_limit))
+        bad_limit = dict(good, limit_cpu_cores=-1.0)
+        self.assertIsNone(sanitize_cpu_admission(bad_limit))
+        bad_limit_str = dict(good, limit_cpu_cores="12")
+        self.assertIsNone(sanitize_cpu_admission(bad_limit_str))
+        bad_expected = dict(good, expected_cpu_cores=None)
+        self.assertIsNone(sanitize_cpu_admission(bad_expected))
         bad = dict(good, psi_full_avg10=101.0)
         self.assertIsNone(sanitize_cpu_admission(bad))
         bad2 = dict(good, oom_kills_delta=1.5)
