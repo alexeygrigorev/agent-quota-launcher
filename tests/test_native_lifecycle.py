@@ -71,5 +71,54 @@ class NativeStatusDiagnosticsTests(unittest.TestCase):
     def test_unknown_phase_stays_unknown(self):
         self.assertEqual(probe(FIXED, document(phase='unobserved')), 'unknown')
 
+    def test_windows_accepts_temp_workspace_in_status_and_tombstone(self):
+        win_binding = dict(
+            BINDING,
+            workspace=r'C:\Users\User\work\agent-hub',
+        )
+        win_info = document(
+            workspace=r'C:\Users\User\AppData\Local\Temp',
+            phase='running',
+            containment_empty=False,
+        )
+        result = subprocess.CompletedProcess(
+            ['aplexer', 'status', BINDING['native_id'], '--json'],
+            0, json.dumps(win_info), '',
+        )
+        with patch.object(FIXED, 'sys') as mock_sys, \
+             patch.object(FIXED.subprocess, 'run', return_value=result), \
+             patch.object(FIXED, 'read_tombstone', return_value=None):
+            mock_sys.platform = 'win32'
+            self.assertEqual(FIXED.probe_native_lifecycle(win_binding, live_info={})[0], 'alive')
+            mock_sys.platform = 'linux'
+            self.assertEqual(FIXED.probe_native_lifecycle(win_binding, live_info={})[0], 'unknown')
+
+        tombstone = dict(
+            id=BINDING['native_id'],
+            tag=BINDING['tag'],
+            workspace=r'C:\Users\User\AppData\Local\Temp',
+            cause='finished',
+            finished_at_ms=2000,
+        )
+        with patch.object(FIXED, 'sys') as mock_sys:
+            mock_sys.platform = 'win32'
+            ok, _ = FIXED.verify_tombstone(
+                tombstone,
+                expected_id=BINDING['native_id'],
+                expected_tag=BINDING['tag'],
+                expected_workspace=r'C:\Users\User\work\agent-hub',
+                expected_incarnation=1234,
+            )
+            self.assertTrue(ok)
+            mock_sys.platform = 'linux'
+            ok_linux, _ = FIXED.verify_tombstone(
+                tombstone,
+                expected_id=BINDING['native_id'],
+                expected_tag=BINDING['tag'],
+                expected_workspace=r'C:\Users\User\work\agent-hub',
+                expected_incarnation=1234,
+            )
+            self.assertFalse(ok_linux)
+
 if __name__ == '__main__':
     unittest.main()

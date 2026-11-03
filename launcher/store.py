@@ -1256,17 +1256,18 @@ class Store:
             return False
         if not self._native_census_absent(task_id):
             return False
-        try:
-            safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in task_id)
-            for prefix in ("agent-task-", "ql-ctl-"):
-                unit = subprocess.run(
-                    ["systemctl", "--user", "is-active", f"{prefix}{safe}.service"],
-                    capture_output=True, text=True, timeout=5)
-                if unit.returncode not in (3, 4) or unit.stdout.strip() not in (
-                        "inactive", "failed", "unknown") or unit.stderr.strip():
-                    return False
-        except (OSError, subprocess.SubprocessError):
-            return False
+        if os.name != "nt":
+            try:
+                safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in task_id)
+                for prefix in ("agent-task-", "ql-ctl-"):
+                    unit = subprocess.run(
+                        ["systemctl", "--user", "is-active", f"{prefix}{safe}.service"],
+                        capture_output=True, text=True, timeout=5)
+                    if unit.returncode not in (3, 4) or unit.stdout.strip() not in (
+                            "inactive", "failed", "unknown") or unit.stderr.strip():
+                        return False
+            except (OSError, subprocess.SubprocessError):
+                return False
         return (self._uncertain_fleet_record(task_id, payload) == fleet
                 and self._uncertain_local_absent(task_id, payload, fleet[0]))
 
@@ -1278,13 +1279,31 @@ class Store:
         if not fleet:
             return None
         try:
-            import fcntl
+            try:
+                import fcntl as _fcntl
+            except ImportError:
+                _fcntl = None
+            try:
+                import msvcrt as _msvcrt
+            except ImportError:
+                _msvcrt = None
+            if _fcntl is None and _msvcrt is None:
+                return None
             lock_path = Path(self.db_path).parent / "launch.lock"
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(lock_path, open_flags, 0o600)
             with os.fdopen(fd, "a") as held:
                 # Admission may already own this lock. Skip rather than block
                 # or weaken the same exclusion that fences native spawn.
-                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if _fcntl is not None:
+                    _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                else:
+                    held.seek(0, os.SEEK_END)
+                    if held.tell() == 0:
+                        held.write("\0")
+                        held.flush()
+                    held.seek(0)
+                    _msvcrt.locking(held.fileno(), _msvcrt.LK_NBLCK, 1)
                 try:
                     with self.transaction() as conn:
                         row = conn.execute(
@@ -1334,7 +1353,11 @@ class Store:
                                 return None
                         return reason
                 finally:
-                    fcntl.flock(held, fcntl.LOCK_UN)
+                    if _fcntl is not None:
+                        _fcntl.flock(held, _fcntl.LOCK_UN)
+                    else:
+                        held.seek(0)
+                        _msvcrt.locking(held.fileno(), _msvcrt.LK_UNLCK, 1)
         except (ImportError, OSError, sqlite3.Error):
             return None
 

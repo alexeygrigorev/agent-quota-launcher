@@ -8,8 +8,22 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import uuid
 from pathlib import Path
+
+
+def _is_windows_drive_workspace(ws: object) -> bool:
+    """True on win32 when ws is a drive-letter path (aplexer 0.1.23 mutates session workspace to %TEMP%)."""
+    return (
+        sys.platform == "win32"
+        and isinstance(ws, str)
+        and len(ws) >= 3
+        and ws[0].isascii()
+        and ws[0].isalpha()
+        and ws[1] == ":"
+        and ws[2] in ("\\", "/")
+    )
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -218,20 +232,24 @@ def verify_tombstone(
     if t_tag != expected_tag.strip():
         return False, f"tag mismatch: tombstone={t_tag!r}, expected={expected_tag!r}"
 
-    # 3. Exact workspace match (absolute; missing workspace must never resolve cwd)
+    # 3. Exact workspace match (absolute; missing workspace must never resolve cwd).
+    # On Windows, aplexer 0.1.23 mutates the observed session/tombstone workspace
+    # to the daemon's initial cwd (%TEMP%), so accept a drive-letter workspace
+    # when UUID id and tag match (matching validate_first_action in ccb291a).
     t_ws = tombstone.get("workspace")
-    if not isinstance(t_ws, str) or not t_ws.strip() or not os.path.isabs(t_ws.strip()):
+    t_ws_clean = t_ws.strip() if isinstance(t_ws, str) else ""
+    if not t_ws_clean or (not os.path.isabs(t_ws_clean) and not _is_windows_drive_workspace(t_ws_clean)):
         return False, f"tombstone workspace is missing or not absolute: {t_ws!r}"
-    t_ws_clean = t_ws.strip()
     # Linux /proc cwd appends this exact suffix after worktree removal.
     # Only normalize against the persisted workspace, never another path.
     if t_ws_clean == expected_workspace + " (deleted)":
         t_ws_clean = expected_workspace
-    try:
-        if Path(t_ws_clean).resolve() != Path(expected_workspace).resolve():
-            return False, f"workspace mismatch: tombstone={t_ws_clean!r}, expected={expected_workspace!r}"
-    except Exception:
-        return False, f"workspace resolution error for {t_ws_clean!r}"
+    if not _is_windows_drive_workspace(t_ws_clean):
+        try:
+            if Path(t_ws_clean).resolve() != Path(expected_workspace).resolve():
+                return False, f"workspace mismatch: tombstone={t_ws_clean!r}, expected={expected_workspace!r}"
+        except Exception:
+            return False, f"workspace resolution error for {t_ws_clean!r}"
 
     # 4. Cause finished
     cause = str(tombstone.get("cause") or "").strip()
@@ -330,15 +348,17 @@ def probe_native_lifecycle(
             if not info_tag or info_tag != expected_tag.strip():
                 return "unknown", f"aplexer status returned mismatched tag: {info_tag!r} != {expected_tag!r}"
 
-            # 3. Exact workspace match (absolute)
+            # 3. Exact workspace match (absolute; on Windows accept drive-letter workspace per ccb291a)
             info_ws = info.get("workspace")
-            if not isinstance(info_ws, str) or not info_ws.strip() or not os.path.isabs(info_ws.strip()):
+            info_ws_clean = info_ws.strip() if isinstance(info_ws, str) else ""
+            if not info_ws_clean or (not os.path.isabs(info_ws_clean) and not _is_windows_drive_workspace(info_ws_clean)):
                 return "unknown", f"aplexer status returned missing or non-absolute workspace: {info_ws!r}"
-            try:
-                if Path(info_ws.strip()).resolve() != Path(expected_workspace).resolve():
-                    return "unknown", f"aplexer status returned mismatched workspace: {info_ws!r} != {expected_workspace!r}"
-            except Exception:
-                return "unknown", f"workspace resolution error for {info_ws!r}"
+            if not _is_windows_drive_workspace(info_ws_clean):
+                try:
+                    if Path(info_ws_clean).resolve() != Path(expected_workspace).resolve():
+                        return "unknown", f"aplexer status returned mismatched workspace: {info_ws!r} != {expected_workspace!r}"
+                except Exception:
+                    return "unknown", f"workspace resolution error for {info_ws!r}"
 
             # 4. Exact engine match
             info_engine = str(info.get("engine") or "").strip()
