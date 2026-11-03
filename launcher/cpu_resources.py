@@ -139,7 +139,7 @@ def sanitize_cpu_admission(value):
         if key == "observed_at":
             if number is not None and _parse_observed_ms(number) is None:
                 return None
-        elif number is None and key in optional:
+        elif number is None and (key in optional or key == "limit_cpu_cores"):
             continue
         elif not _finite_nonneg(number) or number > (
                 100 if "psi" in key else 1 if key == "target_utilization" else 1e9):
