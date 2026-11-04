@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from unittest.mock import patch
 from launcher.interactive import interactive_argv,register_native_goal,goal_store,goal_prompt,objective_hash,child_config_path
 
@@ -38,7 +38,7 @@ class InteractiveTests(unittest.TestCase):
         (native/'transcript.json').write_text(json.dumps({'path':str(rollout)}))
         self.row={'id':'native-id','tag':'task-test','workspace':str(root),'engine':'codex','created_at_ms':self.at,'phase':'running','history_path':str(native/'history.jsonl')}
         self.db=root/'codex/goals_1.sqlite'
-        with sqlite3.connect(self.db) as db:db.execute('CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,status TEXT,objective TEXT)')
+        with closing(sqlite3.connect(self.db)) as db, db:db.execute('CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,status TEXT,objective TEXT)')
         self.calls=[]
         self.delivery={'id':'native-id','delivery':{'engine':'codex','ready':True,'landed':True,'submitted':True,'status':'submitted','sends':1,'enter_presses':1}}
         self.native_effect=True
@@ -48,7 +48,7 @@ class InteractiveTests(unittest.TestCase):
         if argv[1]=='status':value=self.row
         else:
             if self.native_effect:
-                with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread','active','objective'))
+                with closing(sqlite3.connect(self.db)) as db, db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread','active','objective'))
             value=self.delivery
         return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
 
@@ -77,12 +77,12 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(sum(v[1]=='send' for v in self.calls),1)
 
     def test_foreign_thread_row_is_not_goal_evidence(self):
-        with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('foreign-thread','active','objective'))
+        with closing(sqlite3.connect(self.db)) as db, db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('foreign-thread','active','objective'))
         self.assertIsNone(goal_store(self.row))
 
     def test_existing_wrong_active_or_complete_goal_is_never_overwritten(self):
         for status in ['active','complete']:
-            with sqlite3.connect(self.db) as db:
+            with closing(sqlite3.connect(self.db)) as db, db:
                 db.execute('DELETE FROM thread_goals')
                 db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread',status,'different objective'))
             with self.subTest(status=status),self.assertRaisesRegex(RuntimeError,'objective_conflict'):
@@ -96,7 +96,7 @@ class InteractiveTests(unittest.TestCase):
         command=goal_prompt(objective,self.temp.name,'task-id','/private/first-action.json')
         self.assertLessEqual(len(('/goal '+command).encode('utf-16-le'))//2,4000)
         brief=next((Path(self.temp.name)/'.local/goal-briefs').glob('*.md'))
-        self.assertEqual(brief.read_text(),objective)
+        self.assertEqual(brief.read_text(encoding="utf8"),objective)
         self.assertLess(command.index('First tool action'),command.index('Then read'))
         with self.assertRaises(FileExistsError):goal_prompt(objective,self.temp.name,'task-id','/private/first-action.json')
 
@@ -129,7 +129,7 @@ class InteractiveLifecycleTests(unittest.TestCase):
             popen.return_value.communicate.side_effect=started
             rc=do_run(str(root/'store.sqlite'),'interactive-test',directory,None,str(root/'launch.lock'))
             state=store.get_task('interactive-test')['state']
-            record=json.loads((root/'.local/launch-interactive-test.json').read_text())
+            record=json.loads((root/'.local/launch-interactive-test.json').read_text(encoding='utf8'))
             argv=popen.call_args.args[0]
             self.assertTrue(fetch.called);self.assertTrue(validate.called);self.assertTrue(resources.called)
             return rc,state,record,argv,first.call_count,registration.call_count
