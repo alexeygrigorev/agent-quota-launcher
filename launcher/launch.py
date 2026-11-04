@@ -1118,9 +1118,17 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             env = clean_provider_environment()
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
         if central_home:
-            final_chosen, final_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
-            if final_chosen != chosen or final_home != central_home:
-                raise ValueError("central_provider_changed_before_spawn")
+            try:
+                final_chosen, final_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
+                if final_chosen != chosen or final_home != central_home:
+                    raise ValueError("central_provider_changed_before_spawn")
+            except Exception:
+                # No native Popen occurred: restore the queued resource policy,
+                # without clearing any remotely admitted or uncertain lease.
+                store.transition_task(task_id, "queued", ("starting",), reason="final provider gate failed before native spawn")
+                record.update(outcome="admission-unverified", reason="final provider gate failed before native spawn")
+                _write_launch_record(cwd, record)
+                raise
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)

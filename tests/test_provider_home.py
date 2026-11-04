@@ -110,7 +110,7 @@ class ProviderHomes(unittest.TestCase):
         forbidden = {'OPENCODE_SERVER': 'https://foreign.invalid', 'HUB2_TOKEN': 'synthetic-host-secret',
                      'ANTHROPIC_API_KEY':'foreign','OPENAI_API_KEY':'foreign','CODEX_API_KEY':'foreign',
                      'CLAUDE_CODE_OAUTH_TOKEN':'foreign','OPENCODE_GO_API_KEY':'foreign','ZAI_API_KEY':'foreign',
-                     'CODEX_HOME':'/foreign','ANTHROPIC_BASE_URL':'https://foreign.invalid'}
+                     'CODEX_HOME':'/foreign','CLAUDE_CONFIG_DIR':'/hostile-claude','ANTHROPIC_BASE_URL':'https://foreign.invalid'}
         with patch.dict(os.environ, forbidden), \
              patch('launcher.provider_home.shutil.which', return_value='installed-opencode'), \
              patch('launcher.provider_home.subprocess.run') as run:
@@ -181,7 +181,7 @@ class ProviderHomes(unittest.TestCase):
                    'provider_home': str(manifest), 'model_requirements': {'models': ['configured-model'], 'providers': ['zai']}}
         store.submit_task('central-test', 'central-key', payload, [])
         with ExitStack() as stack:
-            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key'}))
+            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key','CLAUDE_CONFIG_DIR':'/hostile-claude'}))
             gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, verify(manifest))))
             quse = stack.enter_context(patch('launcher.launch.fetch_quse', side_effect=AssertionError('legacy quota used')))
             legacy = stack.enter_context(patch('launcher.launch.build_managed_profile_argv', side_effect=AssertionError('legacy package used')))
@@ -208,6 +208,8 @@ class ProviderHomes(unittest.TestCase):
             self.assertNotIn('HUB2_LAUNCH_CONTEXT', env)
             self.assertNotIn('HUB2_TOKEN', env)
             self.assertNotIn('CODEX_API_KEY', env)
+            self.assertNotIn('CLAUDE_CONFIG_DIR',env)
+            self.assertIn('CLAUDE_CONFIG_DIR='+str(manifest.parent/'home/.claude'),argv)
             self.assertNotIn('synthetic-host-secret', json.dumps(argv))
 
 
@@ -245,7 +247,16 @@ class ProviderHomes(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'central_provider_evidence_unverified'):
                 do_run(str(root/'tasks.sqlite'),'late-gate',str(root),None,str(root/'lock'))
             self.assertFalse(spawn.called)
-        self.assertEqual(calls,['/api/sessions/s1/admission']*2)
+            self.assertEqual(store.get_task('late-gate')['state'],'queued')
+            self.assertIsNone(store.get_native_binding('late-gate'))
+            self.assertEqual(sum(row['reserve_mb'] for row in store.resource_breakdown(dry_run=True)),0)
+            # The denial is still current: retry reaches the actual remote gate
+            # rather than failing locally because its task was stuck starting.
+            with self.assertRaisesRegex(ValueError,'central_provider_evidence_unverified'):
+                do_run(str(root/'tasks.sqlite'),'late-gate',str(root),None,str(root/'lock'))
+            self.assertFalse(spawn.called)
+            self.assertEqual(store.get_task('late-gate')['state'],'queued')
+        self.assertEqual(calls,['/api/sessions/s1/admission']*3)
 
     def test_central_codex_dispatch_preserves_all_admission_without_unmanaged_wrapper(self):
         from launcher.store import Store

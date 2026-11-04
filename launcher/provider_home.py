@@ -360,7 +360,7 @@ def home_environment(home, provider):
 
 
 def clean_provider_environment():
-    prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_CODE_', 'ZAI_', 'GO_API_')
+    prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_', 'ZAI_', 'GO_API_')
     return {key: value for key, value in os.environ.items() if not key.startswith(prefixes)}
 
 
