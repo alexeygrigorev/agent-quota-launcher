@@ -45,11 +45,13 @@ def command_effort(command):
 
 
 def goal_prompt(prompt, workspace, task_id, first_action_path):
-    if len(('/goal '+prompt).encode('utf-16-le'))//2<=4000:return prompt
+    if '\r' not in prompt and '\n' not in prompt and len(('/goal '+prompt).encode('utf-16-le'))//2<=4000:return prompt
     import hashlib
     import os
     from pathlib import Path
     root=Path(workspace).resolve()
+    if any(c in str(value) for value in (root,first_action_path) for c in '\r\n'):
+        raise ValueError('goal_brief_pointer_not_single_line')
     directory=root/'.local'/'goal-briefs'
     directory.mkdir(mode=0o700,parents=True,exist_ok=True)
     if not directory.resolve().is_relative_to(root):raise ValueError('goal_brief_path_untrusted')
@@ -58,7 +60,8 @@ def goal_prompt(prompt, workspace, task_id, first_action_path):
     if len(data)>512*1024:raise ValueError('goal_brief_too_large')
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
     with os.fdopen(fd,'wb') as stream:stream.write(data);stream.flush();os.fsync(stream.fileno())
-    result=f'First tool action: run aplexer whoami --json and write its complete JSON to {first_action_path}. Then read and fulfill the complete objective in {path}.'
+    digest=hashlib.sha256(data).hexdigest()
+    result=f'First tool action: run aplexer whoami --json and write its complete JSON to {first_action_path}. Then read and verify SHA256 {digest} of {path}, and fulfill that complete objective.'
     if len(('/goal '+result).encode('utf-16-le'))//2>4000:raise ValueError('goal_brief_pointer_too_large')
     return result
 
@@ -170,6 +173,8 @@ def register_native_goal(*, native_id, tag, workspace, engine, created_at_ms, pr
     monotonic=monotonic or time.monotonic
     if engine not in {'codex','zcodex'} or not isinstance(prompt,str) or not prompt.strip() or timeout<=0:
         raise ValueError('native_goal_provider_unsupported')
+    if '\r' in prompt or '\n' in prompt:
+        raise ValueError('native_goal_single_line_required')
     deadline=monotonic()+min(timeout,60)
     expected_hash=objective_hash(prompt)
     def matching(proof):
