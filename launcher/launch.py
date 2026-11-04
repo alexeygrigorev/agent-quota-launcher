@@ -848,32 +848,48 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     managed_dir = payload.get("managed_dir") if is_managed else None
     task_reqs = task_requirements_for(payload)
     req_model = extract_requested_model(payload, provider=payload.get("provider") if is_managed else None)
-    quse_data = fetch_quse(
-        account_label=account_label,
-        provider=payload.get("provider") if is_managed else None,
-        requested_model=req_model,
-        config_dir=config_dir,
-        managed_dir=managed_dir,
-    )
-    record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
-    valid_routes, rejections = validate_quse(
-        quse_data, task_requirements=task_reqs, config_dir=config_dir)
-    record["rejections"] = rejections
+    provider_home = payload.get("provider_home")
+    central_home = None
+    if provider_home:
+        from launcher.provider_home import admission
+        chosen, central_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
+        if payload.get("account_label") != central_home["account_id"]:
+            raise ValueError("provider_account_binding_mismatch")
+        requirements=payload.get('model_requirements',{})
+        if requirements.get('models')!=[chosen['model']] or requirements.get('providers') not in ([chosen['provider']],[central_home['provider']]):
+            raise ValueError('provider_model_binding_mismatch')
+        if central_home['provider']=='zai' and payload.get('account_profile')!='hub-zai-central':
+            raise ValueError('zai_central_profile_required')
+        record["central_generation"] = central_home["generation"]
+        record["quota_source"] = "central-provider-api"
+        is_managed = True
+    else:
+        quse_data = fetch_quse(
+            account_label=account_label,
+            provider=payload.get("provider") if is_managed else None,
+            requested_model=req_model,
+            config_dir=config_dir,
+            managed_dir=managed_dir,
+        )
+        record["quse_fetched_at"] = datetime.now(timezone.utc).isoformat()
+        valid_routes, rejections = validate_quse(
+            quse_data, task_requirements=task_reqs, config_dir=config_dir)
+        record["rejections"] = rejections
 
-    if not valid_routes:
-        record["outcome"] = "no-valid-route"
-        _write_launch_record(cwd, record)
-        raise ValueError("No valid routes available")
+        if not valid_routes:
+            record["outcome"] = "no-valid-route"
+            _write_launch_record(cwd, record)
+            raise ValueError("No valid routes available")
 
-    seed = int(time.time() * 1000)
-    chosen, provenance = select_candidate(valid_routes, seed=seed)
-    record["ranking"] = provenance
-    record["promo_multiplier"] = PROMO_MULTIPLIER
-    record["promo_cutoff_utc"] = PROMO_CUTOFF_UTC
-    if not chosen:
-        record["outcome"] = "no-selectable-candidate"
-        _write_launch_record(cwd, record)
-        raise ValueError("No eligible candidate chosen (unknown fit/health weight 0)")
+        seed = int(time.time() * 1000)
+        chosen, provenance = select_candidate(valid_routes, seed=seed)
+        record["ranking"] = provenance
+        record["promo_multiplier"] = PROMO_MULTIPLIER
+        record["promo_cutoff_utc"] = PROMO_CUTOFF_UTC
+        if not chosen:
+            record["outcome"] = "no-selectable-candidate"
+            _write_launch_record(cwd, record)
+            raise ValueError("No eligible candidate chosen (unknown fit/health weight 0)")
 
     provider = chosen["provider"]
     record["provider"] = provider
@@ -938,6 +954,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     # engine even when the model name begins with gemini. Existing bindings
     # retain the engine recorded at their original birth.
     native_engine = {"opencode": "opencode", "antigravity": "antigravity", "zai": "zcodex", "codex": "codex", "gemini": "gemini", "claude": "claude"}.get(provider)
+    if central_home and provider == "zai":
+        native_engine = "codex"
     if native_engine and not account_profile:
         cmd.extend(["--engine", native_engine])
     if provider == "opencode" and not account_profile:
@@ -954,6 +972,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     elif provider == "zai":
         child_env["ZCODE_WARM"] = "1"
         child_env["ZCODE_WARM_MODE"] = "yolo"
+    if central_home:
+        from launcher.provider_home import native_environment
+        child_env.update(native_environment(provider_home))
     child_env["TMPDIR"] = tmpdir_resolved
     from launcher.interactive import child_config_path
     context=child_config_path(payload.get('child_config_file'),payload['cwd'])
@@ -961,7 +982,14 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
-    if account_profile:
+    if central_home:
+        if provider=='claude':
+            binary=shutil.which('claude')
+            if not binary:raise ValueError('provider_sdk_unavailable')
+            cmd.extend([binary,'--dangerously-skip-permissions','-p','--model',chosen['model'],goal])
+        else:
+            cmd.extend(build_adapter_argv(provider, goal, model=chosen["model"]))
+    elif account_profile:
         label = account_label or (account_profile[4:] if account_profile.startswith("hub-") else account_profile)
         cmd.extend(build_managed_profile_argv(provider, goal, label, model=chosen.get("model"), managed_dir=managed_dir))
     else:
@@ -1077,6 +1105,12 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         store.transition_task(task_id, "starting", ("queued",),
                               reason=f"launching via {provider}")
         env = os.environ.copy()
+        for name in ("HUB2_LAUNCH_CONTEXT", "HUB2_TOKEN", "HUB2_SERVER", "HUB_TOKEN", "HUB_JOB_TOKEN", "HUB_CONFIG_FILE", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ZAI_API_KEY", "GO_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+            env.pop(name, None)
+        if central_home:
+            for name in list(env):
+                if name.startswith(('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CLAUDE_CODE_')):
+                    env.pop(name)
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
