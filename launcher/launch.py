@@ -766,6 +766,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     if not payload.get("owner") or not payload.get("cwd") or not payload.get("timeout"):
         raise ValueError("Missing owner/cwd/timeout in payload")
     timeout_seconds = _bounded_timeout(payload)
+    mode=payload.get('mode','headless')
+    with_goal=payload.get('with_goal',False)
+    effort=payload.get('effort')
+    if mode not in {'headless','interactive'} or type(with_goal) is not bool:
+        raise ValueError('invalid_launch_mode')
+    if with_goal and mode!='interactive':
+        raise ValueError('goal_requires_interactive')
 
     # Pre-action receiver guard for root-run profile
     from launcher.task_profiles import resolve_task_bounds
@@ -899,7 +906,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     # needs it inside its brief (see FIRST_ACTION_INSTRUCTION).
     fa_path = Path(cwd) / ".local" / f"first-action-{task_id}.json"
     goal = payload.get("goal", "")
-    if provider in {"opencode", "antigravity", "zai", "gemini", "claude"} or (provider == "codex" and is_managed):
+    if provider in {"opencode", "antigravity", "zai", "gemini", "claude"} or (provider == "codex" and (is_managed or mode=='interactive')):
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
     cmd = [
@@ -956,6 +963,16 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         cmd.extend(build_managed_profile_argv(provider, goal, label, model=chosen.get("model"), managed_dir=managed_dir))
     else:
         cmd.extend(build_adapter_argv(provider, goal, model=chosen.get("model")))
+    if mode=='interactive':
+        from launcher.interactive import interactive_argv
+        boundary=cmd.index('--')+1
+        cmd[boundary:]=interactive_argv(provider,cmd[boundary:],goal,model=chosen.get('model'),effort=effort,with_goal=with_goal)
+        record.update(mode=mode,with_goal=with_goal,effort=effort)
+    elif effort is not None:
+        from launcher.interactive import headless_effort_argv
+        boundary=cmd.index('--')+1
+        cmd[boundary:]=headless_effort_argv(provider,cmd[boundary:],effort)
+        record['effort']=effort
     record["adapter_argv"] = cmd[cmd.index("--") + 1:]
 
     deadline = time.monotonic() + timeout_seconds
@@ -1151,6 +1168,36 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         store.transition_task(task_id, "launch-uncertain", ("starting",), reason=record["reason"])
         return 1
 
+    if effort is not None:
+        from launcher.interactive import command_effort
+        expected_effort='xhigh' if effort=='max' and provider in {'codex','zai'} else effort
+        record['effort_verified']=command_effort(start_json.get('command'))==expected_effort
+        if not record['effort_verified']:
+            record.update(outcome='launch-uncertain',reason='effort_mismatch')
+            _write_launch_record(cwd,record)
+            store.transition_task(task_id,'launch-uncertain',('starting',),reason=record['reason'])
+            return 1
+    if mode=='interactive':
+        if start_json.get('command')!=record['adapter_argv']:
+            record.update(outcome='launch-uncertain',reason='interactive_command_mismatch')
+            _write_launch_record(cwd,record)
+            store.transition_task(task_id,'launch-uncertain',('starting',),reason=record['reason'])
+            return 1
+        record['interactive_verified']=True
+        if with_goal:
+            from launcher.interactive import register_native_goal,goal_prompt
+            record['goal_registration_intent']=True
+            _write_launch_record(cwd,record)
+            try:
+                if not has_full_observed_identity:raise ValueError('native_goal_identity_unverified')
+                record['goal_registration']=register_native_goal(native_id=sess_id,tag=sess_tag,
+                    workspace=binding_ws,engine=sess_engine,created_at_ms=sess_created_at_ms,
+                    prompt=goal_prompt(goal,workspace,task_id,fa_path),timeout=max(.1,deadline-time.monotonic()))
+            except Exception:
+                record.update(outcome='launch-uncertain',reason='native_goal_registration_unverified')
+                _write_launch_record(cwd,record)
+                store.transition_task(task_id,'launch-uncertain',('starting',),reason=record['reason'])
+                return 1
     # --- first-action wait happens OUTSIDE the launch lock ---
     record["first_action_path"] = str(fa_path)
     
