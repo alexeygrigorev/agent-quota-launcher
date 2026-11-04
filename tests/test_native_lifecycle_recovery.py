@@ -122,6 +122,33 @@ class NativeLifecycleValidationTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 real_fstat(opened[0])
 
+    def test_native_retained_output_envelope_preserves_only_lifecycle_metadata(self):
+        from launcher.native_lifecycle import MAX_TOMBSTONE_BYTES, MAX_TOMBSTONE_ENVELOPE_BYTES
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "retired-sessions" / VALID_UUID / "tombstone.json"
+            path.parent.mkdir(parents=True)
+            receipt = {
+                "id": VALID_UUID, "tag": "task-t-1", "workspace": "/tmp/ws",
+                "cause": "finished", "created_at_ms": 1000, "finished_at_ms": 2000,
+                "containment_empty": True,
+                "exit": {"code": 0, "signal": None, "oom_killed": False, "exited_at_ms": 1999},
+                "output": {"status": "complete", "observed_bytes": 65536,
+                           "limit_bytes": 65536, "bytes": [255] * 65536},
+            }
+            path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+            self.assertGreater(path.stat().st_size, MAX_TOMBSTONE_BYTES)
+            self.assertLess(path.stat().st_size, MAX_TOMBSTONE_ENVELOPE_BYTES)
+            metadata = read_tombstone(VALID_UUID, state_dir=Path(tmp))
+            self.assertEqual(metadata, {k: v for k, v in receipt.items() if k != "output"})
+            self.assertTrue(verify_tombstone(metadata, VALID_UUID, "task-t-1", "/tmp/ws", 1000)[0])
+            self.assertEqual(metadata["exit"]["code"], 0)
+
+            # A valid prefix is not evidence if the bounded envelope truncates.
+            path.write_bytes(path.read_bytes()[:-2])
+            self.assertIsNone(read_tombstone(VALID_UUID, state_dir=Path(tmp)))
+            path.write_bytes(b" " * (MAX_TOMBSTONE_ENVELOPE_BYTES + 1))
+            self.assertIsNone(read_tombstone(VALID_UUID, state_dir=Path(tmp)))
+
     def test_fractional_finished_timestamp_is_not_terminal_proof(self):
         tombstone = {"id": VALID_UUID, "tag": "task-t-1", "workspace": "/tmp/ws",
                      "cause": "finished", "finished_at_ms": 1792260000001.5}
