@@ -1125,6 +1125,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             from launcher.provider_home import clean_provider_environment
             env = clean_provider_environment(env)
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
+        if runtime_deadline is not None:
+            env.pop("APLEXER_WORKER", None)
         if central_home:
             try:
                 final_chosen, final_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
@@ -1137,6 +1139,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
                 record.update(outcome="admission-unverified", reason="final provider gate failed before native spawn")
                 _write_launch_record(cwd, record)
                 raise
+
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)

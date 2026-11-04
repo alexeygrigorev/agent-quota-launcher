@@ -181,10 +181,11 @@ class ProviderHomes(unittest.TestCase):
                    'provider_home': str(manifest), 'model_requirements': {'models': ['configured-model'], 'providers': ['zai']}}
         store.submit_task('central-test', 'central-key', payload, [])
         with ExitStack() as stack:
-            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key','CLAUDE_CONFIG_DIR':'/hostile-claude'}))
+            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key','CLAUDE_CONFIG_DIR':'/hostile-claude','APLEXER_WORKER':'/unreviewed/old-worker'}))
             launch_environment=os.environ.copy()
             launch_environment['APLEXER_RETAIN_RETIRED_OUTPUT']='1'
             stack.enter_context(patch('launcher.launch.os.environ.copy',return_value=launch_environment))
+
             gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, dict(verify(manifest),runtime_deadline=int(time.time()*1000)+60000))))
 
 
@@ -223,6 +224,8 @@ class ProviderHomes(unittest.TestCase):
             self.assertNotIn('CODEX_API_KEY', env)
             self.assertNotIn('CLAUDE_CONFIG_DIR',env)
             self.assertIn('CLAUDE_CONFIG_DIR='+str(manifest.parent/'home/.claude'),argv)
+            self.assertNotIn('APLEXER_WORKER', env)
+
             self.assertNotIn('synthetic-host-secret', json.dumps(argv))
 
 
