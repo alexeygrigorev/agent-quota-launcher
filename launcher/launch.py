@@ -927,6 +927,11 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     if provider in {"opencode", "antigravity", "zai", "gemini", "claude"} or (provider == "codex" and (is_managed or mode=='interactive')):
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
+    runtime_deadline = central_home["runtime_deadline"] if central_home else payload.get("runtime_deadline")
+    if runtime_deadline is not None or payload.get("child_config_file"):
+        if (type(runtime_deadline) is not int or not time.time()*1000 < runtime_deadline <= (time.time()+timeout_seconds)*1000
+                or payload.get("runtime_deadline",runtime_deadline) != runtime_deadline):
+            raise ValueError("native_runtime_deadline_unverified")
     cmd = [
         "aplexer", "start",
         "--json",
@@ -940,6 +945,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         "--cwd", native_cwd,
         "--tag", run_tag,
     ]
+    if runtime_deadline is not None:
+        cmd.extend(["--deadline-ms", str(runtime_deadline)])
+        record["runtime_deadline"] = runtime_deadline
     account_profile = payload.get("account_profile") or payload.get("provider_profile")
     if not account_profile and isinstance(payload.get("profile"), str) and payload["profile"].startswith("hub-"):
         account_profile = payload["profile"]
@@ -1117,6 +1125,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             from launcher.provider_home import clean_provider_environment
             env = clean_provider_environment(env)
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
+        if runtime_deadline is not None:
+            env.pop("APLEXER_WORKER", None)
         if central_home:
             try:
                 final_chosen, final_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
@@ -1129,6 +1139,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
                 record.update(outcome="admission-unverified", reason="final provider gate failed before native spawn")
                 _write_launch_record(cwd, record)
                 raise
+
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
@@ -1212,6 +1223,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             record["native_binding_error"] = str(e)
     else:
         record["native_binding_unbound_reason"] = "missing or invalid required observed start fields"
+
+    if runtime_deadline is not None and start_json.get("deadline_ms") != runtime_deadline:
+        record["outcome"] = "launch-uncertain"
+        record["reason"] = "native runtime deadline receipt mismatch"
+        _write_launch_record(cwd, record)
+        store.transition_task(task_id, "launch-uncertain", ("starting",), reason=record["reason"])
+        return 1
 
     record["observed_model"] = native_command_model(start_json.get("command"))
     record["model_verified"] = record["observed_model"] == record["requested_model"]

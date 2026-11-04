@@ -339,6 +339,10 @@ def admission(manifest, controller):
             or not now < quota.get('valid_until', 0) <= quota.get('captured_at', 0) + 300000
             or type(quota.get('remaining')) not in (int, float) or not 0 < quota['remaining'] <= 100 or not math.isfinite(quota['remaining'])):
         raise ValueError('central_provider_evidence_unverified')
+    deadline = result.get('runtime_deadline')
+    if type(deadline) is not int or not now < deadline <= now + 7200000:
+        raise ValueError('central_runtime_deadline_unverified')
+    data['runtime_deadline'] = deadline
     if data['provider'] == 'codex':
         from launcher.admission import CODEX_MIN_REMAINING
         if quota['remaining'] <= CODEX_MIN_REMAINING:
