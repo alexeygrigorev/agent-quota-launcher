@@ -93,6 +93,9 @@ class ProviderHomes(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'lifetime'):
             require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 600)
         require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 60)
+        require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 60.0)
+        with self.assertRaises(ValueError):
+            require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, True)
         with self.assertRaises(ValueError):
             access_only('claude', {'claudeAiOauth': {'accessToken': 'access', 'expiresAt': None}})
         jwt = 'e30.' + base64.urlsafe_b64encode(json.dumps({'exp': time.time() + 86400}).encode()).decode().rstrip('=') + '.synthetic'

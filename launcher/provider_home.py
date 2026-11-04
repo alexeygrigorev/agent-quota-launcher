@@ -115,7 +115,7 @@ def require_lifetime(data, timeout):
         return
     # Sixty seconds is the explicit controller clock/dispatch safety margin,
     # in addition to the SDK's independently recorded proactive cutoff.
-    if type(timeout) is not int or not 1 <= timeout <= 7200 or min(data['access_expires_at'], data['proactive_refresh_at']) <= time.time() * 1000 + (timeout + 60) * 1000:
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 7200 or min(data['access_expires_at'], data['proactive_refresh_at']) <= time.time() * 1000 + (timeout + 60) * 1000:
         raise ValueError('provider_access_lifetime_insufficient')
 
 
