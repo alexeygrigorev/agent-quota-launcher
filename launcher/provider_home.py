@@ -3,6 +3,7 @@ import hashlib
 import base64
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -336,7 +337,7 @@ def admission(manifest, controller):
             or quota.get('source') != 'provider:' + data['provider'] + ':generation:' + str(data['generation'])
             or not now - 300000 <= quota.get('captured_at', 0) <= now + 5000
             or not now < quota.get('valid_until', 0) <= quota.get('captured_at', 0) + 300000
-            or not isinstance(quota.get('remaining'), (int, float)) or not 0 < quota['remaining'] <= 100):
+            or type(quota.get('remaining')) not in (int, float) or not 0 < quota['remaining'] <= 100 or not math.isfinite(quota['remaining'])):
         raise ValueError('central_provider_evidence_unverified')
     if data['provider'] == 'codex':
         from launcher.admission import CODEX_MIN_REMAINING
@@ -358,11 +359,13 @@ def home_environment(home, provider):
     return env
 
 
+def clean_provider_environment():
+    prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_CODE_', 'ZAI_', 'GO_API_')
+    return {key: value for key, value in os.environ.items() if not key.startswith(prefixes)}
+
+
 def go_sdk(home, arguments, text=None):
-    env = os.environ.copy()
-    for key in list(env):
-        if key.startswith(('OPENCODE_', 'HUB', 'AGENT_HUB_')):
-            env.pop(key)
+    env = clean_provider_environment()
     env.update(home_environment(home, 'go'))
     binary = shutil.which('opencode')
     if not binary:

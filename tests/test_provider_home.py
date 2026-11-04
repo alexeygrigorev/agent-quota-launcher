@@ -107,7 +107,11 @@ class ProviderHomes(unittest.TestCase):
             require_lifetime({'provider': 'codex', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 60)
 
     def test_go_auth_forces_private_standalone_sdk_not_ambient_service(self):
-        with patch.dict(os.environ, {'OPENCODE_SERVER': 'https://foreign.invalid', 'HUB2_TOKEN': 'synthetic-host-secret'}), \
+        forbidden = {'OPENCODE_SERVER': 'https://foreign.invalid', 'HUB2_TOKEN': 'synthetic-host-secret',
+                     'ANTHROPIC_API_KEY':'foreign','OPENAI_API_KEY':'foreign','CODEX_API_KEY':'foreign',
+                     'CLAUDE_CODE_OAUTH_TOKEN':'foreign','OPENCODE_GO_API_KEY':'foreign','ZAI_API_KEY':'foreign',
+                     'CODEX_HOME':'/foreign','ANTHROPIC_BASE_URL':'https://foreign.invalid'}
+        with patch.dict(os.environ, forbidden), \
              patch('launcher.provider_home.shutil.which', return_value='installed-opencode'), \
              patch('launcher.provider_home.subprocess.run') as run:
             run.return_value.returncode = 0
@@ -116,7 +120,8 @@ class ProviderHomes(unittest.TestCase):
             self.assertEqual(run.call_args.args[0], ['installed-opencode', 'auth', 'export', 'opencode', '--standalone'])
             env = run.call_args.kwargs['env']
             self.assertNotIn('OPENCODE_SERVER', env)
-            self.assertNotIn('HUB2_TOKEN', env)
+            for key,value in forbidden.items():
+                self.assertNotEqual(env.get(key),value)
             self.assertEqual(env['OPENCODE_DB'], str(self.root / '.local/share/opencode/opencode.db'))
 
     def test_actual_authenticated_http_gate_revalidates_every_attempt(self):
@@ -156,6 +161,10 @@ class ProviderHomes(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 admission(manifest, context)
             response[key] = previous
+        for remaining in (True,False,float('nan'),float('inf'),float('-inf')):
+            response['quota']['remaining']=remaining
+            with self.subTest(remaining=remaining),self.assertRaises(ValueError):admission(manifest,context)
+        response['quota']['remaining']=3
         response['quota']['valid_until'] = now - 1
         with self.assertRaises(ValueError):
             admission(manifest, context)
@@ -188,7 +197,8 @@ class ProviderHomes(unittest.TestCase):
                     'worker_pid': 1234, 'command': argv[argv.index('--') + 1:]}), ''
             popen.return_value.communicate.side_effect = started
             self.assertEqual(do_run(str(root / 'tasks.sqlite'), 'central-test', str(root), None, str(root / 'lock')), 0)
-            gate.assert_called_once_with(str(manifest), '/private/controller.json')
+            self.assertEqual(gate.call_count,2)
+            gate.assert_called_with(str(manifest), '/private/controller.json')
             self.assertFalse(quse.called)
             self.assertFalse(legacy.called)
             argv = popen.call_args.args[0]
@@ -199,6 +209,43 @@ class ProviderHomes(unittest.TestCase):
             self.assertNotIn('HUB2_TOKEN', env)
             self.assertNotIn('CODEX_API_KEY', env)
             self.assertNotIn('synthetic-host-secret', json.dumps(argv))
+
+
+    def test_actual_remote_gate_after_resources_refuses_changed_generation_before_spawn(self):
+        from launcher.store import Store
+        from launcher.launch import do_run
+        manifest=self.home()
+        root=self.root/'late-gate';(root/'.local').mkdir(parents=True)
+        now=int(time.time()*1000)
+        binding={'account_id':'zai-central','session_id':'s1','operation_id':'op1','epoch':1,'machine_id':'m1'}
+        response={**binding,'launch_allowed':True,'provider':'zai','credential_generation':1,'model':'configured-model',
+                  'quota':{'source':'provider:zai:generation:1','remaining':3,'captured_at':now,'valid_until':now+300000}}
+        calls=[]
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*args):pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                calls.append(self.path);raw=json.dumps(response).encode()
+                self.send_response(200);self.end_headers();self.wfile.write(raw)
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        context=self.root/'late-controller.json'
+        context.write_text(json.dumps({'server':'http://127.0.0.1:'+str(server.server_port),'token':'synthetic-host-token','binding':binding}))
+        make_private(context)
+        store=Store(str(root/'tasks.sqlite'))
+        store.submit_task('late-gate','late-key',{'owner':'test','cwd':str(root),'goal':'synthetic objective','timeout':60,
+            'mode':'interactive','account_label':'zai-central','account_profile':'hub-zai-central','provider_home':str(manifest),
+            'model_requirements':{'models':['configured-model'],'providers':['zai']}},[])
+        with patch.dict(os.environ,{'HUB2_LAUNCH_CONTEXT':str(context)}), \
+             patch('launcher.launch.fetch_quse',side_effect=AssertionError('legacy quota')), \
+             patch('launcher.launch.build_adapter_argv',side_effect=lambda provider,goal,model:['synthetic-sdk','exec','--model',model,'--json',goal]), \
+             patch('launcher.launch.check_resources',side_effect=lambda *a,**k:response.update(credential_generation=2)), \
+             patch('launcher.launch.subprocess.Popen') as spawn:
+            with self.assertRaisesRegex(ValueError,'central_provider_evidence_unverified'):
+                do_run(str(root/'tasks.sqlite'),'late-gate',str(root),None,str(root/'lock'))
+            self.assertFalse(spawn.called)
+        self.assertEqual(calls,['/api/sessions/s1/admission']*2)
 
     def test_central_codex_dispatch_preserves_all_admission_without_unmanaged_wrapper(self):
         from launcher.store import Store

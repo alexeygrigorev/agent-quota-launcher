@@ -1114,10 +1114,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         for name in ("HUB2_LAUNCH_CONTEXT", "HUB2_TOKEN", "HUB2_SERVER", "HUB_TOKEN", "HUB_JOB_TOKEN", "HUB_CONFIG_FILE", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_AUTH_TOKEN", "CODEX_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ZAI_API_KEY", "GO_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
             env.pop(name, None)
         if central_home:
-            for name in list(env):
-                if name.startswith(('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CLAUDE_CODE_')):
-                    env.pop(name)
+            from launcher.provider_home import clean_provider_environment
+            env = clean_provider_environment()
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
+        if central_home:
+            final_chosen, final_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
+            if final_chosen != chosen or final_home != central_home:
+                raise ValueError("central_provider_changed_before_spawn")
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
