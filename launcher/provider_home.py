@@ -1,5 +1,7 @@
 """Private central provider homes; controller admission never enters native metadata."""
 import hashlib
+import base64
+import datetime
 import json
 import os
 import re
@@ -14,6 +16,18 @@ from pathlib import Path
 
 PATHS = {'codex': '.codex/auth.json', 'claude': '.claude/.credentials.json',
          'go': '.local/share/opencode-hub/device-auth.json', 'zai': '.config/goz/config.json'}
+SDK_VERSIONS = {'codex': '0.166.0', 'claude': '2.1.289', 'go': '2.0.32'}
+
+
+def sdk_version(provider):
+    binary = shutil.which('opencode' if provider == 'go' else provider)
+    if not binary:
+        raise ValueError('provider_sdk_unavailable')
+    result = subprocess.run([binary, '--version'], text=True, capture_output=True, timeout=5, check=False)
+    observed = re.search(r'(?<![0-9.])' + re.escape(SDK_VERSIONS[provider]) + r'(?![0-9.])', result.stdout)
+    if result.returncode or len(result.stdout) > 4096 or not observed:
+        raise ValueError('provider_sdk_refresh_policy_unverified')
+    return SDK_VERSIONS[provider]
 
 
 def make_private(path):
@@ -51,11 +65,62 @@ def fingerprint(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def access_only(provider, value):
+    """Preserve actual expiry; ordinary SDKs never receive a rotatable token.
+
+    Installed Codex 0.166 refreshes at last_refresh + eight days. Claude
+    2.1.289 and Go 2.0.32 refresh within five minutes of access expiry.
+    """
+    value = json.loads(json.dumps(value))
+    proactive = None
+    if provider == 'codex':
+        token = value['tokens']['access_token']
+        claims = json.loads(base64.urlsafe_b64decode(token.split('.')[1] + '==='))
+        expires = claims['exp'] * 1000
+        refreshed = datetime.datetime.fromisoformat(value['last_refresh'].replace('Z', '+00:00'))
+        if refreshed.tzinfo is None:
+            raise ValueError('provider_refresh_time_unknown')
+        if refreshed.timestamp() * 1000 > time.time() * 1000 + 5000:
+            raise ValueError('provider_refresh_time_invalid')
+        proactive = refreshed.timestamp() * 1000 + 8 * 86400000
+    elif provider == 'claude':
+        expires = value['claudeAiOauth']['expiresAt']
+    else:
+        active = [row for row in value if row.get('active') is True]
+        if len(active) != 1:
+            raise ValueError('provider_active_identity_ambiguous')
+        expires = active[0]['value']['expires']
+    if type(expires) not in (int, float) or not 0 < expires < 10**14:
+        raise ValueError('provider_access_expiry_unknown')
+    if proactive is None:
+        proactive = expires - 300000
+    def strip(item):
+        if isinstance(item, list):
+            return [strip(entry) for entry in item]
+        if isinstance(item, dict):
+            return {key: ('' if key in {'refresh', 'refresh_token', 'refreshToken', 'idpRefreshToken'} else strip(entry)) for key, entry in item.items()}
+        return item
+    stripped = strip(value)
+    if provider == 'codex':
+        stripped['tokens']['refresh_token'] = ''
+    elif provider == 'go':
+        for row in stripped:
+            row['value']['refresh'] = ''
+    return stripped, expires, proactive
+
+
+def require_lifetime(data, timeout):
+    if data['provider'] == 'zai':
+        return
+    # Sixty seconds is the explicit controller clock/dispatch safety margin,
+    # in addition to the SDK's independently recorded proactive cutoff.
+    if type(timeout) is not int or not 1 <= timeout <= 7200 or min(data['access_expires_at'], data['proactive_refresh_at']) <= time.time() * 1000 + (timeout + 60) * 1000:
+        raise ValueError('provider_access_lifetime_insufficient')
+
+
 def token_for(provider, value):
     if provider == 'codex':
         token = value['tokens']['access_token']
-        if not isinstance(value['tokens']['refresh_token'], str):
-            raise ValueError('provider_refresh_missing')
     elif provider == 'claude':
         token = value['claudeAiOauth']['accessToken']
     elif provider == 'go':
@@ -77,7 +142,7 @@ def zcode_files(token, model):
     # from the configured policy, never a fallback/default model.
     provider = 'zai-coding-plan'
     base = 'https://api.z.ai/api/anthropic'
-    native = model.upper() if model.startswith('glm-') else model
+    native = model
     config = {'schemaVersion': 1, 'config': {
         'providerConfigRules': {'providerRules': [{'providerId': provider, 'providerName': 'Z.AI Coding Plan',
             'config': {'group': 'standard-personal', 'access': {'type': 'api-key', 'apiKey': token},
@@ -109,13 +174,16 @@ def selected_token(provider, home, model):
         token = rule['access']['apiKey']
     elif provider == 'go':
         source = '.local/share/opencode/opencode.db'
-        token = token_for(provider, go_sdk(home, ['auth', 'export', 'opencode']))
+        exported = go_sdk(home, ['auth', 'export', 'opencode'])
+        if exported != access_only(provider, exported)[0]:
+            raise ValueError('provider_refresh_material_forbidden')
+        token = token_for(provider, exported)
     else:
         token = token_for(provider, json.loads(private_read(home / source)))
     return source, fingerprint(token)
 
 
-def materialize(root, account, provider, generation, files, model):
+def materialize(root, account, provider, generation, files, model, timeout_seconds=7200):
     if provider not in PATHS or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', account):
         raise ValueError('provider_identity_invalid')
     if provider == 'zai' and account != 'zai-central':
@@ -128,6 +196,13 @@ def materialize(root, account, provider, generation, files, model):
     if not isinstance(text, str) or not 0 < len(text) <= 16000:
         raise ValueError('provider_bundle_invalid')
     token = token_for(provider, json.loads(text))
+    bounds = {}
+    if provider != 'zai':
+        native, expires, proactive = access_only(provider, json.loads(text))
+        bounds = {'access_expires_at': expires, 'proactive_refresh_at': proactive, 'access_only': True, 'sdk_version': sdk_version(provider)}
+        require_lifetime({'provider': provider, **bounds}, timeout_seconds)
+        files = {PATHS[provider]: json.dumps(native)}
+        text = files[PATHS[provider]]
     digest = fingerprint(token)
     root = Path(root).resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -137,6 +212,7 @@ def materialize(root, account, provider, generation, files, model):
         result = verify(destination / 'manifest.json')
         if result['credential_hash'] != digest or result['model'] != model:
             raise ValueError('provider_generation_conflict')
+        require_lifetime(result, timeout_seconds)
         return str(destination / 'manifest.json')
     staging = Path(tempfile.mkdtemp(prefix='.provider-', dir=root))
     make_private(staging)
@@ -164,7 +240,7 @@ def materialize(root, account, provider, generation, files, model):
             raise ValueError('provider_sdk_credential_mismatch')
         metadata = {'version': 1, 'account_id': account, 'provider': provider, 'generation': generation,
                     'model': model, 'source': source, 'credential_hash': digest,
-                    'files': {name: fingerprint(value) for name, value in content.items()}}
+                    'files': {name: fingerprint(value) for name, value in content.items()}, **bounds}
         fd = os.open(staging / 'manifest.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as stream:
             json.dump(metadata, stream)
@@ -210,6 +286,13 @@ def verify(manifest):
     source, digest = selected_token(provider, home, data['model'])
     if source != data['source'] or digest != data['credential_hash']:
         raise ValueError('provider_sdk_credential_mismatch')
+    if provider != 'zai':
+        native = json.loads(private_read(home / PATHS[provider]))
+        stripped, expires, proactive = access_only(provider, native)
+        if native != stripped or data.get('access_only') is not True or expires != data.get('access_expires_at') or proactive != data.get('proactive_refresh_at'):
+            raise ValueError('provider_refresh_material_forbidden')
+        if data.get('sdk_version') != sdk_version(provider):
+            raise ValueError('provider_sdk_refresh_policy_unverified')
     return data
 
 
@@ -279,6 +362,11 @@ def go_sdk(home, arguments, text=None):
                             env=env, timeout=20, check=False)
     if result.returncode or len(result.stdout) > 131072:
         raise ValueError('provider_sdk_auth_unverified')
+    database = home / '.local/share/opencode/opencode.db'
+    if database.exists():
+        if database.is_symlink() or not database.resolve().is_relative_to(home.resolve()):
+            raise ValueError('provider_sdk_store_untrusted')
+        make_private(database)
     return json.loads(result.stdout) if text is None else None
 
 

@@ -853,6 +853,8 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     if provider_home:
         from launcher.provider_home import admission
         chosen, central_home = admission(provider_home, os.environ.get("HUB2_LAUNCH_CONTEXT", ""))
+        from launcher.provider_home import require_lifetime
+        require_lifetime(central_home, timeout_seconds)
         if payload.get("account_label") != central_home["account_id"]:
             raise ValueError("provider_account_binding_mismatch")
         requirements=payload.get('model_requirements',{})

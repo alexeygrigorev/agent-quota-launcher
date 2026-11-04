@@ -1,4 +1,6 @@
 import json
+import base64
+import datetime
 import os
 from pathlib import Path
 import tempfile
@@ -9,7 +11,7 @@ from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from launcher.provider_home import materialize, verify, admission, native_environment, make_private, go_sdk
+from launcher.provider_home import materialize, verify, admission, native_environment, make_private, go_sdk, access_only, require_lifetime
 
 
 class ProviderHomes(unittest.TestCase):
@@ -62,18 +64,40 @@ class ProviderHomes(unittest.TestCase):
                 verify(manifest)
 
     def test_codex_claude_and_go_native_auth_import_export(self):
-        cases = [('codex', '.codex/auth.json', {'tokens': {'access_token': 'codex-access', 'refresh_token': 'codex-refresh'}}),
-                 ('claude', '.claude/.credentials.json', {'claudeAiOauth': {'accessToken': 'claude-access'}}),
-                 ('go', '.local/share/opencode-hub/device-auth.json', [{'active': True, 'value': {'access': 'go-access'}}])]
+        jwt = 'e30.' + base64.urlsafe_b64encode(json.dumps({'exp': time.time() + 86400}).encode()).decode().rstrip('=') + '.synthetic'
+        cases = [('codex', '.codex/auth.json', {'tokens': {'access_token': jwt, 'refresh_token': 'codex-refresh'}, 'last_refresh': datetime.datetime.now(datetime.timezone.utc).isoformat()}),
+                 ('claude', '.claude/.credentials.json', {'claudeAiOauth': {'accessToken': 'claude-access', 'refreshToken': 'claude-refresh', 'expiresAt': (time.time() + 86400) * 1000}}),
+                 ('go', '.local/share/opencode-hub/device-auth.json', [{'active': True, 'value': {'access': 'go-access', 'refresh': 'go-refresh', 'expires': (time.time() + 86400) * 1000}}])]
         for provider, source, value in cases:
-            with self.subTest(provider=provider), patch('launcher.provider_home.go_sdk', return_value=value) as sdk:
+            with self.subTest(provider=provider), patch('launcher.provider_home.sdk_version', return_value='synthetic-tested-sdk'), patch('launcher.provider_home.go_sdk', return_value=access_only(provider, value)[0]) as sdk:
                 path = materialize(self.root, provider + '-central', provider, 2, {source: json.dumps(value)}, 'configured-model')
                 self.assertEqual(verify(path)['provider'], provider)
+                self.assertNotIn(provider + '-refresh', (Path(path).parent / 'home' / source).read_text())
                 self.assertEqual(native_environment(path)['HOME'], str(Path(path).parent / 'home'))
                 self.assertEqual(sdk.called, provider == 'go')
                 if provider == 'go':
                     self.assertTrue(any(call.args[1] == ['auth', 'import'] for call in sdk.call_args_list))
                     self.assertTrue(any(call.args[1] == ['auth', 'export', 'opencode'] for call in sdk.call_args_list))
+
+    def test_access_only_actual_expiry_and_proactive_cutoff_are_independent(self):
+        now = time.time() * 1000
+        value = {'claudeAiOauth': {'accessToken': 'access', 'refreshToken': 'rotatable-secret', 'expiresAt': now + 600000}}
+        stripped, expiry, proactive = access_only('claude', value)
+        self.assertEqual(stripped['claudeAiOauth']['refreshToken'], '')
+        self.assertEqual(expiry, value['claudeAiOauth']['expiresAt'])
+        self.assertEqual(proactive, expiry - 300000)
+        with self.assertRaisesRegex(ValueError, 'lifetime'):
+            require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 600)
+        require_lifetime({'provider': 'claude', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 60)
+        with self.assertRaises(ValueError):
+            access_only('claude', {'claudeAiOauth': {'accessToken': 'access', 'expiresAt': None}})
+        jwt = 'e30.' + base64.urlsafe_b64encode(json.dumps({'exp': time.time() + 86400}).encode()).decode().rstrip('=') + '.synthetic'
+        old = {'tokens': {'access_token': jwt}, 'last_refresh': (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=9)).isoformat()}
+        stripped, expiry, proactive = access_only('codex', old)
+        self.assertGreater(expiry, now + 3600000)
+        self.assertEqual(stripped['last_refresh'], old['last_refresh'])
+        with self.assertRaisesRegex(ValueError, 'lifetime'):
+            require_lifetime({'provider': 'codex', 'access_expires_at': expiry, 'proactive_refresh_at': proactive}, 60)
 
     def test_go_auth_forces_private_standalone_sdk_not_ambient_service(self):
         with patch.dict(os.environ, {'OPENCODE_SERVER': 'https://foreign.invalid', 'HUB2_TOKEN': 'synthetic-host-secret'}), \
