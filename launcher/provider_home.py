@@ -237,7 +237,7 @@ def materialize(root, account, provider, generation, files, model, timeout_secon
                     break
                 make_private(directory)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf8') as stream:
+            with os.fdopen(fd, 'w', encoding='utf8', newline='') as stream:
                 stream.write(value)
                 stream.flush()
                 os.fsync(stream.fileno())
