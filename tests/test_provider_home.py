@@ -197,6 +197,37 @@ class ProviderHomes(unittest.TestCase):
             self.assertNotIn('CODEX_API_KEY', env)
             self.assertNotIn('synthetic-host-secret', json.dumps(argv))
 
+    def test_central_codex_dispatch_preserves_all_admission_without_unmanaged_wrapper(self):
+        from launcher.store import Store
+        from launcher.launch import do_run
+        root=self.root/'central-codex';(root/'.local').mkdir(parents=True)
+        store=Store(str(root/'store.sqlite'))
+        store.submit_task('central-codex','central-key',{'owner':'test','cwd':str(root),'goal':'synthetic first action',
+            'timeout':60,'provider_home':'/private/synthetic-manifest.json','account_label':'codex-central',
+            'model_requirements':{'providers':['codex'],'models':['configured-model']}},[])
+        with ExitStack() as stack:
+            stack.enter_context(patch('launcher.provider_home.admission',return_value=({'provider':'codex','model':'configured-model'},
+                {'provider':'codex','account_id':'codex-central','generation':1,'access_expires_at':(time.time()+86400)*1000,'proactive_refresh_at':(time.time()+86400)*1000})))
+            stack.enter_context(patch('launcher.provider_home.native_environment',return_value={'HOME':'/private/sdk-home'}))
+            stack.enter_context(patch('launcher.launch.shutil.which',return_value='/installed/codex'))
+            legacy=stack.enter_context(patch('launcher.launch.build_adapter_argv',side_effect=AssertionError('unmanaged adapter selected')))
+            quse=stack.enter_context(patch('launcher.launch.fetch_quse',side_effect=AssertionError('legacy quota selected')))
+            resources=stack.enter_context(patch('launcher.launch.check_resources'))
+            first=stack.enter_context(patch('launcher.launch.validate_first_action',return_value=True))
+            popen=stack.enter_context(patch('launcher.launch.subprocess.Popen'))
+            popen.return_value.returncode=0
+            def started(**kwargs):
+                argv=popen.call_args.args[0]
+                return json.dumps({'id':'11111111-1111-4111-8111-111111111111','tag':'task-central-codex','workspace':str(root),
+                    'engine':'codex','phase':'running','created_at_ms':int(time.time()*1000),'worker_pid':1234,'command':argv[argv.index('--')+1:]}),''
+            popen.return_value.communicate.side_effect=started
+            self.assertEqual(do_run(str(root/'store.sqlite'),'central-codex',str(root),None,str(root/'lock')),0)
+            self.assertFalse(legacy.called);self.assertFalse(quse.called)
+            self.assertTrue(resources.called);self.assertTrue(first.called)
+            argv=popen.call_args.args[0]
+            self.assertEqual(argv[argv.index('--')+1],'/installed/codex')
+            self.assertIn('--model',argv)
+
 
 if __name__ == '__main__':
     unittest.main()

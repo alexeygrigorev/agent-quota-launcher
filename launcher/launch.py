@@ -985,10 +985,14 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
     if central_home:
-        if provider=='claude':
-            binary=shutil.which('claude')
-            if not binary:raise ValueError('provider_sdk_unavailable')
-            cmd.extend([binary,'--dangerously-skip-permissions','-p','--model',chosen['model'],goal])
+        if provider in {'claude','codex'}:
+            binary=shutil.which(provider)
+            if not binary:
+                raise ValueError('provider_sdk_unavailable')
+            if provider=='claude':
+                cmd.extend([binary,'--dangerously-skip-permissions','-p','--model',chosen['model'],goal])
+            else:
+                cmd.extend([binary,'exec','--dangerously-bypass-approvals-and-sandbox','--json','--model',chosen['model'],goal])
         else:
             cmd.extend(build_adapter_argv(provider, goal, model=chosen["model"]))
     elif account_profile:
