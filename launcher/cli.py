@@ -194,6 +194,11 @@ def _run_with_host_hint(args):
             "tag": start_doc.get("tag"),
             "workspace": start_doc.get("workspace"),
             "engine": start_doc.get("engine"),
+            "mode": record_doc.get("mode", "headless"),
+            "interactive_verified": record_doc.get("interactive_verified") is True,
+            "effort": record_doc.get("effort"),
+            "effort_verified": record_doc.get("effort_verified") is True,
+            "goal_registration": record_doc.get("goal_registration"),
         }
         if outcome == "running":
             receipt["phase"] = start_doc.get("phase")
