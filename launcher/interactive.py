@@ -2,6 +2,20 @@
 import json
 
 
+def child_config_path(value,workspace):
+    if value is None:return None
+    import os
+    from pathlib import Path
+    if not isinstance(value,str):raise ValueError('child_config_path_untrusted')
+    path=Path(value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(Path(workspace).resolve()):
+        raise ValueError('child_config_path_untrusted')
+    info=path.stat()
+    if info.st_size>16384 or (os.name!='nt' and (info.st_uid!=os.getuid() or info.st_mode&0o077)):
+        raise ValueError('child_config_not_private')
+    return str(path.resolve())
+
+
 def objective_hash(value):
     import hashlib
     if not isinstance(value,str) or len(value.encode())>512*1024:

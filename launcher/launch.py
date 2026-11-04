@@ -955,6 +955,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         child_env["ZCODE_WARM"] = "1"
         child_env["ZCODE_WARM_MODE"] = "yolo"
     child_env["TMPDIR"] = tmpdir_resolved
+    from launcher.interactive import child_config_path
+    context=child_config_path(payload.get('child_config_file'),payload['cwd'])
+    if context:child_env['HUB2_CONFIG']=context
     for key, value in child_env.items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.extend(["--"])
