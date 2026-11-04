@@ -927,6 +927,11 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     if provider in {"opencode", "antigravity", "zai", "gemini", "claude"} or (provider == "codex" and (is_managed or mode=='interactive')):
         goal = str(goal) + FIRST_ACTION_INSTRUCTION.format(path=fa_path)
 
+    runtime_deadline = central_home["runtime_deadline"] if central_home else payload.get("runtime_deadline")
+    if runtime_deadline is not None or payload.get("child_config_file"):
+        if (type(runtime_deadline) is not int or not time.time()*1000 < runtime_deadline <= (time.time()+timeout_seconds)*1000
+                or payload.get("runtime_deadline",runtime_deadline) != runtime_deadline):
+            raise ValueError("native_runtime_deadline_unverified")
     cmd = [
         "aplexer", "start",
         "--json",
@@ -940,9 +945,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         "--cwd", native_cwd,
         "--tag", run_tag,
     ]
-    if central_home:
-        cmd.extend(["--deadline-ms", str(central_home["runtime_deadline"])])
-        record["runtime_deadline"] = central_home["runtime_deadline"]
+    if runtime_deadline is not None:
+        cmd.extend(["--deadline-ms", str(runtime_deadline)])
+        record["runtime_deadline"] = runtime_deadline
     account_profile = payload.get("account_profile") or payload.get("provider_profile")
     if not account_profile and isinstance(payload.get("profile"), str) and payload["profile"].startswith("hub-"):
         account_profile = payload["profile"]
@@ -1216,7 +1221,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
     else:
         record["native_binding_unbound_reason"] = "missing or invalid required observed start fields"
 
-    if central_home and start_json.get("deadline_ms") != central_home["runtime_deadline"]:
+    if runtime_deadline is not None and start_json.get("deadline_ms") != runtime_deadline:
         record["outcome"] = "launch-uncertain"
         record["reason"] = "native runtime deadline receipt mismatch"
         _write_launch_record(cwd, record)

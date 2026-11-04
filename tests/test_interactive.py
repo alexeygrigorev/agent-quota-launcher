@@ -113,6 +113,7 @@ class InteractiveLifecycleTests(unittest.TestCase):
             if context:
                 path=root/'private-context.json';path.write_text(json.dumps({'token':'scoped-secret-token','server':'http://127.0.0.1:1'}));path.chmod(0o600)
                 payload['child_config_file']=str(path)
+                payload['runtime_deadline']=int(time.time()*1000)+59000
             store.submit_task('interactive-test','test-key',payload,[])
             fetch=stack.enter_context(patch('launcher.launch.fetch_quse'))
             validate=stack.enter_context(patch('launcher.launch.validate_quse',return_value=([{'provider':'codex'}],[])))
@@ -125,7 +126,7 @@ class InteractiveLifecycleTests(unittest.TestCase):
             popen.return_value.returncode=0
             def started(**kwargs):
                 command=popen.call_args.args[0]
-                return json.dumps({'id':'11111111-1111-4111-8111-111111111111','tag':'task-interactive-test','workspace':directory,'engine':'codex','phase':'running','created_at_ms':int(time.time()*1000),'worker_pid':1234,'command':command[command.index('--')+1:]}),''
+                return json.dumps({'id':'11111111-1111-4111-8111-111111111111','tag':'task-interactive-test','workspace':directory,'engine':'codex','phase':'running','created_at_ms':int(time.time()*1000),'deadline_ms':payload.get('runtime_deadline'),'worker_pid':1234,'command':command[command.index('--')+1:]}),''
             popen.return_value.communicate.side_effect=started
             rc=do_run(str(root/'store.sqlite'),'interactive-test',directory,None,str(root/'launch.lock'))
             state=store.get_task('interactive-test')['state']
