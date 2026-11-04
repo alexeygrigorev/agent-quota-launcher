@@ -940,6 +940,9 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         "--cwd", native_cwd,
         "--tag", run_tag,
     ]
+    if central_home:
+        cmd.extend(["--deadline-ms", str(central_home["runtime_deadline"])])
+        record["runtime_deadline"] = central_home["runtime_deadline"]
     account_profile = payload.get("account_profile") or payload.get("provider_profile")
     if not account_profile and isinstance(payload.get("profile"), str) and payload["profile"].startswith("hub-"):
         account_profile = payload["profile"]
@@ -1212,6 +1215,13 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             record["native_binding_error"] = str(e)
     else:
         record["native_binding_unbound_reason"] = "missing or invalid required observed start fields"
+
+    if central_home and start_json.get("deadline_ms") != central_home["runtime_deadline"]:
+        record["outcome"] = "launch-uncertain"
+        record["reason"] = "native runtime deadline receipt mismatch"
+        _write_launch_record(cwd, record)
+        store.transition_task(task_id, "launch-uncertain", ("starting",), reason=record["reason"])
+        return 1
 
     record["observed_model"] = native_command_model(start_json.get("command"))
     record["model_verified"] = record["observed_model"] == record["requested_model"]

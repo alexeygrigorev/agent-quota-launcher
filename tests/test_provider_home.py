@@ -129,7 +129,7 @@ class ProviderHomes(unittest.TestCase):
         binding = {'account_id': 'zai-central', 'session_id': 'session-1', 'operation_id': 'op-1', 'epoch': 4, 'machine_id': 'machine-1'}
         now = int(time.time() * 1000)
         response = {**binding, 'launch_allowed': True, 'provider': 'zai', 'credential_generation': 1,
-                    'model': 'configured-model', 'quota': {'source': 'provider:zai:generation:1',
+                    'runtime_deadline': now + 60000, 'model': 'configured-model', 'quota': {'source': 'provider:zai:generation:1',
                     'remaining': 3, 'captured_at': now, 'valid_until': now + 300000}}
         calls = []
         class Handler(BaseHTTPRequestHandler):
@@ -155,7 +155,7 @@ class ProviderHomes(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], ('/api/sessions/session-1/admission', 'Bearer synthetic-host-token',
                                    {'operation_id': 'op-1', 'epoch': 4, 'provider_check': True}))
-        for key, value in [('credential_generation', 2), ('machine_id', 'foreign'), ('model', 'foreign')]:
+        for key, value in [('credential_generation', 2), ('machine_id', 'foreign'), ('model', 'foreign'), ('runtime_deadline', None), ('runtime_deadline', True), ('runtime_deadline', now-1), ('runtime_deadline', now+7201000)]:
             previous = response[key]
             response[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -169,7 +169,7 @@ class ProviderHomes(unittest.TestCase):
         with self.assertRaises(ValueError):
             admission(manifest, context)
 
-    def test_actual_do_run_uses_central_parent_gate_and_drops_controller_before_spawn(self):
+    def test_actual_do_run_uses_central_parent_gate_and_drops_controller_before_spawn(self, mismatch=False):
         from launcher.store import Store
         from launcher.launch import do_run
         manifest = self.home()
@@ -185,7 +185,9 @@ class ProviderHomes(unittest.TestCase):
             launch_environment=os.environ.copy()
             launch_environment['APLEXER_RETAIN_RETIRED_OUTPUT']='1'
             stack.enter_context(patch('launcher.launch.os.environ.copy',return_value=launch_environment))
-            gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, verify(manifest))))
+            gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, dict(verify(manifest),runtime_deadline=int(time.time()*1000)+60000))))
+
+
             quse = stack.enter_context(patch('launcher.launch.fetch_quse', side_effect=AssertionError('legacy quota used')))
             legacy = stack.enter_context(patch('launcher.launch.build_managed_profile_argv', side_effect=AssertionError('legacy package used')))
             stack.enter_context(patch('launcher.launch.check_resources'))
@@ -197,15 +199,22 @@ class ProviderHomes(unittest.TestCase):
                 argv = popen.call_args.args[0]
                 return json.dumps({'id': '11111111-1111-4111-8111-111111111111', 'tag': 'task-central-test',
                     'workspace': str(root), 'engine': 'codex', 'phase': 'running', 'created_at_ms': int(time.time() * 1000),
-                    'worker_pid': 1234, 'command': argv[argv.index('--') + 1:]}), ''
+                    'deadline_ms':int(argv[argv.index('--deadline-ms')+1]) + int(mismatch), 'worker_pid': 1234, 'command': argv[argv.index('--') + 1:]}), ''
             popen.return_value.communicate.side_effect = started
-            self.assertEqual(do_run(str(root / 'tasks.sqlite'), 'central-test', str(root), None, str(root / 'lock')), 0)
+            self.assertEqual(do_run(str(root / 'tasks.sqlite'), 'central-test', str(root), None, str(root / 'lock')), 1 if mismatch else 0)
+            if mismatch:
+                saved=json.loads((root/'.local/launch-central-test.json').read_text())
+                self.assertEqual(saved['outcome'],'launch-uncertain')
+                self.assertEqual(saved['session_id'],'11111111-1111-4111-8111-111111111111')
+                self.assertIn('deadline',saved['reason'])
             self.assertEqual(gate.call_count,2)
             gate.assert_called_with(str(manifest), '/private/controller.json')
+
             self.assertFalse(quse.called)
             self.assertFalse(legacy.called)
             argv = popen.call_args.args[0]
             env = popen.call_args.kwargs['env']
+            self.assertIn('--deadline-ms', argv)
             self.assertIn('hub-zai-central', argv)
             self.assertIn('HOME=' + str(manifest.parent / 'home'), argv)
             self.assertEqual(env.get('APLEXER_RETAIN_RETIRED_OUTPUT'),'1')
@@ -224,7 +233,7 @@ class ProviderHomes(unittest.TestCase):
         root=self.root/'late-gate';(root/'.local').mkdir(parents=True)
         now=int(time.time()*1000)
         binding={'account_id':'zai-central','session_id':'s1','operation_id':'op1','epoch':1,'machine_id':'m1'}
-        response={**binding,'launch_allowed':True,'provider':'zai','credential_generation':1,'model':'configured-model',
+        response={**binding,'runtime_deadline':now+60000,'launch_allowed':True,'provider':'zai','credential_generation':1,'model':'configured-model',
                   'quota':{'source':'provider:zai:generation:1','remaining':3,'captured_at':now,'valid_until':now+300000}}
         calls=[]
         class Handler(BaseHTTPRequestHandler):
@@ -262,6 +271,11 @@ class ProviderHomes(unittest.TestCase):
             self.assertEqual(store.get_task('late-gate')['state'],'queued')
         self.assertEqual(calls,['/api/sessions/s1/admission']*3)
 
+    def test_actual_do_run_refuses_native_deadline_mismatch(self):
+        self.test_actual_do_run_uses_central_parent_gate_and_drops_controller_before_spawn(mismatch=True)
+
+
+
     def test_central_codex_dispatch_preserves_all_admission_without_unmanaged_wrapper(self):
         from launcher.store import Store
         from launcher.launch import do_run
@@ -272,7 +286,7 @@ class ProviderHomes(unittest.TestCase):
             'model_requirements':{'providers':['codex'],'models':['configured-model']}},[])
         with ExitStack() as stack:
             stack.enter_context(patch('launcher.provider_home.admission',return_value=({'provider':'codex','model':'configured-model'},
-                {'provider':'codex','account_id':'codex-central','generation':1,'access_expires_at':(time.time()+86400)*1000,'proactive_refresh_at':(time.time()+86400)*1000})))
+                {'runtime_deadline':int(time.time()*1000)+60000,'provider':'codex','account_id':'codex-central','generation':1,'access_expires_at':(time.time()+86400)*1000,'proactive_refresh_at':(time.time()+86400)*1000})))
             stack.enter_context(patch('launcher.provider_home.native_environment',return_value={'HOME':'/private/sdk-home'}))
             stack.enter_context(patch('launcher.launch.shutil.which',return_value='/installed/codex'))
             legacy=stack.enter_context(patch('launcher.launch.build_adapter_argv',side_effect=AssertionError('unmanaged adapter selected')))
@@ -284,7 +298,7 @@ class ProviderHomes(unittest.TestCase):
             def started(**kwargs):
                 argv=popen.call_args.args[0]
                 return json.dumps({'id':'11111111-1111-4111-8111-111111111111','tag':'task-central-codex','workspace':str(root),
-                    'engine':'codex','phase':'running','created_at_ms':int(time.time()*1000),'worker_pid':1234,'command':argv[argv.index('--')+1:]}),''
+                    'engine':'codex','phase':'running','created_at_ms':int(time.time()*1000),'deadline_ms':int(argv[argv.index('--deadline-ms')+1]),'worker_pid':1234,'command':argv[argv.index('--')+1:]}),''
             popen.return_value.communicate.side_effect=started
             self.assertEqual(do_run(str(root/'store.sqlite'),'central-codex',str(root),None,str(root/'lock')),0)
             self.assertFalse(legacy.called);self.assertFalse(quse.called)
