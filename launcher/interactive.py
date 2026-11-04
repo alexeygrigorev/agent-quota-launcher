@@ -2,6 +2,13 @@
 import json
 
 
+def objective_hash(value):
+    import hashlib
+    if not isinstance(value,str) or len(value.encode())>512*1024:
+        raise ValueError('native_goal_objective_invalid')
+    return hashlib.sha256(value.replace('\r\n','\n').replace('\r','\n').strip().encode()).hexdigest()
+
+
 def headless_effort_argv(provider, argv, effort):
     if provider in {'codex','zai'}:
         value='xhigh' if effort=='max' else effort
@@ -132,9 +139,9 @@ def goal_store(row, *, proc_root=None):
         with closing(sqlite3.connect(max(stores)[1].as_uri()+'?mode=ro',uri=True,timeout=.05)) as db:
             deadline=time.monotonic()+.05
             db.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
-            found=db.execute('SELECT status FROM thread_goals WHERE thread_id=?',(thread,)).fetchone()
+            found=db.execute('SELECT status,objective FROM thread_goals WHERE thread_id=? AND length(CAST(objective AS BLOB))<=?',(thread,512*1024)).fetchone()
         if found and found[0] in {'active','complete','paused','blocked','stalled','usage_limited','budget_limited'}:
-            return {'status':found[0],'thread_id':thread}
+            return {'status':found[0],'thread_id':thread,'objective_hash':objective_hash(found[1])}
     except sqlite3.Error:pass
     return None
 
@@ -150,6 +157,11 @@ def register_native_goal(*, native_id, tag, workspace, engine, created_at_ms, pr
     if engine not in {'codex','zcodex'} or not isinstance(prompt,str) or not prompt.strip() or timeout<=0:
         raise ValueError('native_goal_provider_unsupported')
     deadline=monotonic()+min(timeout,60)
+    expected_hash=objective_hash(prompt)
+    def matching(proof):
+        if proof and proof.get('objective_hash')!=expected_hash:
+            raise RuntimeError('native_goal_objective_conflict')
+        return proof
     def call(args,limit=5):
         remaining=deadline-monotonic()
         if remaining<=0:raise RuntimeError('native_goal_registration_unverified')
@@ -160,7 +172,7 @@ def register_native_goal(*, native_id, tag, workspace, engine, created_at_ms, pr
     if (row.get('id')!=native_id or row.get('tag')!=tag or row.get('workspace')!=workspace
             or row.get('engine')!=engine or row.get('created_at_ms')!=created_at_ms or row.get('phase')!='running'):
         raise RuntimeError('native_goal_identity_unverified')
-    proof=read_goal(row)
+    proof=matching(read_goal(row))
     if proof:return proof
     receipt=call(['send',native_id,'/goal '+prompt,'--enter','--json','--wait-ack','0',
                   '--resends','0','--ready-timeout',str(min(25,max(1,int(deadline-monotonic())-1)))],30)
@@ -172,7 +184,7 @@ def register_native_goal(*, native_id, tag, workspace, engine, created_at_ms, pr
             or type(delivery.get('enter_presses')) is not int or not 1<=delivery['enter_presses']<=3):
         raise RuntimeError('native_goal_delivery_unverified')
     while monotonic()<deadline:
-        proof=read_goal(row)
+        proof=matching(read_goal(row))
         if proof:return proof
         sleep(min(.5,max(0,deadline-monotonic())))
     raise RuntimeError('native_goal_registration_unverified')

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
-from launcher.interactive import interactive_argv,register_native_goal,goal_store,goal_prompt
+from launcher.interactive import interactive_argv,register_native_goal,goal_store,goal_prompt,objective_hash
 
 
 class InteractiveTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class InteractiveTests(unittest.TestCase):
         (native/'transcript.json').write_text(json.dumps({'path':str(rollout)}))
         self.row={'id':'native-id','tag':'task-test','workspace':str(root),'engine':'codex','created_at_ms':self.at,'phase':'running','history_path':str(native/'history.jsonl')}
         self.db=root/'codex/goals_1.sqlite'
-        with sqlite3.connect(self.db) as db:db.execute('CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,status TEXT)')
+        with sqlite3.connect(self.db) as db:db.execute('CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,status TEXT,objective TEXT)')
         self.calls=[]
         self.delivery={'id':'native-id','delivery':{'engine':'codex','ready':True,'landed':True,'submitted':True,'status':'submitted','sends':1,'enter_presses':1}}
         self.native_effect=True
@@ -47,7 +47,7 @@ class InteractiveTests(unittest.TestCase):
         if argv[1]=='status':value=self.row
         else:
             if self.native_effect:
-                with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?)',('exact-thread','active'))
+                with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread','active','objective'))
             value=self.delivery
         return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
 
@@ -57,7 +57,7 @@ class InteractiveTests(unittest.TestCase):
     def test_guarded_one_effect_requires_actual_bound_goal_sqlite_row(self):
         self.assertIsNone(goal_store(self.row))
         proof=self.register()
-        self.assertEqual(proof,{'status':'active','thread_id':'exact-thread'})
+        self.assertEqual(proof,{'status':'active','thread_id':'exact-thread','objective_hash':objective_hash('objective')})
         self.assertEqual(sum(v[1]=='send' for v in self.calls),1)
         self.assertEqual(self.register(),proof)
         self.assertEqual(sum(v[1]=='send' for v in self.calls),1)
@@ -76,8 +76,17 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(sum(v[1]=='send' for v in self.calls),1)
 
     def test_foreign_thread_row_is_not_goal_evidence(self):
-        with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?)',('foreign-thread','active'))
+        with sqlite3.connect(self.db) as db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('foreign-thread','active','objective'))
         self.assertIsNone(goal_store(self.row))
+
+    def test_existing_wrong_active_or_complete_goal_is_never_overwritten(self):
+        for status in ['active','complete']:
+            with sqlite3.connect(self.db) as db:
+                db.execute('DELETE FROM thread_goals')
+                db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread',status,'different objective'))
+            with self.subTest(status=status),self.assertRaisesRegex(RuntimeError,'objective_conflict'):
+                self.register()
+        self.assertFalse(any(v[1]=='send' for v in self.calls))
         self.row['created_at_ms']+=20000
         self.assertIsNone(goal_store(self.row))
 
