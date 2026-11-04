@@ -182,6 +182,9 @@ class ProviderHomes(unittest.TestCase):
         store.submit_task('central-test', 'central-key', payload, [])
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key','CLAUDE_CONFIG_DIR':'/hostile-claude'}))
+            launch_environment=os.environ.copy()
+            launch_environment['APLEXER_RETAIN_RETIRED_OUTPUT']='1'
+            stack.enter_context(patch('launcher.launch.os.environ.copy',return_value=launch_environment))
             gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, verify(manifest))))
             quse = stack.enter_context(patch('launcher.launch.fetch_quse', side_effect=AssertionError('legacy quota used')))
             legacy = stack.enter_context(patch('launcher.launch.build_managed_profile_argv', side_effect=AssertionError('legacy package used')))
@@ -205,6 +208,7 @@ class ProviderHomes(unittest.TestCase):
             env = popen.call_args.kwargs['env']
             self.assertIn('hub-zai-central', argv)
             self.assertIn('HOME=' + str(manifest.parent / 'home'), argv)
+            self.assertEqual(env.get('APLEXER_RETAIN_RETIRED_OUTPUT'),'1')
             self.assertNotIn('HUB2_LAUNCH_CONTEXT', env)
             self.assertNotIn('HUB2_TOKEN', env)
             self.assertNotIn('CODEX_API_KEY', env)

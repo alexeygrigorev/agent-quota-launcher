@@ -359,9 +359,9 @@ def home_environment(home, provider):
     return env
 
 
-def clean_provider_environment():
+def clean_provider_environment(source=None):
     prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_', 'ZAI_', 'GO_API_')
-    return {key: value for key, value in os.environ.items() if not key.startswith(prefixes)}
+    return {key: value for key, value in (os.environ if source is None else source).items() if not key.startswith(prefixes)}
 
 
 def go_sdk(home, arguments, text=None):

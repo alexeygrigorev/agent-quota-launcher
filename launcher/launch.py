@@ -1115,7 +1115,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
             env.pop(name, None)
         if central_home:
             from launcher.provider_home import clean_provider_environment
-            env = clean_provider_environment()
+            env = clean_provider_environment(env)
         launch_output_path = Path(cwd) / ".local" / f"launch-{task_id}-start.json"
         if central_home:
             try:
