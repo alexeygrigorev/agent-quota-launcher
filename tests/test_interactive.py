@@ -48,7 +48,7 @@ class InteractiveTests(unittest.TestCase):
         if argv[1]=='status':value=self.row
         else:
             if self.native_effect:
-                with closing(sqlite3.connect(self.db)) as db, db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread','active','objective'))
+                with closing(sqlite3.connect(self.db)) as db, db:db.execute('INSERT INTO thread_goals VALUES(?,?,?)',('exact-thread','active',argv[3].removeprefix('/goal ')))
             value=self.delivery
         return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
 
@@ -99,6 +99,48 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(brief.read_text(encoding="utf8"),objective)
         self.assertLess(command.index('First tool action'),command.index('Then read'))
         with self.assertRaises(FileExistsError):goal_prompt(objective,self.temp.name,'task-id','/private/first-action.json')
+
+    def test_short_one_line_goal_keeps_fast_path(self):
+        self.assertEqual(goal_prompt('short objective',self.temp.name,'unused','unused'),'short objective')
+        self.assertFalse((Path(self.temp.name)/'.local/goal-briefs').exists())
+
+    def test_short_multiline_goal_uses_exact_private_brief_and_single_line_hash(self):
+        import hashlib
+        import stat
+        for index,objective in enumerate(['first line\nsecond line','first line\r\nsecond line','first line\rsecond line']):
+            with self.subTest(objective=repr(objective)):
+                command=goal_prompt(objective,self.temp.name,'multiline-'+str(index),'/private/first-action.json')
+                self.assertNotIn('\n',command);self.assertNotIn('\r',command)
+                self.assertLessEqual(len(('/goal '+command).encode('utf-16-le'))//2,4000)
+                directory=Path(self.temp.name)/'.local/goal-briefs'
+                brief=directory/(hashlib.sha256(('multiline-'+str(index)).encode()).hexdigest()+'.md')
+                self.assertEqual(brief.read_bytes(),objective.encode())
+                self.assertIn(hashlib.sha256(objective.encode()).hexdigest(),command)
+                self.assertIn(str(brief),command)
+                if os.name!='nt':
+                    self.assertEqual(stat.S_IMODE(brief.stat().st_mode),0o600)
+                    self.assertEqual(stat.S_IMODE(directory.stat().st_mode),0o700)
+                # The registered native objective is the one-line pointer;
+                # its embedded raw-byte digest binds the full original brief.
+                self.assertEqual(objective_hash(command),hashlib.sha256(command.strip().encode()).hexdigest())
+                with closing(sqlite3.connect(self.db)) as db, db:db.execute('DELETE FROM thread_goals')
+                proof=register_native_goal(native_id='native-id',tag='task-test',workspace=self.temp.name,engine='codex',created_at_ms=self.at,prompt=command,timeout=1,runner=self.runner)
+                self.assertEqual(proof['objective_hash'],objective_hash(command))
+                self.assertEqual(goal_store(self.row)['objective_hash'],objective_hash(command))
+                with self.assertRaises(FileExistsError):
+                    goal_prompt(objective,self.temp.name,'multiline-'+str(index),'/private/first-action.json')
+
+    def test_multiline_pointer_paths_are_refused_before_brief_write(self):
+        for workspace,first in [(self.temp.name,'bad\nfirst'),(self.temp.name,'bad\rfirst'),(self.temp.name+'\nworkspace','first')]:
+            with self.subTest(workspace=workspace,first=first),self.assertRaisesRegex(ValueError,'pointer_not_single_line'):
+                goal_prompt('short\nobjective',workspace,'path-test',first)
+        self.assertFalse((Path(self.temp.name)/'.local/goal-briefs').exists())
+
+    def test_direct_multiline_registration_refuses_before_tui_effect(self):
+        for prompt in ['first\nsecond','first\r\nsecond','first\rsecond']:
+            with self.subTest(prompt=repr(prompt)),self.assertRaisesRegex(ValueError,'single_line_required'):
+                register_native_goal(native_id='native-id',tag='task-test',workspace=self.temp.name,engine='codex',created_at_ms=self.at,prompt=prompt,timeout=1,runner=self.runner)
+        self.assertEqual(self.calls,[])
 
 
 class InteractiveLifecycleTests(unittest.TestCase):
