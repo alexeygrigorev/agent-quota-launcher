@@ -1107,7 +1107,7 @@ def do_run(store_path, task_id, cwd, tmpdir, lock_path, resource_config_path=Non
         store.transition_task(task_id, "starting", ("queued",),
                               reason=f"launching via {provider}")
         env = os.environ.copy()
-        for name in ("HUB2_LAUNCH_CONTEXT", "HUB2_TOKEN", "HUB2_SERVER", "HUB_TOKEN", "HUB_JOB_TOKEN", "HUB_CONFIG_FILE", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ZAI_API_KEY", "GO_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+        for name in ("HUB2_LAUNCH_CONTEXT", "HUB2_TOKEN", "HUB2_SERVER", "HUB_TOKEN", "HUB_JOB_TOKEN", "HUB_CONFIG_FILE", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_AUTH_TOKEN", "CODEX_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ZAI_API_KEY", "GO_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
             env.pop(name, None)
         if central_home:
             for name in list(env):

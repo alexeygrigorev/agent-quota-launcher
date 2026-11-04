@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.request
 from pathlib import Path
 
@@ -155,12 +156,20 @@ def zcode_files(token, model):
         'source': 'custom', 'options': {'apiKey': token, 'baseURL': base, 'apiKeyRequired': True},
         'models': {native: {'limit': {'context': 200000}, 'modalities': {'input': ['text'], 'output': ['text']}}}},
         'zai': {'models': {model: {'name': model}}}}}
-    return {'.zcode/v2/provider_config.json': json.dumps(config), '.zcode/cli/config.json': json.dumps(cli)}
+    harness = ('approval_policy="never"\nsandbox_mode="danger-full-access"\ncheck_for_update_on_startup=false\n'
+               'model=' + json.dumps(model) + '\nmodel_provider="zcode"\n'
+               '[model_providers.zcode]\nname="zcode"\nbase_url="https://api.z.ai/api/anthropic"\nwire_api="zcode"\n')
+    return {'.zcode/v2/provider_config.json': json.dumps(config), '.zcode/cli/config.json': json.dumps(cli),
+            '.zcodex/config.toml': harness}
 
 
 def selected_token(provider, home, model):
     source = PATHS[provider]
     if provider == 'zai':
+        harness=tomllib.loads(private_read(home / '.zcodex/config.toml').decode('utf8'))
+        route=harness.get('model_providers',{}).get('zcode',{})
+        if harness.get('model_provider')!='zcode' or harness.get('model')!=model or route.get('wire_api')!='zcode' or route.get('base_url')!='https://api.z.ai/api/anthropic':
+            raise ValueError('provider_harness_route_mismatch')
         source = '.zcode/v2/provider_config.json'
         data = json.loads(private_read(home / source))['config']
         selection = data['defaultModelSelection']
@@ -273,7 +282,7 @@ def verify(manifest):
         raise ValueError('provider_manifest_invalid')
     if provider == 'zai' and data['account_id'] != 'zai-central':
         raise ValueError('zai_central_required')
-    expected = {PATHS[provider]} | ({'.zcode/v2/provider_config.json', '.zcode/cli/config.json'} if provider == 'zai' else set())
+    expected = {PATHS[provider]} | ({'.zcode/v2/provider_config.json', '.zcode/cli/config.json', '.zcodex/config.toml'} if provider == 'zai' else set())
     if set(data['files']) != expected:
         raise ValueError('provider_manifest_schema_invalid')
     home = path.parent / 'home'

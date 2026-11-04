@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +34,9 @@ class ProviderHomes(unittest.TestCase):
         native = native_environment(manifest)
         self.assertEqual(native['ZCODE_HOME'], str(manifest.parent / 'home/.zcode'))
         self.assertNotIn('synthetic-central-key', json.dumps(info) + json.dumps(native))
+        harness=tomllib.loads((manifest.parent/'home/.zcodex/config.toml').read_text())
+        self.assertEqual((harness['model'],harness['model_provider'],harness['model_providers']['zcode']['wire_api']),
+                         ('configured-model','zcode','zcode'))
         if os.name != 'nt':
             self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
         with self.assertRaises(ValueError):
@@ -165,7 +169,7 @@ class ProviderHomes(unittest.TestCase):
                    'provider_home': str(manifest), 'model_requirements': {'models': ['configured-model'], 'providers': ['zai']}}
         store.submit_task('central-test', 'central-key', payload, [])
         with ExitStack() as stack:
-            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret'}))
+            stack.enter_context(patch.dict(os.environ, {'HUB2_LAUNCH_CONTEXT': '/private/controller.json', 'HUB2_TOKEN': 'synthetic-host-secret','CODEX_API_KEY':'synthetic-paid-key'}))
             gate = stack.enter_context(patch('launcher.provider_home.admission', return_value=({'provider': 'zai', 'model': 'configured-model'}, verify(manifest))))
             quse = stack.enter_context(patch('launcher.launch.fetch_quse', side_effect=AssertionError('legacy quota used')))
             legacy = stack.enter_context(patch('launcher.launch.build_managed_profile_argv', side_effect=AssertionError('legacy package used')))
@@ -190,6 +194,7 @@ class ProviderHomes(unittest.TestCase):
             self.assertIn('HOME=' + str(manifest.parent / 'home'), argv)
             self.assertNotIn('HUB2_LAUNCH_CONTEXT', env)
             self.assertNotIn('HUB2_TOKEN', env)
+            self.assertNotIn('CODEX_API_KEY', env)
             self.assertNotIn('synthetic-host-secret', json.dumps(argv))
 
 
