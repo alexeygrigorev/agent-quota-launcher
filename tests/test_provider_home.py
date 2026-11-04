@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from launcher.provider_home import materialize, verify, admission, native_environment, make_private
+from launcher.provider_home import materialize, verify, admission, native_environment, make_private, go_sdk
 
 
 class ProviderHomes(unittest.TestCase):
@@ -74,6 +74,19 @@ class ProviderHomes(unittest.TestCase):
                 if provider == 'go':
                     self.assertTrue(any(call.args[1] == ['auth', 'import'] for call in sdk.call_args_list))
                     self.assertTrue(any(call.args[1] == ['auth', 'export', 'opencode'] for call in sdk.call_args_list))
+
+    def test_go_auth_forces_private_standalone_sdk_not_ambient_service(self):
+        with patch.dict(os.environ, {'OPENCODE_SERVER': 'https://foreign.invalid', 'HUB2_TOKEN': 'synthetic-host-secret'}), \
+             patch('launcher.provider_home.shutil.which', return_value='installed-opencode'), \
+             patch('launcher.provider_home.subprocess.run') as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = '[]'
+            self.assertEqual(go_sdk(self.root, ['auth', 'export', 'opencode']), [])
+            self.assertEqual(run.call_args.args[0], ['installed-opencode', 'auth', 'export', 'opencode', '--standalone'])
+            env = run.call_args.kwargs['env']
+            self.assertNotIn('OPENCODE_SERVER', env)
+            self.assertNotIn('HUB2_TOKEN', env)
+            self.assertEqual(env['OPENCODE_DB'], str(self.root / '.local/share/opencode/opencode.db'))
 
     def test_actual_authenticated_http_gate_revalidates_every_attempt(self):
         manifest = self.home()

@@ -275,7 +275,7 @@ def go_sdk(home, arguments, text=None):
     binary = shutil.which('opencode')
     if not binary:
         raise ValueError('provider_sdk_unavailable')
-    result = subprocess.run([binary, *arguments], input=text, text=True, capture_output=True,
+    result = subprocess.run([binary, *arguments, '--standalone'], input=text, text=True, capture_output=True,
                             env=env, timeout=20, check=False)
     if result.returncode or len(result.stdout) > 131072:
         raise ValueError('provider_sdk_auth_unverified')
