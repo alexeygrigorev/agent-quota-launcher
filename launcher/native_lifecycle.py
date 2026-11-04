@@ -29,7 +29,12 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+# Lifecycle metadata keeps its original small bound. Native aplexer receipts
+# also retain up to 64 KiB raw output as a pretty-printed numeric byte array
+# (up to 13 encoded bytes per raw byte), so the complete JSON needs a separate
+# finite envelope bound. Output is not lifecycle authority and is discarded.
 MAX_TOMBSTONE_BYTES = 65536
+MAX_TOMBSTONE_ENVELOPE_BYTES = 1048576
 MAX_ARTIFACT_JSON_BYTES = 1048576
 
 ACTIVE_PHASES = ("running", "starting", "working", "launching")
@@ -195,7 +200,9 @@ def read_tombstone(native_id: str, state_dir: Path | None = None) -> dict | None
     """Bounded, explicit read of retired-sessions/<native_id>/tombstone.json.
 
     Never scans every directory; reads only the explicit native_id file.
-    Rejects symlinks, oversize files, and malformed JSON.
+    Optional retained output may enlarge the bounded envelope, but is not
+    returned as lifecycle evidence. Metadata retains its original 64 KiB cap.
+    Rejects symlinks, oversize envelopes/metadata, and malformed JSON.
     """
     try:
         canonical_id = validate_native_id(native_id)
@@ -204,7 +211,15 @@ def read_tombstone(native_id: str, state_dir: Path | None = None) -> dict | None
 
     base = state_dir if state_dir is not None else get_aplexer_state_dir()
     tombstone_file = base / "retired-sessions" / canonical_id / "tombstone.json"
-    return read_bounded_json_file(tombstone_file, max_bytes=MAX_TOMBSTONE_BYTES)
+    data = read_bounded_json_file(
+        tombstone_file, max_bytes=MAX_TOMBSTONE_ENVELOPE_BYTES
+    )
+    if data is None:
+        return None
+    data.pop("output", None)
+    if len(json.dumps(data, ensure_ascii=True).encode("utf-8")) > MAX_TOMBSTONE_BYTES:
+        return None
+    return data
 
 
 def verify_tombstone(
