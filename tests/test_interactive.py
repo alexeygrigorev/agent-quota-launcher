@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -7,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
-from launcher.interactive import interactive_argv,register_native_goal,goal_store,goal_prompt,objective_hash
+from launcher.interactive import interactive_argv,register_native_goal,goal_store,goal_prompt,objective_hash,child_config_path
 
 
 class InteractiveTests(unittest.TestCase):
@@ -101,14 +102,18 @@ class InteractiveTests(unittest.TestCase):
 
 
 class InteractiveLifecycleTests(unittest.TestCase):
-    def execute(self,with_goal=False,goal_error=None):
+    def execute(self,with_goal=False,goal_error=None,context=False):
         from launcher.store import Store
         from launcher.launch import do_run
         import time
         with tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
             root=Path(directory);(root/'.local').mkdir()
             store=Store(str(root/'store.sqlite'))
-            store.submit_task('interactive-test','test-key',{'owner':'test','cwd':directory,'goal':'harmless objective','timeout':60,'mode':'interactive','with_goal':with_goal,'effort':'max'},[])
+            payload={'owner':'test','cwd':directory,'goal':'harmless objective','timeout':60,'mode':'interactive','with_goal':with_goal,'effort':'max'}
+            if context:
+                path=root/'private-context.json';path.write_text(json.dumps({'token':'scoped-secret-token','server':'http://127.0.0.1:1'}));path.chmod(0o600)
+                payload['child_config_file']=str(path)
+            store.submit_task('interactive-test','test-key',payload,[])
             fetch=stack.enter_context(patch('launcher.launch.fetch_quse'))
             validate=stack.enter_context(patch('launcher.launch.validate_quse',return_value=([{'provider':'codex'}],[])))
             stack.enter_context(patch('launcher.launch.select_candidate',return_value=({'provider':'codex','model':'configured-model'},{})))
@@ -141,3 +146,19 @@ class InteractiveLifecycleTests(unittest.TestCase):
         self.assertEqual((rc,state,first,registered),(1,'launch-uncertain',0,1))
         self.assertTrue(record['goal_registration_intent'])
         self.assertEqual(record['reason'],'native_goal_registration_unverified')
+
+    def test_actual_dispatch_exposes_only_nonsecret_private_config_path(self):
+        rc,state,record,argv,first,registered=self.execute(context=True)
+        self.assertEqual((rc,state,first),(0,'running',1))
+        self.assertTrue(any(value.startswith('HUB2_CONFIG=') for value in argv))
+        self.assertNotIn('scoped-secret-token',str(argv)+json.dumps(record))
+
+    def test_context_path_refuses_external_symlink_or_nonprivate_file(self):
+        with tempfile.TemporaryDirectory() as directory,tempfile.TemporaryDirectory() as outside:
+            path=Path(outside)/'private.json';path.write_text('{}');path.chmod(0o600)
+            with self.assertRaises(ValueError):child_config_path(str(path),directory)
+            path=Path(directory)/'private.json';path.write_text('{}');path.chmod(0o600)
+            self.assertEqual(child_config_path(str(path),directory),str(path.resolve()))
+            if os.name!='nt':
+                path.chmod(0o644)
+                with self.assertRaises(ValueError):child_config_path(str(path),directory)
